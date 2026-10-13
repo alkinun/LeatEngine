@@ -158,6 +158,7 @@ class _Embedding:
     texts: list[list[int]]
     done: list[list[float]] = field(default_factory=list)
     out: queue.SimpleQueue[list[list[float]] | Exception] = field(default_factory=queue.SimpleQueue)
+    cancelled: threading.Event = field(default_factory=threading.Event)  # its client hung up
 
 
 @dataclass(eq=False)
@@ -321,8 +322,12 @@ class Server(ThreadingHTTPServer):
             self.busy, self.queued = len(running), sum(isinstance(r, _Completion) for r in waiting)
 
     def _embed(self, embedding: collections.deque[_Embedding]) -> None:
-        # embeds the next text of the first embedding asked, answering it once all are
+        # embeds the next text of the first embedding asked, answering it once all are, or drops
+        # it if its client hung up
         e = embedding[0]
+        if e.cancelled.is_set():
+            embedding.popleft()
+            return
         try:
             assert self.embedder is not None  # a handler asks for none without it
             e.done.append(self.embedder.embed(e.texts[len(e.done)]))
@@ -769,7 +774,15 @@ class _Handler(BaseHTTPRequestHandler):
             return self._error(404, "this server's embedding model failed to load")
         tokens = [_embedded(engine, text) for text in texts]
         server.requests.put(asked := _Embedding(tokens))
-        if isinstance(said := asked.out.get(), Exception):
+        while True:  # checking the client is still there, as a long list takes a while
+            try:
+                said = asked.out.get(timeout=_HANG_UP_CHECK)
+                break
+            except queue.Empty:
+                if self._hung_up():
+                    asked.cancelled.set()
+                    return
+        if isinstance(said, Exception):
             return self._error(500, f"embedding failed: {said!r}")
         data = [{"object": "embedding", "index": i, "embedding": v} for i, v in enumerate(said)]
         used = sum(map(len, tokens))

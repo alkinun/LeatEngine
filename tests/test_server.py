@@ -1025,6 +1025,26 @@ def test_embeddings(tiny_model, tiny):
         connect(server).embeddings.create(model="any", input="x")
 
 
+def test_embeddings_end_as_the_client_hangs_up(tiny_model, tiny, monkeypatch):
+    # a long list of texts stops being embedded once its client has gone
+    with serving(tiny_model[0], max_context=CONTEXT, embed=tiny("qwen3")[0]) as server:
+        while server.embedder is None:
+            time.sleep(0.01)
+        embedded, embed = [], server.embedder.embed
+        monkeypatch.setattr(server.embedder, "embed", lambda tokens: embedded.append(tokens)
+                            or time.sleep(0.02) or embed(tokens))  # fmt: skip
+        body = json.dumps({"input": ["the rent"] * 200}).encode()
+        head = f"POST /v1/embeddings HTTP/1.1\r\nContent-Length: {len(body)}\r\n\r\n"
+        with socket.create_connection(("127.0.0.1", server.server_port), timeout=10) as connection:
+            connection.sendall(head.encode() + body)
+            while not embedded:
+                time.sleep(0.01)
+        time.sleep(0.6)  # for the handler to find the client gone, and the worker to drop it
+        gone = len(embedded)
+        time.sleep(0.6)
+        assert len(embedded) <= gone + 1 < 100
+
+
 @pytest.mark.usefixtures("reference_ops")
 def test_embeddings_of_an_encoder(tiny_model, tiny):
     # an encoder's embedding, EmbeddingGemma 2's, of a text's start, as many tokens as its context
