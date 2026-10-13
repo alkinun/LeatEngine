@@ -1,3 +1,5 @@
+<img src="docs/logo.svg" alt="LeatEngine logo" width="48">
+
 # LeatEngine
 
 A minimal GGUF inference engine built on [tinygrad](https://github.com/tinygrad/tinygrad),
