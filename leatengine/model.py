@@ -602,13 +602,14 @@ class Transformer:
         kv_heads, dim, eps = c.kv_heads[i], c.head_dims[i], c.norm_eps
         # Gemma 4's full-attention layers have no values of their own: the keys are, before norm;
         # Muse Glimmer's gate their output by a projection of their own
-        proj = [w[n] for n in ("attn_q", "attn_k", "attn_v", "attn_gate") if n in w]
-        q, k, *rest = ops.linears(x, *proj, norm=(s["attn_norm"], eps))
-        values, gate = rest[: "attn_v" in w], rest[-1] if "attn_gate" in w else None
+        names = [n for n in ("attn_q", "attn_k", "attn_v", "attn_gate") if n in w]
+        outs = dict(zip(names, ops.linears(x, *(w[n] for n in names), norm=(s["attn_norm"], eps)),
+                        strict=True))  # fmt: skip
+        q, k, gate = outs["attn_q"], outs["attn_k"], outs.get("attn_gate")
         if c.q_gate:  # each head's q, then the gate of its output
             q, gate = q.reshape(B, T, c.n_heads, 2 * dim).chunk(2, dim=-1)
         q, k = q.reshape(B, T, c.n_heads, dim), k.reshape(B, T, kv_heads, dim)
-        v = (values[0] if values else k).reshape(B, T, kv_heads, dim)
+        v = outs.get("attn_v", k).reshape(B, T, kv_heads, dim)
         biases = None
         if "attn_q.bias" in s:  # Qwen2's and gpt-oss's
             biases = (s["attn_q.bias"], s["attn_k.bias"], s["attn_v.bias"])
@@ -617,10 +618,8 @@ class Transformer:
         if positions is not None and (base := self.base[i]) is not None:
             table = _mrope(base, positions, c.mrope)  # each token's own angles
         rope = None if table is None else (table, c.ropes[i].dims)
-        cache = self.cache[i]
-        assert cache is not None
-        q, cache = ops.rotate(q, k, v, cache, spans, rope, c.rope_halves, biases, norms, c.v_norm,
-                              eps, positions is not None, self.rings[i])  # fmt: skip
+        q, cache = ops.rotate(q, k, v, self._cache(i), spans, rope, c.rope_halves, biases, norms,
+                              c.v_norm, eps, positions is not None, self.rings[i])  # fmt: skip
         return (q, gate), cache
 
     def _mla_rotated(self, i: int, x: Tensor, spans: list[Span]) -> Tensor:
