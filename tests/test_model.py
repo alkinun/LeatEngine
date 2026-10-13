@@ -665,11 +665,13 @@ def test_start_needs_a_free_slot(tiny_model):
 # architecture, scores 0.0021 and 98.1% on the prompt's path, and 0.0025 and 98.4% on the decode
 # path, its depth adding to the noise, as the 0.0017 of 20 chunks of the README's table.
 # Qwen3.8 27B, dense, of recurrent state, scores 0.0014 and 98.1% on 20 chunks of the prompt's
-# path; its decode path's scoring takes more than the 3090's 24 GB.
+# path; its decode path's scoring takes more than the 3090's 24 GB. Mellum 2.1 12B A2.5B, of 64
+# experts and 8 used, scores 0.0078 and 95.8% on the prompt's path and 0.0086 and 95.9% on the
+# decode path over 8 chunks: llama.cpp's own CPU backend scores 0.0095 against its CUDA one.
 LIMITS = {
     "llama": (0.0015, 0.975), "qwen2": (0.0045, 0.97), "qwen3": (0.0035, 0.97),
     "qwen3moe": (0.007, 0.97), "qwen35": (0.003, 0.975), "qwen35moe": (0.01, 0.965),
-    "Mistral Small": (0.003, 0.975),
+    "Mistral Small": (0.003, 0.975), "mellum": (0.012, 0.95),
 }  # fmt: skip
 
 
