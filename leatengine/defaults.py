@@ -1,11 +1,13 @@
-"""The sampling a model runs with where a request leaves it out: as its makers recommend it, apart
-as it reasons or not, under an operator's own, by model, of a file of JSON.
+"""Default sampling for options a request leaves out.
 
-What a model's makers recommend comes of its GGUF's general.sampling keys, which llama.cpp's
-converter writes of its generation_config.json, and, of the families whose files say none of it or
-not all, of their generation_config.json and model cards: Qwen's sets apart as the model thinks or
-not, and its presence_penalty, which no GGUF key holds. What neither says is OpenAI's default.
+Request values win over an operator's overrides (a JSON file of options by model id), which win
+over what the model's makers recommend, which wins over OpenAI's defaults. Makers' recommendations
+may differ for replies that reason and replies that do not.
 
+Recommendations come from the GGUF's general.sampling keys, which llama.cpp's converter copies from
+generation_config.json, and, for families whose files give none or only some, from their
+generation_config.json and model cards: for example Qwen's separate thinking and non-thinking sets,
+and its presence_penalty, which no GGUF key holds.
 """
 
 import json
