@@ -32,15 +32,19 @@ _PER_LAYER = ("inp_gate", "proj", "post_norm")
 _ROPE_HALVES = {
     "llama": False, "qwen2": True, "qwen3": True, "qwen3moe": True, "gemma3": True,
     "gemma4": True, "gemma-embedding2": True, "gpt-oss": True, "phi3": True, "qwen35": True,
-    "qwen35moe": True, "mellum": True,
+    "qwen35moe": True, "mellum": True, "muse-glimmer": False,
 }  # fmt: skip
 QWEN35 = ("qwen35", "qwen35moe")  # Qwen3.5's and Qwen3.6's architectures: dense, and of experts
 GEMMA4 = ("gemma4", "gemma-embedding2")  # Gemma 4's, and EmbeddingGemma 2's of its layers
 # the period of attention.sliding_window_pattern where a GGUF has none, as llama.cpp's
-_SLIDING_EVERY = {"gemma3": 6, "gpt-oss": 2, "mellum": 4}
+_SLIDING_EVERY = {"gemma3": 6, "gpt-oss": 2, "mellum": 4, "muse-glimmer": 4}
 # the architectures whose sliding-window layers turn by the RoPE base of the others where the GGUF
 # gives none of their own, rather than Gemma's 10000
-_SWA_BASE_SHARED = ("gpt-oss", "mellum")
+_SWA_BASE_SHARED = ("gpt-oss", "mellum", "muse-glimmer")
+# the architectures whose full-attention layers turn by no RoPE, NoPE, as Muse Glimmer's
+_NOPE_FULL = ("muse-glimmer",)
+# the eps of the norms of each block's output, where not that of the others, as llama.cpp's
+_POST_NORM_EPS = {"muse-glimmer": 1e-8}
 # how an architecture's MLPs combine their gate and up, as ops.glu has it, where not by SiLU
 _GLU = {"gemma3": "gelu", "gemma4": "gelu", "gemma-embedding2": "gelu", "gpt-oss": "oai"}
 
@@ -100,8 +104,11 @@ class Config:
     experts_used: int = 0  # experts each token takes
     glu: str = "silu"  # how an MLP's gate and up combine, as ops.glu has it
     embed_scale: float = 1.0
+    embed_norm: bool = False  # the embeddings RMSNormed without a weight, as Muse Glimmer's
+    post_norm_eps: float = 0.0  # the eps of the norms of each block's output, if not norm_eps
     v_norm: bool = False  # values RMSNormed without a weight, as Gemma 4's
     logit_cap: float = 0.0
+    logit_scale: float = 1.0  # what the logits are multiplied by, before any cap
     # M-RoPE's sections of the frequencies, interleaved, that turn by an image's time, height and
     # width, as Qwen3.5's: text, of the same position on each, turns as by plain RoPE
     mrope: tuple[int, ...] = ()
@@ -198,6 +205,9 @@ class Config:
             embed_scale=math.sqrt(dim) if arch in ("gemma3", *GEMMA4) else 1.0,
             v_norm=arch in GEMMA4,
             logit_cap=m.get("final_logit_softcapping", 0.0),
+            logit_scale=m.get("logit_scale", 1.0),
+            embed_norm=arch == "muse-glimmer",
+            post_norm_eps=_POST_NORM_EPS.get(arch, 0.0),
             mrope=tuple(m.get("rope.dimension_sections", [])[:3]) if arch in QWEN35 else (),
             causal=causal,
             mean_pool=pooling == 1,
@@ -212,6 +222,11 @@ class Config:
         other or of all of them."""
         return self.causal and not self.mean_pool
 
+    @property
+    def post_eps(self) -> float:
+        """The eps of the norms of each block's output."""
+        return self.post_norm_eps or self.norm_eps
+
     def uses(self, name: str) -> bool:
         """Whether the model reads a tensor: all but those of layers past its own, as Qwen3.5's
         layer for predicting further tokens."""
@@ -225,6 +240,8 @@ def _rope(m: dict[str, Any], arch: str, sliding: bool, dims: int) -> Rope:
     swa_base = m.get("rope.freq_base_swa", base if arch in _SWA_BASE_SHARED else 10000.0)
     if sliding and arch != "gpt-oss":  # their own base, unscaled; gpt-oss's scaled as the others
         return Rope(swa_base, dims, mscale=attn_factor)
+    if arch in _NOPE_FULL:
+        return Rope(base, 0)
     # rope_freqs divides the frequencies of the layers that see all positions: all of Llama
     # 3.1's, few of Gemma 4's
     rope = Rope(swa_base if sliding else base, dims, freqs=not sliding, mscale=attn_factor)
@@ -381,6 +398,8 @@ class Transformer:
         x = ops.embedding(tokens, self.embed)
         if (scale := self.config.embed_scale) != 1:
             x = x * scale
+        if self.config.embed_norm:
+            x = ops.rms_norm(x, None, self.config.norm_eps)
         return self.forward(x, spans, live, save)
 
     def forward(
@@ -421,6 +440,8 @@ class Transformer:
 
     def logits(self, hidden: Tensor) -> Tensor:
         logits = ops.linear(hidden, self.output)
+        if (scale := self.config.logit_scale) != 1:
+            logits = logits * scale
         if cap := self.config.logit_cap:
             logits = (logits / cap).tanh() * cap
         return logits
@@ -501,7 +522,7 @@ class Transformer:
             return ops.linear(out, w["attn_output"], residual=residual)
         return ops.add_normed(
             residual, [(ops.linear(out, w["attn_output"]), s["post_attention_norm"])], None,
-            c.norm_eps,
+            c.post_eps,
         )  # fmt: skip
 
     def _rotated(
@@ -512,10 +533,11 @@ class Transformer:
         c, w, s = self.config, self.layers[i], self.small[i]
         B, T, _ = x.shape
         kv_heads, dim, eps = c.kv_heads[i], c.head_dims[i], c.norm_eps
-        gate = None
-        # Gemma 4's full-attention layers have no values of their own: the keys are, before norm
-        proj = [w["attn_q"], w["attn_k"]] + ([w["attn_v"]] if "attn_v" in w else [])
-        q, k, *values = ops.linears(x, *proj, norm=(s["attn_norm"], eps))
+        # Gemma 4's full-attention layers have no values of their own: the keys are, before norm;
+        # Muse Glimmer's gate their output by a projection of their own
+        proj = [w[n] for n in ("attn_q", "attn_k", "attn_v", "attn_gate") if n in w]
+        q, k, *rest = ops.linears(x, *proj, norm=(s["attn_norm"], eps))
+        values, gate = rest[: "attn_v" in w], rest[-1] if "attn_gate" in w else None
         if c.q_gate:  # each head's q, then the gate of its output
             q, gate = q.reshape(B, T, c.n_heads, 2 * dim).chunk(2, dim=-1)
         q, k = q.reshape(B, T, c.n_heads, dim), k.reshape(B, T, kv_heads, dim)
@@ -561,7 +583,7 @@ class Transformer:
             if "post_ffw_norm" not in s:
                 return ops.feed_forward(x, *mlp, norm, c.glu)
             out = ops.feed_forward(x, *mlp, norm, c.glu, residual=False)
-            return ops.add_normed(x, [(out, s["post_ffw_norm"])], None, eps, scale)
+            return ops.add_normed(x, [(out, s["post_ffw_norm"])], None, c.post_eps, scale)
         router = (s.get("router_norm", s["ffn_norm"]), eps)
         scores = ops.router(x, router, w["ffn_gate_inp"], s.get("ffn_gate_inp.bias"))
         # stacked gate and up matrices, or one stack of both, the gate's rows first

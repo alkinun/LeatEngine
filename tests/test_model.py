@@ -36,6 +36,7 @@ ARCHS = [
     "qwen35",
     "qwen35moe",
     "mellum",
+    "muse-glimmer",
 ]
 
 

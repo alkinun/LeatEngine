@@ -1436,12 +1436,78 @@ def _reference_mellum(w: dict[str, np.ndarray], tokens: list[int]) -> np.ndarray
     return norm(x, w["output_norm.weight"]) @ w["output.weight"].T
 
 
+# Muse Glimmer: RMSNormed embeddings; sliding-window layers of RoPE's adjacent pairs and
+# full-attention ones of no RoPE; q and k normed, the attention's output gated by a projection of
+# its own, each block's output normed, of an eps of 1e-8; and logits scaled, then capped
+MG_WINDOW, MG_SCALE, MG_CAP = 4, 0.5, 5.0
+
+
+def _write_muse_glimmer(path: Path) -> dict[str, np.ndarray]:
+    w, weights, add = _writer(path, "muse-glimmer")
+    a = "muse-glimmer."
+    for key, value in [("block_count", LAYERS), ("embedding_length", D),
+                       ("feed_forward_length", HIDDEN), ("attention.head_count", HEADS),
+                       ("attention.head_count_kv", KV_HEADS), ("attention.key_length", HEAD_DIM),
+                       ("attention.value_length", HEAD_DIM),
+                       ("attention.sliding_window", MG_WINDOW)]:  # fmt: skip
+        w.add_uint32(a + key, value)
+    w.add_array(a + "attention.sliding_window_pattern", [True, False])
+    w.add_float32(a + "rope.freq_base", 10000.0)
+    w.add_float32(a + "final_logit_softcapping", MG_CAP)
+    w.add_float32(a + "logit_scale", MG_SCALE)
+    add("token_embd.weight", *TENSORS["token_embd.weight"])
+    add("output.weight", *TENSORS["output.weight"])
+    add("output_norm.weight", (D,))
+    for i in range(LAYERS):
+        for name in ("attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm",
+                     "attn_q_norm", "attn_k_norm"):  # fmt: skip
+            add(f"blk.{i}.{name}.weight", (HEAD_DIM if "_q_" in name or "_k_" in name else D,))
+        for name in ATTENTION + MLP:
+            add(f"blk.{i}.{name}.weight", *TENSORS[name])
+        add(f"blk.{i}.attn_gate.weight", (D, D), GGMLType.Q8_0, 1e-3)
+    _finish(w)
+    return weights
+
+
+def _reference_muse_glimmer(w: dict[str, np.ndarray], tokens: list[int]) -> np.ndarray:
+    T, positions = len(tokens), np.arange(len(tokens))
+    angles = positions[:, None, None] * 10000.0 ** (-np.arange(0, HEAD_DIM, 2) / HEAD_DIM)
+    cos, sin = np.cos(angles), np.sin(angles)
+
+    def rope(z):  # adjacent pairs
+        out = np.empty_like(z)
+        out[..., 0::2] = z[..., 0::2] * cos - z[..., 1::2] * sin
+        out[..., 1::2] = z[..., 0::2] * sin + z[..., 1::2] * cos
+        return out
+
+    def post(z, weight):  # a block's output norm, of an eps of 1e-8
+        return z / np.sqrt((z * z).mean(-1, keepdims=True) + 1e-8) * weight
+
+    x = norm(w["token_embd.weight"][tokens].astype(np.float64))
+    for i in range(LAYERS):
+        lw, sliding = _layer(w, i), i == 0
+        h = norm(x, lw["attn_norm"])
+        q, k, v, gate = (h @ lw[n].T for n in ("attn_q", "attn_k", "attn_v", "attn_gate"))
+        q = norm(q.reshape(T, HEADS, HEAD_DIM), lw["attn_q_norm"])
+        k = norm(k.reshape(T, KV_HEADS, HEAD_DIM), lw["attn_k_norm"])
+        if sliding:
+            q, k = rope(q), rope(k)
+        mask = _mask(T, MG_WINDOW if sliding else 0)
+        out = attention(q, k, v.reshape(T, KV_HEADS, HEAD_DIM), mask, 1 / np.sqrt(HEAD_DIM))
+        x = x + post((out * sigmoid(gate)) @ lw["attn_output"].T, lw["post_attention_norm"])
+        h = norm(x, lw["ffn_norm"])
+        x = x + post(mlp(h, lw["ffn_gate"], lw["ffn_up"], lw["ffn_down"]), lw["post_ffw_norm"])
+    logits = norm(x, w["output_norm.weight"]) @ w["output.weight"].T * MG_SCALE
+    return np.tanh(logits / MG_CAP) * MG_CAP
+
+
 _WRITERS = {
     "gemma3": _write_gemma3, "gpt-oss": _write_gpt_oss, "phi3": _write_phi3,
-    "mellum": _write_mellum,
+    "mellum": _write_mellum, "muse-glimmer": _write_muse_glimmer,
     "qwen35": lambda path: _write_qwen35(path, "qwen35"),
     "qwen35moe": lambda path: _write_qwen35(path, "qwen35moe"),
 }  # fmt: skip
 _REFERENCES = {
     "gpt-oss": _reference_gpt_oss, "phi3": _reference_phi3, "mellum": _reference_mellum,
+    "muse-glimmer": _reference_muse_glimmer,
 }  # fmt: skip
