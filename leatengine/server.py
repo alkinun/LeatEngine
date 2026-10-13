@@ -1,0 +1,1054 @@
+"""OpenAI-compatible HTTP server: chat completions, whole or streamed, embeddings, the model list,
+loading a model, and the metrics of what it did, in Prometheus's format.
+
+Handler threads parse requests, render prompts and write responses. One worker thread owns the
+engines: it runs completions together, one per slot, a token of each per batched step, and loads a
+model once the completions before have finished; the rest wait their turn in the order they arrive.
+With an embedding model beside the model, as Qwen3-Embedding or EmbeddingGemma 2, it embeds texts
+too, one between steps, so that a long list of them never holds the completions up.
+
+Given keys, every request must hold one, as OpenAI's clients send it, `Authorization: Bearer KEY`,
+or as Anthropic's do, `x-api-key: KEY`; each key's requests, tokens and time are counted apart,
+and its prompts share cached prefixes with its own alone. A request may name the end user it is for,
+as OpenAI's `user` or `safety_identifier`, whose prompts then share them with that user's alone.
+"""
+
+import collections
+import contextlib
+import dataclasses
+import gc
+import itertools
+import json
+import queue
+import re
+import socket
+import sys
+import threading
+import time
+import urllib.parse
+import uuid
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+import jinja2
+
+from leatengine.chat import (
+    EFFORTS,
+    ChatTemplate,
+    Reply,
+    images,
+    parse_tool_calls,
+    partial_end,
+    split_reply,
+    tool_call_start,
+)
+from leatengine.defaults import Overrides, recommended
+from leatengine.draft import own_drafter
+from leatengine.engine import Engine, Sequence
+from leatengine.gguf import GGUF
+from leatengine.keys import Keys
+from leatengine.model import Config
+from leatengine.sampler import Sampling
+from leatengine.tokenizer import Tokenizer
+from leatengine.vision import Image, beside
+
+# seconds between a handler's checks that its client is still there, while it waits for text
+_HANG_UP_CHECK = 0.25
+EMBED_CONTEXT = 2048  # tokens of a text the embedding model reads at most, its start
+_EMBED_TEXTS = 256  # texts a request embeds at most
+
+
+def _integer(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _between(low: float, high: float) -> Callable[[Any], bool]:
+    return lambda v: (_integer(v) or isinstance(v, float)) and low <= v <= high
+
+
+def _tool(v: Any) -> bool:
+    # a function to call, named; its parameters, a JSON schema, the template reads as it may
+    return (
+        isinstance(v, dict)
+        and isinstance(f := v.get("function"), dict)
+        and isinstance(f.get("name"), str)
+    )
+
+
+_STOP = 256  # characters a stop string has at most, each checked against the text's end per token
+
+# the request fields leatengine reads, when present: what makes them valid, and how to say so
+_FIELDS: dict[str, tuple[Callable[[Any], bool], str]] = {
+    "messages": (lambda v: isinstance(v, list) and bool(v) and all(isinstance(m, dict) for m in v),
+                 "a non-empty list of objects"),
+    "temperature": (_between(0, 2), "a number from 0 to 2"),
+    "top_k": (_integer, "an integer"),
+    "top_p": (_between(0, 1), "a number from 0 to 1"),
+    "min_p": (_between(0, 1), "a number from 0 to 1"),
+    "presence_penalty": (_between(-2, 2), "a number from -2 to 2"),
+    "max_tokens": (lambda v: _integer(v) and v > 0, "a positive integer"),
+    "max_completion_tokens": (lambda v: _integer(v) and v > 0, "a positive integer"),
+    "seed": (_integer, "an integer"),
+    "stop": (lambda v: isinstance(v, str) and len(v) <= _STOP or isinstance(v, list)
+             and len(v) <= 16 and all(isinstance(s, str) and len(s) <= _STOP for s in v),
+             f"a string or a list of 16 strings at most, each of {_STOP} characters at most"),
+    "stream": (lambda v: isinstance(v, bool), "a boolean"),
+    "stream_options": (lambda v: isinstance(v, dict), "an object"),
+    "tools": (lambda v: isinstance(v, list) and all(_tool(t) for t in v),
+              'a list of objects, each {"type": "function", "function": {"name": ...}}'),
+    "chat_template_kwargs": (lambda v: isinstance(v, dict), "an object"),
+    "reasoning_effort": (lambda v: v in EFFORTS, f"one of {', '.join(EFFORTS)}"),
+    "user": (lambda v: isinstance(v, str) and len(v) <= 256, "a string of 256 characters at most"),
+    "safety_identifier": (lambda v: isinstance(v, str) and len(v) <= 256,
+                          "a string of 256 characters at most"),
+    "service_tier": (lambda v: v in ("auto", "default", "flex", "priority"),
+                     "one of auto, default, flex and priority"),
+}  # fmt: skip
+
+# what leatengine does not implement, each with the value that asks for nothing more
+_UNSUPPORTED = {
+    "n": 1, "frequency_penalty": 0, "repetition_penalty": 1, "logit_bias": {}, "logprobs": False,
+    "response_format": {"type": "text"},
+}  # fmt: skip
+
+
+@dataclass(frozen=True)
+class _Finish:
+    reason: str  # "stop" or "length"
+    cached: int  # prompt tokens the cache held
+    tokens: int  # tokens generated
+    prefill_time: float  # seconds from the start of generation to the first token
+    decode_time: float  # seconds from the first token to the last
+
+
+@dataclass(frozen=True)
+class _Loaded:
+    # the loaded model: its id, its engine, and its chat template
+    name: str
+    engine: Engine
+    chat: ChatTemplate
+
+
+@dataclass
+class _Load:
+    # a model to load: the worker answers None once it is ready, or the exception it raised
+    name: str
+    done: queue.SimpleQueue[Exception | None] = field(default_factory=queue.SimpleQueue)
+
+
+@dataclass
+class _Embedding:
+    # texts to embed, as their tokens: the worker answers their embeddings, in turn, or the
+    # exception it raised
+    texts: list[list[int]]
+    done: list[list[float]] = field(default_factory=list)
+    out: queue.SimpleQueue[list[list[float]] | Exception] = field(default_factory=queue.SimpleQueue)
+
+
+@dataclass(eq=False)
+class _Completion:
+    """A chat completion: what the worker generates, and what the handler answers with.
+
+    Queued requests have identity, even before their finish state has been populated.
+    """
+
+    prompt: list[int]
+    model: str  # whose chat template rendered the prompt
+    max_tokens: int
+    sampling: Sampling
+    seed: int | None
+    stop: list[str]
+    tools: list[dict[str, Any]] | None
+    stream: bool
+    stream_usage: bool
+    images: list[Image] = field(default_factory=list)  # those the prompt shows
+    form: str | None = None  # how the reply marks its reasoning, as ChatTemplate.form
+    key: str = ""  # the name of the key it came with, if the server asks for keys
+    user: str = ""  # the end user it is for, if the client names them
+    thinking: bool = False  # the prompt opened a <think> block
+    opened: str = ""  # what the prompt opened the reply with, as ChatTemplate.answer
+    # work no one waits on, of service_tier "flex", as OpenAI's flex processing: started after the
+    # completions that wait before it, and never into the last slot free
+    background: bool = False
+    id: str = field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
+    created: int = field(default_factory=lambda: int(time.time()))
+    # from the worker: pieces of text, then how generation finished or the exception it raised
+    out: queue.SimpleQueue[str | _Finish | Exception] = field(default_factory=queue.SimpleQueue)
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    finish: _Finish = field(init=False)  # once pieces() is exhausted
+
+    def pieces(self, hung_up: Callable[[], bool]) -> Iterator[str]:
+        """The reply's text as the worker produces it; then `finish` says how it ended. Raises
+        ConnectionAbortedError once `hung_up()`, checked at each piece and while none comes, as
+        for a reply that sends nothing before it ends, which would never find its client gone."""
+        while True:
+            try:
+                item: str | _Finish | Exception | None = self.out.get(timeout=_HANG_UP_CHECK)
+            except queue.Empty:
+                item = None
+            if hung_up():
+                raise ConnectionAbortedError("the client hung up")
+            if isinstance(item, str):
+                yield item
+            elif item is not None:
+                break
+        if isinstance(item, Exception):
+            raise RuntimeError(f"generation failed: {item!r}") from item
+        self.finish = item
+
+
+class Server(ThreadingHTTPServer):
+    """Serves GGUF models at http://host:port, the API at /v1 and its metrics at /metrics, until
+    shut down, to the requests that hold one of the `keys`, if given, and to any otherwise. A
+    request's sampling is what it asks for, else the `sampling` an operator sets of the model, if
+    given, else what the model's makers recommend, as leatengine.defaults has it.
+
+    One model is loaded at a time, none until load(), as Engine(path, **options); it answers every
+    request, whatever model it names. A model's id is its file name without .gguf. Unless the
+    options name a vision encoder, a model takes the projector beside it, if any, of its name, and
+    unless they name a drafter, it drafts with its own MTP layer, if any, as draft.own_drafter
+    finds it; either is left out where the GPU has no room for it. An
+    embedding model, `embed`, if given, loads at start beside it, and stays, and answers every
+    request for embeddings.
+    """
+
+    def __init__(
+        self, models: Iterable[str | Path], host: str = "127.0.0.1", port: int = 8080,
+        keys: Keys | None = None, sampling: Overrides | None = None,
+        embed: str | Path | None = None, **options: Any,
+    ):  # fmt: skip
+        self.models = {Path(path).stem: Path(path) for path in models}
+        self.embed = Path(embed) if embed is not None else None
+        self.embedder: Engine | None = None  # once the worker has loaded it
+        self.options, self.created, self.keys = options, int(time.time()), keys
+        self.overrides = sampling  # an operator's sampling, of each model's, if given
+        self.metrics = _Metrics()
+        self.busy = self.queued = 0  # completions running, and waiting for a slot, as last stepped
+        self.loaded: _Loaded | None = None
+        self.loading: str | None = None  # the id of the model the worker is loading
+        self.ready = threading.Event()  # clear from a load's request till every load asked for
+        # is done, which completions wait for
+        self.ready.set()
+        self._loads = 0  # loads asked for, not yet done
+        self._loads_lock = threading.Lock()
+        self.requests: queue.SimpleQueue[_Completion | _Load | _Embedding | None] = (
+            queue.SimpleQueue()
+        )
+        super().__init__((host, port), _Handler)
+        threading.Thread(target=self._work, name="leatengine engine", daemon=True).start()
+
+    def load(self, name: str) -> None:
+        """Loads a model in place of the loaded one, once the completions before have finished,
+        and compiles its graphs; returns when it is ready. Loading the loaded model does nothing."""
+        if name not in self.models:
+            raise ValueError(f"there is no model {name!r}")
+        with self._loads_lock:  # a completion asked from now on waits for it, rendered by its
+            # template
+            self._loads += 1
+            self.ready.clear()
+        self.requests.put(load := _Load(name))
+        if (error := load.done.get()) is not None:
+            raise RuntimeError(f"loading {name} failed: {error!r}") from error
+
+    def server_close(self) -> None:
+        super().server_close()
+        self.requests.put(None)  # the worker stops after the requests before it
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # a client that hung up before its answer was written, as one that gave up waiting, is
+        # no error to print
+        if not isinstance(sys.exc_info()[1], ConnectionError):
+            super().handle_error(request, client_address)
+
+    def _work(self) -> None:
+        # loads the embedding model, if any; then starts waiting requests in turn, embeds a text
+        # of the first embedding asked, and steps every running completion; waits for a request
+        # only when none is running or waiting, and stops after the requests that came before
+        # shutdown
+        if self.embed is not None:
+            try:
+                self.embedder = _embedder(self.embed)
+            except Exception as e:  # the models served still, without embeddings
+                print(f"{self.embed.name} failed to load, so nothing is embedded: {e!r}",
+                      file=sys.stderr, flush=True)  # fmt: skip
+                self.embed = None
+        waiting: collections.deque[_Completion | _Load] = collections.deque()
+        embedding: collections.deque[_Embedding] = collections.deque()
+        running: dict[Sequence, _Writer] = {}
+        stopping = False
+        while not stopping or waiting or running or embedding:
+            try:
+                for request in self._arrivals(wait=not (waiting or running or embedding)):
+                    if request is None:
+                        stopping = True
+                    elif isinstance(request, _Embedding):
+                        embedding.append(request)
+                    else:
+                        waiting.append(request)
+                self._admit(waiting, running)
+                if embedding:
+                    self._embed(embedding)
+                if running:
+                    self._step(running)
+            except Exception as e:  # a bug's, for every client, rather than a worker gone
+                self._fail(e, waiting, running)
+            self.busy, self.queued = len(running), sum(isinstance(r, _Completion) for r in waiting)
+
+    def _embed(self, embedding: collections.deque[_Embedding]) -> None:
+        # embeds the next text of the first embedding asked, answering it once all are
+        e = embedding[0]
+        try:
+            assert self.embedder is not None  # a handler asks for none without it
+            e.done.append(self.embedder.embed(e.texts[len(e.done)]))
+        except Exception as error:  # for the client; the server carries on
+            embedding.popleft()
+            return e.out.put(error)
+        if len(e.done) == len(e.texts):
+            embedding.popleft()
+            e.out.put(e.done)
+
+    def _fail(
+        self, error: Exception, waiting: collections.deque[_Completion | _Load],
+        running: dict[Sequence, "_Writer"],
+    ) -> None:  # fmt: skip
+        # ends every request with the error, the running completions' sequences too
+        for sequence, writer in running.items():
+            if self.loaded is not None:
+                self.loaded.engine.cancel(sequence)
+            writer.c.out.put(error)
+        for request in waiting:
+            (request.done if isinstance(request, _Load) else request.out).put(error)
+            if isinstance(request, _Load):  # completions waiting for it go on, with no load
+                self._loaded()
+        running.clear()
+        waiting.clear()
+
+    def _step(self, running: dict[Sequence, "_Writer"]) -> None:
+        # steps every running completion, after ending those whose clients hung up. The engine
+        # is local to this call, which a load waits out, so that the load can free it.
+        assert self.loaded is not None  # a load waits for running completions to finish
+        engine = self.loaded.engine
+        for sequence, writer in list(running.items()):
+            if writer.c.cancelled.is_set():  # the client hung up
+                engine.cancel(sequence)
+                writer.finish("cancelled")
+                del running[sequence]
+        if not running:
+            return
+        try:
+            stepped = engine.step()
+        except Exception as e:  # for every running completion's client
+            for sequence, writer in running.items():
+                engine.cancel(sequence)
+                writer.c.out.put(e)
+            running.clear()
+            return
+        # a speculative step gives a sequence several tokens, the last of which may end it
+        last = {sequence: i for i, (sequence, _) in enumerate(stepped)}
+        for i, (sequence, token) in enumerate(stepped):
+            if sequence not in running:  # a stop string ended it before
+                continue
+            writer = running[sequence]
+            if writer.take(token):  # end of generation or a stop string
+                engine.cancel(sequence)
+                writer.finish("stop")
+            elif sequence.done and i == last[sequence]:  # max_tokens, or the context full
+                writer.finish("length")
+            else:
+                continue
+            del running[sequence]
+
+    def _admit(
+        self, waiting: collections.deque[_Completion | _Load], running: dict[Sequence, "_Writer"]
+    ) -> None:  # fmt: skip
+        # starts what waits, as it may: a load once it is first, and nothing after it before it;
+        # then the completions before the next load, those someone waits on first, each in turn,
+        # and background ones while more than one slot is free, so that a chat asked meanwhile
+        # starts at once, however much background work waits
+        while waiting and isinstance(waiting[0], _Load):
+            if not self._start(waiting[0], running):
+                return
+            waiting.popleft()
+        ahead: list[_Completion] = []
+        for request in waiting:
+            if not isinstance(request, _Completion):
+                break
+            ahead.append(request)
+        for request in sorted(ahead, key=lambda r: r.background):
+            if request.background and not request.cancelled.is_set() and not self._spare():
+                break
+            if not self._start(request, running):
+                break
+            waiting.remove(request)
+
+    def _spare(self) -> bool:
+        # whether a slot is free besides the one kept for completions someone waits on, of an
+        # engine of more than one; a completion of no model loaded ends at once, as _start ends it
+        if (loaded := self.loaded) is None:
+            return True
+        engine = loaded.engine
+        return len(engine.active) < engine.slots - (engine.slots > 1)
+
+    def _start(self, request: _Completion | _Load, running: dict[Sequence, "_Writer"]) -> bool:
+        # starts a request, or ends it if it never can: a completion while a slot is free, a load
+        # once no completion runs. False if it must wait.
+        if isinstance(request, _Load):  # the loaded model's needs no wait
+            if running and (self.loaded is None or self.loaded.name != request.name):
+                return False
+            self._load(request)
+            return True
+        if request.cancelled.is_set():
+            return True
+        if (loaded := self.loaded) is None or loaded.name != request.model:
+            request.out.put(
+                RuntimeError(f"{request.model} was unloaded before the completion started")
+            )
+            return True
+        engine = loaded.engine
+        if len(engine.active) == engine.slots:
+            return False
+        # a key's prompts share the cache with its own alone, and an end user's with that user's,
+        # lest one tell from the time to the first token what another's asked: a key's name holds
+        # no newline, so that no key's and user's are another's. Without either, every prompt's is
+        # the same, ""
+        owner = f"{request.key}\n{request.user}" if request.user else request.key
+        try:  # timed from before start(), which copies a prefix in or restores a kept state
+            started, cached = time.perf_counter(), engine.cached_prefix(request.prompt, owner)
+            sequence = engine.start(
+                request.prompt, request.max_tokens, request.sampling, request.seed,
+                images=request.images, owner=owner,
+            )  # fmt: skip
+        except Exception as e:  # for the client; the server carries on
+            request.out.put(e)
+            return True
+        running[sequence] = _Writer(request, engine.tokenizer, cached, started, self.metrics)
+        return True
+
+    def _load(self, load: _Load) -> None:
+        # replaces the loaded model, whose memory is freed first: a GPU holds one model at most
+        if self.loaded is not None and self.loaded.name == load.name:
+            self._loaded()
+            return load.done.put(None)
+        self.loaded, self.loading = None, load.name
+        gc.collect()  # an engine's graphs refer back to it
+        error: Exception | None = None
+        try:
+            self.loaded = _Loaded(load.name, *self._engine(self.models[load.name]))
+        except Exception as e:  # for the client; the server carries on with no model
+            error = e
+        self.loading = None
+        self._loaded()
+        load.done.put(error)
+
+    def _loaded(self) -> None:
+        # a load done: completions go on once every load asked for is, rather than rendered by a
+        # model's template that one asked for later replaces, or finding none loaded meanwhile
+        with self._loads_lock:
+            self._loads -= 1
+            if not self._loads:
+                self.ready.set()
+
+    def _engine(self, path: Path) -> tuple[Engine, ChatTemplate]:
+        # a model's engine, warmed up, and its template: with the vision encoder and drafter the
+        # options name, or else the projector beside it and its own drafter, each left out, the
+        # drafter first, where the GPU has no room for it too
+        extras = {"draft": self.options.get("draft"), "vision": self.options.get("vision")}
+        found = {"draft": own_drafter(path), "vision": beside(path)}
+        optional = [(k, file) for k, file in found.items() if extras[k] is None and file]
+        extras |= dict(optional)
+        while True:
+            try:
+                return self._warmed(path, extras)
+            except MemoryError:
+                if not optional:
+                    raise
+            left, file = optional.pop(0)
+            gc.collect()  # what the try took, once its traceback is gone, past the except
+            said = "decodes without drafting" if left == "draft" else "takes no images"
+            print(f"{path.stem}: the GPU has no room for {file.name} beside it, so it {said}",
+                  file=sys.stderr, flush=True)  # fmt: skip
+            extras[left] = None
+
+    def _warmed(self, path: Path, extras: dict[str, Path | None]) -> tuple[Engine, ChatTemplate]:
+        engine = Engine(path, **self.options | extras)
+        chat = ChatTemplate(engine.gguf.metadata, engine.tokenizer)
+        engine.warm_up()
+        return engine, chat
+
+    def _arrivals(self, wait: bool) -> Iterator[_Completion | _Load | _Embedding | None]:
+        # the requests queued so far, after waiting for one if `wait`
+        with contextlib.suppress(queue.Empty):
+            yield self.requests.get(block=wait)
+            while True:
+                yield self.requests.get_nowait()
+
+
+class _Writer:
+    """Puts a completion's reply into its out queue piece by piece as tokens come: decoded, and
+    holding back any end of the text that may begin a stop string; and counts it in `metrics` once
+    it ends."""
+
+    def __init__(
+        self, c: _Completion, tokenizer: Tokenizer, cached: int, started: float,
+        metrics: "_Metrics",
+    ):  # fmt: skip
+        self.c, self.tokenizer, self.cached, self.metrics = c, tokenizer, cached, metrics
+        self.decode, self.text, self.sent, self.count = tokenizer.stream(), "", 0, 0
+        self.stopped = False  # by a stop string, the text cut where it begins
+        # when generation started, after any wait for a slot, and when the first token came
+        self.started, self.first = started, 0.0
+
+    def take(self, token: int) -> bool:
+        """Takes the next token; True if it ends the reply: end of generation or a stop string."""
+        self.count += 1
+        if self.count == 1:
+            self.first = time.perf_counter()
+        if token in self.tokenizer.eog_ids:
+            return True
+        self.text += self.decode(token)
+        # sent text holds no start of a stop string, so one can only begin after it
+        if found := [i for s in self.c.stop if (i := self.text.find(s, self.sent)) >= 0]:
+            self.text, self.stopped = self.text[: min(found)], True
+            return True
+        if (end := len(self.text) - partial_end(self.text, self.c.stop)) > self.sent:
+            self.c.out.put(self.text[self.sent : end])
+            self.sent = end
+        return False
+
+    def finish(self, reason: str) -> None:
+        """Puts the rest of the text, then how the reply ended: "stop", "length", or "cancelled" as
+        its client hung up."""
+        if not self.stopped:
+            self.text += self.decode(None)
+        if len(self.text) > self.sent:
+            self.c.out.put(self.text[self.sent :])
+        end = time.perf_counter()
+        first = self.first if self.count else end
+        finish = _Finish(reason, self.cached, self.count, first - self.started, end - first)
+        self.c.out.put(finish)
+        self.metrics.finished(self.c.key, len(self.c.prompt), finish)
+
+
+_Labels = tuple[tuple[str, str], ...]  # a sample's, by name
+_Gauge = tuple[str, str, dict[str, str], float]  # a gauge's name, help, labels and value
+
+
+class _Metrics:
+    """What the server did since it started, counted by key: its requests, and its completions'
+    tokens and time, which only grow, as Prometheus's counters do."""
+
+    COUNTERS = {
+        "leatengine_requests_total": "Requests answered, by key, path and status.",
+        "leatengine_completions_total": "Chat completions ended, by key and how: stop, length or "
+        "cancelled, as the client hung up.",
+        "leatengine_prompt_tokens_total": (
+            "Prompt tokens of the completions ended, the cached ones too."
+        ),
+        "leatengine_cached_tokens_total": (
+            "Prompt tokens the cache held, which were not computed again."
+        ),
+        "leatengine_completion_tokens_total": "Tokens generated.",
+        "leatengine_prefill_seconds_total": (
+            "Seconds from each completion's start to its first token."
+        ),
+        "leatengine_decode_seconds_total": (
+            "Seconds from each completion's first token to its last."
+        ),
+    }
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._values: dict[str, dict[_Labels, float]] = {name: {} for name in self.COUNTERS}
+
+    def add(self, name: str, value: float, **labels: str) -> None:
+        with self._lock:
+            samples, key = self._values[name], tuple(sorted(labels.items()))
+            samples[key] = samples.get(key, 0.0) + value
+
+    def finished(self, key: str, prompt: int, f: _Finish) -> None:
+        """Counts a completion that ended, of a prompt of `prompt` tokens."""
+        self.add("leatengine_completions_total", 1, key=key, finish=f.reason)
+        for name, value in (("prompt_tokens", prompt), ("cached_tokens", f.cached),
+                            ("completion_tokens", f.tokens), ("prefill_seconds", f.prefill_time),
+                            ("decode_seconds", f.decode_time)):  # fmt: skip
+            self.add(f"leatengine_{name}_total", value, key=key)
+
+    def text(self, gauges: list[_Gauge]) -> str:
+        """The counters, then the gauges, each of its name, its help, its labels and its value,
+        in Prometheus's text format."""
+        with self._lock:
+            metrics = [(name, help, "counter", list(self._values[name].items()))
+                       for name, help in self.COUNTERS.items()]  # fmt: skip
+        for name, help, named, value in gauges:
+            metrics.append((name, help, "gauge", [(tuple(named.items()), value)]))
+        lines = []
+        for name, help, kind, samples in metrics:
+            lines += [f"# HELP {name} {help}", f"# TYPE {name} {kind}"]
+            for labels, value in samples:
+                shown = ",".join(f'{k}="{_escaped(v)}"' for k, v in labels)
+                lines.append(f"{name}{{{shown}}} {_number(value)}" if shown
+                             else f"{name} {_number(value)}")  # fmt: skip
+        return "\n".join(lines) + "\n"
+
+
+def _number(value: float) -> str:
+    # a sample's value, whole if it is, else every digit of it
+    return str(int(value)) if float(value).is_integer() else repr(float(value))
+
+
+def _escaped(value: str) -> str:
+    # a label's value as Prometheus's text format quotes it
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server: Server
+    key = ""  # the name of the request's key, once it is known
+    status: int | None = None  # the status it was answered with, as the metrics count it
+
+    def do_GET(self) -> None:
+        self.path = urllib.parse.urlsplit(self.path).path  # without a query, ?v=2 say
+        routes = {"/v1/models": self._models, "/metrics": self._metrics}
+        with self._counted(self.path in routes):
+            if (route := routes.get(self.path)) is None:
+                return self._error(404, f"there is no GET {self.path}")
+            if self._authorized():
+                route()
+
+    def do_POST(self) -> None:
+        self.path = urllib.parse.urlsplit(self.path).path
+        routes = {"/v1/chat/completions": self._complete, "/v1/models/load": self._load,
+                  "/v1/embeddings": self._embeddings}  # fmt: skip
+        with self._counted(self.path in routes):
+            if (route := routes.get(self.path)) is None:
+                return self._error(404, f"there is no POST {self.path}")
+            if "Origin" in self.headers:  # a browser's: this server has no pages, and another
+                # site's may not make it generate or load models, its name made this address's
+                return self._error(403, "requests from web pages are refused")
+            if not self._authorized():
+                return
+            try:
+                if (length := int(self.headers.get("Content-Length") or 0)) < 0:  # which would
+                    # read on till the client hangs up
+                    raise ValueError("a body's length cannot be negative")
+                body = json.loads(self.rfile.read(length))
+            except (ValueError, RecursionError) as e:  # not JSON, or nested too deep to parse
+                return self._error(400, str(e))
+            with contextlib.suppress(OSError):  # the client hung up, while a model loaded say
+                route(body)
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        self.status = code
+        super().send_response(code, message)
+
+    @contextlib.contextmanager
+    def _counted(self, routed: bool) -> Iterator[None]:
+        # counts the request once answered, by its key, its path, if it is one of the API's, and
+        # its status
+        try:
+            yield
+        finally:
+            path = self.path if routed else "other"
+            status = str(self.status) if self.status is not None else "none"  # hung up first
+            self.server.metrics.add("leatengine_requests_total", 1, key=self.key, path=path,
+                                    status=status)  # fmt: skip
+
+    def _authorized(self) -> bool:
+        # whether the request holds one of the server's keys, if it has any, as OpenAI's clients
+        # send it or Anthropic's; if not, it is answered so
+        if (keys := self.server.keys) is None:
+            return True
+        given = self.headers.get("x-api-key")
+        bearer = self.headers.get("Authorization", "")
+        if given is None and bearer[:7].lower() == "bearer ":
+            given = bearer[7:].strip()
+        try:
+            self.key = keys.name(given) or ""
+        except ValueError as e:  # the file of keys is broken
+            self._error(500, str(e))
+            return False
+        if not self.key:
+            message = "this server needs an API key" if not given else "the API key is not valid"
+            self._error(401, message, {"WWW-Authenticate": 'Bearer realm="leatengine"'})
+        return bool(self.key)
+
+    def _models(self) -> None:
+        self._json(200, {"object": "list", "data": [self._model(m) for m in self.server.models]})
+
+    def _metrics(self) -> None:
+        # the counters, and the gauges of now: the slots, those busy, the completions waiting,
+        # and the model loaded
+        s, loaded = self.server, self.server.loaded
+        gauges: list[_Gauge] = [
+            ("leatengine_start_time_seconds", "When the server started, in seconds since 1970.", {},
+             s.created),
+            ("leatengine_slots", "Slots of the KV cache, each of a completion at a time.", {},
+             loaded.engine.slots if loaded else 0),
+            ("leatengine_slots_busy", "Slots a completion runs in.", {}, s.busy),
+            ("leatengine_completions_waiting", "Completions waiting for a slot.", {}, s.queued),
+        ]  # fmt: skip
+        if loaded is not None:
+            gauges.append(("leatengine_model_loaded", "The model loaded, of its context in tokens.",
+                           {"model": loaded.name}, loaded.engine.max_context))  # fmt: skip
+        data = s.metrics.text(gauges).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _load(self, body: Any) -> None:
+        name = body.get("model") if isinstance(body, dict) else None
+        if not isinstance(name, str) or name not in self.server.models:
+            return self._error(404, f"there is no model {name!r}")
+        try:
+            self.server.load(name)
+        except RuntimeError as e:
+            return self._error(500, str(e))
+        self._json(200, self._model(name))
+
+    def _embeddings(self, body: Any) -> None:
+        # each text's embedding, as OpenAI's API gives them, of the texts' starts, as many tokens
+        # as the embedding model reads
+        server = self.server
+        if server.embed is None:
+            return self._error(404, "this server embeds nothing: start it with --embed MODEL")
+        given = body.get("input") if isinstance(body, dict) else None
+        texts = [given] if isinstance(given, str) else given
+        if not (isinstance(texts, list) and 0 < len(texts) <= _EMBED_TEXTS
+                and all(isinstance(t, str) and t for t in texts)):  # fmt: skip
+            return self._error(400, f"input must be some text, or a list of 1 to {_EMBED_TEXTS}")
+        while server.embedder is None and server.embed is not None:  # loading, at start
+            time.sleep(_HANG_UP_CHECK)
+        if (engine := server.embedder) is None:
+            return self._error(404, "this server's embedding model failed to load")
+        tokens = [_embedded(engine, text) for text in texts]
+        server.requests.put(asked := _Embedding(tokens))
+        if isinstance(said := asked.out.get(), Exception):
+            return self._error(500, f"embedding failed: {said!r}")
+        data = [{"object": "embedding", "index": i, "embedding": v} for i, v in enumerate(said)]
+        used = sum(map(len, tokens))
+        self._json(200, {"object": "list", "data": data, "model": server.embed.stem,
+                         "usage": {"prompt_tokens": used, "total_tokens": used}})  # fmt: skip
+
+    def _complete(self, body: Any) -> None:
+        self.server.ready.wait()  # for the model loading, if one is, whose template renders it
+        try:
+            completion = _completion(body, self.server)
+        except (ValueError, TypeError, jinja2.TemplateError) as e:
+            return self._error(400, str(e))
+        except _Unset as e:  # the operator's file of sampling, broken
+            return self._error(500, str(e))
+        completion.key = self.key
+        self.server.requests.put(completion)
+        try:
+            if completion.stream:
+                self._stream(completion)
+            else:
+                self._reply(completion)
+        except OSError:  # the client hung up
+            completion.cancelled.set()
+
+    def _reply(self, c: _Completion) -> None:
+        try:
+            text = c.opened + "".join(c.pieces(self._hung_up))
+            reply = split_reply(text, c.form, c.thinking, done=True)
+        except RuntimeError as e:
+            return self._error(500, str(e))
+        reason = c.finish.reason
+        content, calls = _calls(reply, c.tools, c.finish.reason)
+        message: dict[str, Any] = {"role": "assistant", "content": content}
+        if reply.reasoning:
+            message["reasoning_content"] = reply.reasoning
+        if calls:
+            message |= {"content": content or None, "tool_calls": _tool_calls(calls)}
+            reason = "tool_calls"
+        choice = {"index": 0, "message": message, "logprobs": None, "finish_reason": reason}
+        body = {"choices": [choice], "usage": _usage(c), "timings": _timings(c)}
+        self._json(200, self._head(c, "chat.completion") | body)
+
+    def _stream(self, c: _Completion) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self._chunk(c, {"role": "assistant", "content": ""})
+        # what may yet be part of a tool call is held back; the reply is split once more when
+        # done, the end that may have begun a marker then its own
+        text, reasoned, sent, reply = c.opened, 0, 0, Reply()
+        try:
+            for piece in itertools.chain(c.pieces(self._hung_up), [None]):
+                text += piece or ""
+                reply = split_reply(text, c.form, c.thinking, done=piece is None)
+                if len(reply.reasoning) > reasoned:
+                    self._chunk(c, {"reasoning_content": reply.reasoning[reasoned:]})
+                    reasoned = len(reply.reasoning)
+                content = reply.content
+                if (end := tool_call_start(content) if c.tools else len(content)) > sent:
+                    self._chunk(c, {"content": content[sent:end]})
+                    sent = end
+        except RuntimeError as e:
+            return self._event({"error": {"message": str(e), "type": "server_error"}})
+        reason = c.finish.reason
+        content, calls = _calls(reply, c.tools, c.finish.reason)
+        if len(content) > sent:
+            self._chunk(c, {"content": content[sent:]})
+        if calls:
+            self._chunk(
+                c,
+                {"tool_calls": [{"index": i} | call for i, call in enumerate(_tool_calls(calls))]},
+            )
+            reason = "tool_calls"
+        # the timings on the last chunk, as llama.cpp's server sends them
+        timings = {"timings": _timings(c)}
+        self._chunk(c, {}, reason, {} if c.stream_usage else timings)
+        if c.stream_usage:
+            usage = {"choices": [], "usage": _usage(c)} | timings
+            self._event(self._head(c, "chat.completion.chunk") | usage)
+        self._event("[DONE]")
+
+    def _hung_up(self) -> bool:
+        # whether the client closed the connection: it reads as ready, with nothing to read
+        try:
+            return not self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+        except BlockingIOError:  # nothing to read yet
+            return False
+        except OSError:
+            return True
+
+    def _model(self, name: str) -> dict[str, Any]:
+        # as OpenAI lists it, with its status, and its context once loaded, which clients such as
+        # chat clients fit their prompts to
+        s = self.server
+        loaded = s.loaded  # once, as a load may change it meanwhile
+        loaded = loaded if loaded is not None and loaded.name == name else None
+        status = "loaded" if loaded else "loading" if s.loading == name else "unloaded"
+        model = {"id": name, "object": "model", "created": s.created, "owned_by": "leatengine"}
+        if loaded:  # the efforts it reasons at, and if it takes images, the tokens one takes
+            chat = loaded.chat
+            model["max_context"] = loaded.engine.max_context
+            if chat.efforts:
+                model["reasoning"] = {"efforts": list(chat.efforts), "default": chat.default_effort}
+            with contextlib.suppress(_Unset):  # said when a completion asks for it
+                reasons, plain = _sampling(s, loaded)
+                model["sampling"] = {"reasoning": reasons, "plain": plain}
+            if (vision := loaded.engine.vision) is not None:
+                # a square image's embeddings, as most images are, and the few that wrap them
+                model |= {"vision": True, "image_tokens": vision.typical + 8}
+        return model | {"status": status}
+
+    def _head(self, c: _Completion, kind: str) -> dict[str, Any]:
+        return {"id": c.id, "object": kind, "created": c.created, "model": c.model}
+
+    def _chunk(
+        self, c: _Completion, delta: dict[str, Any], reason: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:  # fmt: skip
+        choice = {"index": 0, "delta": delta, "logprobs": None, "finish_reason": reason}
+        self._event(self._head(c, "chat.completion.chunk") | {"choices": [choice]} | (extra or {}))
+
+    def _event(self, data: dict[str, Any] | str) -> None:
+        text = data if isinstance(data, str) else json.dumps(data)
+        self.wfile.write(f"data: {text}\n\n".encode())
+
+    def _json(
+        self, status: int, body: dict[str, Any], headers: dict[str, str] | None = None
+    ) -> None:
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _error(self, status: int, message: str, headers: dict[str, str] | None = None) -> None:
+        kind = "invalid_request_error" if status < 500 else "server_error"
+        code = "invalid_api_key" if status == 401 else None
+        error = {"message": message, "type": kind, "param": None, "code": code}
+        self._json(status, {"error": error}, headers)
+
+
+def _embedded(engine: Engine, text: str) -> list[int]:
+    # a text's tokens, as the embedding model reads it: its start, and its end-of-text token if the
+    # model's tokenizer adds one, as Qwen3-Embedding's does, whose state it pools, and
+    # EmbeddingGemma 2's
+    eos, adds = engine.tokenizer.eos_id, engine.gguf.metadata.get("tokenizer.ggml.add_eos_token")
+    end = [eos] if eos is not None and adds else []
+    return engine.tokenizer.encode(text)[: engine.max_context - 1 - len(end)] + end
+
+
+def _embedder(path: Path) -> Engine:
+    # an embedding model's engine, of EMBED_CONTEXT or its own context if less, a text in chunks
+    # of 512 tokens where the model embeds so, else in one; its graphs compiled, for a text of a
+    # few tokens and for more
+    config = Config.from_gguf(GGUF.open(path).metadata)
+    context = min(EMBED_CONTEXT, config.context_length)
+    chunk = 512 if config.embeds_in_chunks else context
+    engine = Engine(path, max_context=context, prefill_chunk=chunk)
+    engine.embed([0])
+    engine.embed([0] * 32)
+    return engine
+
+
+def _completion(body: Any, server: Server) -> _Completion:
+    # what a request body asks for, or a ValueError saying what is wrong with it
+    if not isinstance(body, dict) or body.get("messages") is None:
+        raise ValueError("a chat completion needs messages")
+    for key, (valid, expected) in _FIELDS.items():
+        if body.get(key) is not None and not valid(body[key]):
+            raise ValueError(f"{key} must be {expected}")
+    for key, neutral in _UNSUPPORTED.items():
+        if body.get(key) not in (None, neutral):
+            raise ValueError(f"{key}={body[key]!r} is not supported")
+    if (choice := body.get("tool_choice") or "auto") not in ("auto", "none"):
+        raise ValueError(f"tool_choice={choice!r} is not supported, only 'auto' and 'none'")
+    if (loaded := server.loaded) is None:
+        raise ValueError("no model is loaded")
+    # tool_choice "none" as OpenAI's API has it: the tools still declared, so that the prompt is
+    # as of "auto", which the cache may hold, and the reply opened as an answer, as harmony's
+    # final channel opens it, of a format that marks one; else the tools left out
+    declared, opened = body.get("tools") or None, ""
+    if choice == "none" and declared and not (opened := loaded.chat.answer):
+        declared = None
+    tools = declared if choice == "auto" else None
+    # the reasoning effort, as the template is told it, and options for the template too, such as
+    # Qwen3's enable_thinking, as llama.cpp and vLLM take, which a client gives over the effort
+    effort = loaded.chat.effort(body["reasoning_effort"]) if body.get("reasoning_effort") else {}
+    given = body.get("chat_template_kwargs") or {}
+    options = effort | given | ({"tools": declared} if declared else {})
+    text = loaded.chat.render(body["messages"], **options) + opened
+    if (files := images(body["messages"])) and loaded.engine.vision is None:
+        raise ValueError(f"{loaded.name} takes no images: it has no vision encoder")
+    shown = [loaded.engine.image(data) for data in files]
+    prompt = loaded.chat.tokens(text, [image.tokens for image in shown])
+    if len(prompt) >= (context := loaded.engine.max_context):
+        raise ValueError(f"the prompt has {len(prompt)} tokens, too many for {context} of context")
+    # what the request asks for of its sampling, else the model's, as it reasons or not
+    stop, given = body.get("stop") or [], {k: v for k, v in body.items() if v is not None}
+    defaults = _sampling(server, loaded)[0 if _reasons(loaded.chat, options) else 1]
+    sampling = Sampling(**({k: given.get(k, v) for k, v in defaults.items()}))
+    sampling = dataclasses.replace(sampling, top_k=max(sampling.top_k, 0))  # vLLM's -1: every one
+    return _Completion(
+        prompt,
+        loaded.name,
+        max_tokens=body.get("max_completion_tokens") or body.get("max_tokens") or context,
+        sampling=sampling,
+        seed=body.get("seed"),
+        stop=[s for s in ([stop] if isinstance(stop, str) else stop) if s],
+        tools=tools,
+        stream=bool(body.get("stream")),
+        stream_usage=bool((body.get("stream_options") or {}).get("include_usage")),
+        images=shown,
+        form=loaded.chat.form,
+        user=body.get("safety_identifier") or body.get("user") or "",
+        thinking=loaded.chat.opens_thinking(text),
+        opened=opened,
+        background=body.get("service_tier") == "flex",
+    )
+
+
+class _Unset(Exception):
+    """The operator's file of sampling is broken."""
+
+
+def _sampling(server: Server, loaded: _Loaded) -> tuple[dict[str, float], dict[str, float]]:
+    # a model's sampling as it reasons and as it does not: its makers', under the operator's.
+    # Raises _Unset if the operator's file is broken.
+    reasons, plain = recommended(loaded.engine.gguf.metadata)
+    try:
+        own = server.overrides.of(loaded.name) if server.overrides is not None else {}
+    except (OSError, ValueError) as e:
+        raise _Unset(f"the server's sampling cannot be read: {e}") from e
+    return reasons | own, plain | own
+
+
+def _reasons(chat: ChatTemplate, options: dict[str, Any]) -> bool:
+    # whether a model reasons, as its template is told: as enable_thinking says, if the template
+    # is told it, else as its default effort is, a model of levels at every one, as gpt-oss does
+    if "enable_thinking" in options:
+        return bool(options["enable_thinking"])
+    return (chat.default_effort or "none") != "none"
+
+
+def _calls(
+    reply: Reply, tools: list[dict[str, Any]] | None, reason: str
+) -> tuple[str, list[dict[str, Any]]]:
+    # a reply's text and its calls to the tools: those of the harmony format, every one, or those
+    # of the text. A call the context cut off, of a reply that ended for its length, is no text:
+    # the text ends where it began, but for a reply all of JSON, as Llama 3's calls are, which may
+    # be text whole.
+    if not tools:
+        return reply.content, []
+    if not reply.calls:
+        content, calls = parse_tool_calls(reply.content, tools)
+        if reason == "length" and not calls and not content.lstrip().startswith("{"):
+            content = content[: tool_call_start(content)]
+        return content, calls
+    # as the model made them, as OpenAI's API passes them on, of tools not given and of arguments
+    # that are no JSON object too, as gpt-oss calls the python it was trained with: the client
+    # answers that it has no such tool, and the model goes on, rather than its turn ending in a
+    # reply of nothing
+    names, calls = {tool.get("function", {}).get("name") for tool in tools}, []
+    for call in reply.calls:
+        name, arguments = call["name"], call["arguments"]
+        # a tool's name run into the channel it is called on, as gpt-oss writes
+        # to=functions.searchcommentary at times, leaving out the <|channel|> between
+        bare = re.sub(r"(commentary|analysis|final)$", "", name)
+        name = bare if name not in names and bare in names else name
+        with contextlib.suppress(ValueError, RecursionError):
+            if isinstance(parsed := json.loads(arguments), dict):
+                arguments = parsed
+        calls.append({"name": name, "arguments": arguments})
+    return reply.content, calls
+
+
+def _tool_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # as OpenAI's API has them, with the arguments as JSON text, or as the model wrote them, if
+    # they are no JSON object
+    return [
+        {
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": c["name"],
+                "arguments": c["arguments"]
+                if isinstance(c["arguments"], str)
+                else json.dumps(c["arguments"], ensure_ascii=False),
+            },
+        }
+        for c in calls
+    ]
+
+
+def _usage(c: _Completion) -> dict[str, Any]:
+    prompt, generated = len(c.prompt), c.finish.tokens
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": generated,
+        "total_tokens": prompt + generated,
+        "prompt_tokens_details": {"cached_tokens": c.finish.cached},
+    }
+
+
+def _timings(c: _Completion) -> dict[str, Any]:
+    # as llama.cpp's server reports them: the prompt's tokens past those cached, timed from the
+    # start of generation, after any wait for a slot, to the first token; and the reply's tokens,
+    # timed from the first to the last: the first comes of the prompt's last step, so that time
+    # holds one step fewer than there are tokens, and of a reply of one token, no rate
+    f = c.finish
+    timings: dict[str, Any] = {"cache_n": f.cached}
+    parts = (("prompt", len(c.prompt) - f.cached, f.prefill_time, True),
+             ("predicted", f.tokens, f.decode_time, f.tokens > 1))  # fmt: skip
+    for name, n, seconds, timed in parts:
+        timings |= {
+            f"{name}_n": n,
+            f"{name}_ms": 1e3 * seconds,
+            f"{name}_per_token_ms": 1e3 * seconds / n if n and timed else 0.0,
+            f"{name}_per_second": n / seconds if seconds and timed else 0.0,
+        }
+    return timings

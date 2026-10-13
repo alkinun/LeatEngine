@@ -1,0 +1,70 @@
+[project]
+name = "leatengine"
+version = "0.0.1"
+description = "A minimal GGUF inference engine built on tinygrad, focused on Strix Halo."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+  "jinja2>=3.1.6",
+  "pillow>=12.3.0",
+  # tinygrad's custom-kernel and HCQ APIs move fast: pin a commit and bump it deliberately.
+  "tinygrad @ git+https://github.com/tinygrad/tinygrad.git@9d7054488aee0e455e226514ba4b8b2f32329c29",
+]
+
+[project.scripts]
+leatengine = "leatengine.cli:main"
+
+[project.urls]
+Repository = "https://github.com/alkinun/LeatEngine"
+Issues = "https://github.com/alkinun/LeatEngine/issues"
+
+[dependency-groups]
+dev = ["gguf", "mypy", "numpy", "openai", "pytest", "pytest-cov", "pytest-xdist", "ruff"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["leatengine"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/leatengine", "/tests", "/scripts", "/docs",
+  "/README.md", "/LICENSE", "/pyproject.toml", "/uv.lock",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM"]
+
+[tool.mypy]
+files = ["leatengine"]
+python_version = "3.12"
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+  "gpu: needs a GPU backend (DEV=NV, CUDA, AMD or MOCK+AMD)",
+  "model: needs a real GGUF model (LEATENGINE_MODEL=path.gguf)",
+]
+
+[tool.coverage.run]
+source = ["leatengine"]
+core = "sysmon"  # Python's monitoring: the default tracer slows the emulated GPU's tests 2x
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

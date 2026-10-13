@@ -1,0 +1,135 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# a newer push to a branch or pull request supersedes its run in progress
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.14"
+      - run: uv sync --locked
+      - run: uv run python scripts/check_package.py
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.14"
+      - run: uv sync --locked
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      - run: uv run mypy
+
+  test:
+    # the hermetic CPU suite on the minimum supported Python and the primary development version
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - run: uv run pytest -n auto --dist worksteal --cov --cov-report= --durations=20
+        env:
+          DEV: CPU
+          COVERAGE_FILE: .coverage.cpu-${{ matrix.python }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-cpu-${{ matrix.python }}
+          path: .coverage.cpu-${{ matrix.python }}
+          include-hidden-files: true
+
+  kernels:
+    # the GPU tests, the warp-level kernels' and every tiny model through them, on tinygrad's
+    # emulated RDNA 3 GPU, as tests/hip.py sets up: their HIP C compiled by the runner's clang,
+    # and the emulator from tinygrad's source tree, at the commit pyproject.toml pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update -q && sudo apt-get install -y -q clang lld
+      - run: |
+          commit=$(grep -oP 'tinygrad\.git@\K[0-9a-f]{40}' pyproject.toml)
+          git clone --quiet --filter=blob:none https://github.com/tinygrad/tinygrad.git "$RUNNER_TEMP/tinygrad"
+          git -C "$RUNNER_TEMP/tinygrad" checkout --quiet "$commit"
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.14"
+      - run: uv sync --locked
+      - run: uv run pytest -m gpu -n auto --dist worksteal --cov --cov-report= --durations=20
+        env:
+          DEV: MOCK+AMD
+          PYTHONPATH: ${{ runner.temp }}/tinygrad
+          COVERAGE_FILE: .coverage.kernels
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-kernels
+          path: .coverage.kernels
+          include-hidden-files: true
+
+  tokenizer:
+    # the tokenizers against llama.cpp's on the vocabs it tests its own with: its llama-tokenize,
+    # built at a commit pinned here, which a bump moves deliberately
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LLAMA_CPP_COMMIT: 889edf43ddae0cfe9a4564a882764dc879759870
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          src="$RUNNER_TEMP/llama.cpp"
+          git clone --quiet --filter=blob:none https://github.com/ggml-org/llama.cpp.git "$src"
+          git -C "$src" checkout --quiet "$LLAMA_CPP_COMMIT"
+          cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
+            -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF
+          cmake --build "$src/build" --target llama-tokenize -j 4
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.14"
+      - run: uv sync --locked
+      - run: uv run pytest tests/test_tokenizer.py -k vocab_matches -n auto
+        env:
+          DEV: CPU
+          LLAMA_CPP: ${{ runner.temp }}/llama.cpp/build/bin
+
+  coverage:
+    # of the CPU's and the emulated GPU's runs together: what neither reaches is either untested
+    # or NVIDIA's alone, the tensor cores' kernels
+    needs: [test, kernels]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.14"
+      - run: uv sync --locked
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: coverage-*
+          merge-multiple: true
+      - run: uv run coverage combine .coverage.*
+      - run: uv run coverage report --fail-under=80
