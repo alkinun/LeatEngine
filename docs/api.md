@@ -14,7 +14,8 @@ and metrics extensions. It serves no HTML, frontend, or browser application.
 | `POST /v1/embeddings` | Embed text using the separately configured embedding model |
 | `GET /metrics` | Prometheus metrics with the `leatengine_` prefix |
 
-All routes use the same authentication when keys are enabled. Errors use an `error` object
+All routes use the same authentication when keys are enabled. Request bodies are limited to
+64 MiB. Errors use an `error` object
 with `message`, `type`, `param`, and `code`. A generation error after streaming starts arrives
 as an SSE error event; clients must handle that as well as HTTP errors.
 
@@ -52,6 +53,8 @@ message roles and tool formats a model understands.
 - Reasoning is returned as `reasoning_content`. `reasoning_effort` and
   `chat_template_kwargs` control supported templates; explicit template options take precedence.
 - Tool calls are returned in OpenAI-style `tool_calls`. The engine does not execute them.
+  A reply cut off by `max_tokens` or the context keeps `finish_reason: "length"` even when it
+  holds complete calls, as a later call may be missing.
 - Image content parts accept `image_url` with base64 `data:` URLs. Remote image URLs are not
   fetched. Supply `--mmproj` or a recognized projector beside the model.
 - `service_tier: "flex"` schedules a completion behind foreground requests.

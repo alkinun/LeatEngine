@@ -18,7 +18,6 @@ import io
 import math
 import re
 import threading
-import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -523,15 +522,20 @@ def _metadata(metadata: dict[str, Any]) -> dict[str, Any]:
 
 
 def _picture(data: bytes) -> Picture.Image:
-    # an image file's RGB picture, upright and its transparency over white
+    # an image file's RGB picture, upright and its transparency over white. Pixels past Pillow's
+    # limit are refused before they are decoded, by a check of its own rather than a warnings
+    # filter, which would be the process's, and so another thread's too.
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Picture.DecompressionBombWarning)
-            with Picture.open(io.BytesIO(data)) as opened:
-                picture = ImageOps.exif_transpose(opened)
+        with Picture.open(io.BytesIO(data)) as opened:
+            limit, pixels = Picture.MAX_IMAGE_PIXELS, opened.width * opened.height
+            if limit is not None and pixels > limit:
+                raise ValueError(f"{pixels} pixels, more than {limit}")
+            picture = ImageOps.exif_transpose(opened)
     except UnidentifiedImageError:  # whose message names the bytes' Python object
         raise ValueError("not an image Pillow reads") from None
-    except (OSError, Picture.DecompressionBombError, Picture.DecompressionBombWarning) as e:
+    except MemoryError:
+        raise
+    except Exception as e:  # a broken file's: Pillow raises OSError, SyntaxError and others
         raise ValueError(f"not an image Pillow reads: {e}") from None
     if picture.has_transparency_data:
         rgba = picture.convert("RGBA")

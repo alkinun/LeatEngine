@@ -45,7 +45,11 @@ def test_checked():
     for bad, error in [([], "x must be an object"), ({"seed": 1}, "x has 'seed', none of"),
                        ({"top_k": 1.5}, "top_k must be an integer"),
                        ({"temperature": 3}, "temperature must be a number from 0 to 2"),
-                       ({"top_p": True}, "top_p must be a number")]:  # fmt: skip
+                       ({"top_p": True}, "top_p must be a number"),
+                       # of JSON's Infinity, which Python's json reads, and of a number past
+                       # a float's
+                       ({"top_k": float("inf")}, "top_k must be an integer"),
+                       ({"min_p": float("nan")}, "min_p must be a number")]:  # fmt: skip
         with pytest.raises(ValueError, match=error):
             checked(bad, "x")
 

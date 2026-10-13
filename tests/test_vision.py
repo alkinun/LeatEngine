@@ -13,7 +13,7 @@ from leatengine import vision
 from leatengine.engine import Engine
 from leatengine.gguf import GGUF
 from leatengine.tokenizer import Tokenizer
-from leatengine.vision import _fit, _resized, _within, beside, projector
+from leatengine.vision import _fit, _picture, _resized, _within, beside, projector
 from tests.helpers import (
     CONTEXT,
     G3_IMAGE,
@@ -225,6 +225,24 @@ def test_image_bytes(tiny, tiny_mmproj):
         v.image(b"GIF89a, but not")
     with pytest.raises(ValueError, match="^not an image Pillow reads$"):  # no Python object named
         v.image(b"no image at all")
+
+
+def test_broken_images(monkeypatch):
+    # a file Pillow cannot decode is refused, however Pillow says so, and one of too many pixels
+    # before it is decoded
+    def broken(data):
+        raise SyntaxError("broken PNG file")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Picture, "open", broken)
+        with pytest.raises(ValueError, match="not an image Pillow reads: broken PNG"):
+            _picture(png(30, 30))
+    monkeypatch.setattr(Picture, "MAX_IMAGE_PIXELS", 30 * 30 - 1)
+    with (
+        pytest.warns(Picture.DecompressionBombWarning),
+        pytest.raises(ValueError, match="900 pixels, more than 899"),
+    ):
+        _picture(png(30, 30))
 
 
 @pytest.mark.usefixtures("reference_ops")

@@ -92,7 +92,7 @@ def checked(options: Any, where: str) -> Options:
         kind, low, high = OPTIONS.get(name, (None, 0, 0))
         if kind is None:
             raise ValueError(f"{where} has {name!r}, none of {', '.join(OPTIONS)}")
-        ok = isinstance(value, int | float) and not isinstance(value, bool)
+        ok = isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
         if not ok or (kind is int and value != int(value)) or not low <= value <= high:
             what = "an integer" if kind is int else "a number"
             raise ValueError(f"{where}'s {name} must be {what} from {low} to {high}")

@@ -15,13 +15,14 @@ from types import SimpleNamespace
 import openai
 import pytest
 
+from leatengine import server as server_module
 from leatengine.chat import ChatTemplate, Reply
 from leatengine.defaults import OPENAI, Overrides
 from leatengine.engine import Engine
 from leatengine.gguf import GGUF
 from leatengine.keys import Keys
 from leatengine.sampler import Sampling
-from leatengine.server import Server, _calls, _Completion, _completion, _Load, _Writer
+from leatengine.server import Server, _calls, _Completion, _completion, _Load, _reasons, _Writer
 from leatengine.tokenizer import Tokenizer
 from tests.helpers import CONTEXT, Oracle, chat_template, reference_embedding
 
@@ -251,18 +252,23 @@ def test_stop(client, expected, stream):
     assert reply == (full[: full.index(stops[1])], "stop")
 
 
+def _asked(body: dict, server: Server) -> _Completion:
+    # what a request asks for of the server's loaded model
+    return _completion(body, server, server.loaded)
+
+
 def test_completion(server):
     # what a request asks for: OpenAI's fields and vLLM's, top_k of -1 keeping every token as 0
     messages = [{"role": "user", "content": "hi"}]
     body = {"messages": messages, "temperature": 0.5, "top_k": -1, "top_p": 0.9, "min_p": 0.05,
             "presence_penalty": 1.5, "max_tokens": 9, "max_completion_tokens": 7, "stop": "x",
             "seed": 3}  # fmt: skip
-    asked = _completion(body, server)
+    asked = _asked(body, server)
     assert asked.sampling == Sampling(0.5, 0, 0.9, 0.05, 1.5)
     hi = server.loaded.engine.tokenizer.encode("hi")
     assert (asked.prompt, asked.max_tokens, asked.stop, asked.seed) == (hi, 7, ["x"], 3)
     # and by default, OpenAI's temperature of 1, up to the context and without empty stops
-    asked = _completion({"messages": messages, "stop": ["", "y"], "top_p": None}, server)
+    asked = _asked({"messages": messages, "stop": ["", "y"], "top_p": None}, server)
     assert (asked.sampling, asked.max_tokens, asked.stop) == (Sampling(1.0), CONTEXT, ["y"])
 
 
@@ -274,15 +280,15 @@ def test_sampling_defaults(server, client, monkeypatch, tmp_path):
         OPENAI | thinks, OPENAI | plain))  # fmt: skip
     messages = [{"role": "user", "content": "hi"}]
     on = {"chat_template_kwargs": {"enable_thinking": True}}
-    assert _completion({"messages": messages} | on, server).sampling == Sampling(0.6, 20)
+    assert _asked({"messages": messages} | on, server).sampling == Sampling(0.6, 20)
     # the tiny model's, which never reasons
-    assert _completion({"messages": messages}, server).sampling == Sampling(0.7, 20)
+    assert _asked({"messages": messages}, server).sampling == Sampling(0.7, 20)
     path = tmp_path / "sampling.json"
     path.write_text(json.dumps({"*": {"min_p": 0.05}, "tiny": {"top_k": 40}}))
     monkeypatch.setattr(server, "overrides", Overrides(path))
-    asked = _completion({"messages": messages, "top_k": 5}, server)
+    asked = _asked({"messages": messages, "top_k": 5}, server)
     assert asked.sampling == Sampling(0.7, 5, 1.0, 0.05)  # the request's over all
-    assert _completion({"messages": messages}, server).sampling == Sampling(0.7, 40, 1.0, 0.05)
+    assert _asked({"messages": messages}, server).sampling == Sampling(0.7, 40, 1.0, 0.05)
     (model,) = client.models.list()
     assert model.sampling["plain"] == OPENAI | plain | {"top_k": 40, "min_p": 0.05}
     path.write_text("[]")  # broken: said to the client, the server going on
@@ -368,9 +374,13 @@ def test_reasoning_effort(client, server, monkeypatch):
 @pytest.fixture
 def replies_with(engine, monkeypatch):
     # makes the engine reply with the given text, which the tiny model would never write: each
-    # step gives every active sequence its next token, and ends it at the last
-    def reply_with(text: str) -> None:
-        tokens = engine.tokenizer.encode(text)
+    # step gives every active sequence its next token, and ends it at the last, an end of
+    # generation unless the reply is to be cut off, as by max_tokens
+    end = int(engine.model.output.shape[0]) - 1  # an end of generation, the tiny vocab has none
+    monkeypatch.setattr(engine.tokenizer, "eog_ids", engine.tokenizer.eog_ids | {end})
+
+    def reply_with(text: str, cut_off: bool = False) -> None:
+        tokens = engine.tokenizer.encode(text) + ([] if cut_off else [end])
 
         def step():
             out = []
@@ -522,7 +532,7 @@ def test_tool_choice_none(client, server, replies_with, monkeypatch, stream):
 def test_text_is_not_a_tool_call(client, replies_with, stream, text, choice):
     replies_with(text)
     kwargs = {"tools": [WEATHER], "tool_choice": choice, "stream": stream}
-    assert complete(client, "Weather in Paris?", **kwargs) == (text, "length")
+    assert complete(client, "Weather in Paris?", **kwargs) == (text, "stop")
 
 
 @pytest.mark.parametrize(
@@ -647,6 +657,10 @@ def test_keys(tiny_model, tmp_path):
         request = urllib.request.Request(f"{url}/v1/chat/completions", body.encode(), anthropic)
         with urllib.request.urlopen(request) as response:
             assert response.status == 200
+        # an empty x-api-key, as a client may send by default, leaves the bearer key to count
+        both = {"x-api-key": "", "Authorization": f"Bearer {alkin}"}
+        with urllib.request.urlopen(urllib.request.Request(url + "/v1/models", None, both)) as r:
+            assert r.status == 200
         counted = metrics(server, agent)
         assert counted['leatengine_completion_tokens_total{key="alkin"}'] == 2
         assert counted['leatengine_completion_tokens_total{key="agent"}'] == 1
@@ -782,7 +796,50 @@ def test_engine_error(client, engine, monkeypatch):
     monkeypatch.setattr(engine, "step", fail)
     with pytest.raises(openai.InternalServerError, match="out of memory"):
         chat(client, "hello", max_tokens=4)
+    # what the step wrote of the cache is not known: no prefix is shared on
+    assert not any(engine._cached)
     assert complete(client, "hello", max_tokens=2)[1] == "length"
+
+
+def test_unexpected_error(client, server, monkeypatch):
+    # a request that fails in a way the handler did not expect is answered, not dropped
+    def fail(*args):
+        raise KeyError("a bug")
+
+    monkeypatch.setattr("leatengine.server._completion", fail)
+    with pytest.raises(openai.InternalServerError, match="failed to answer"):
+        chat(client, "hello", max_tokens=1)
+    monkeypatch.undo()
+    deep = [{"role": "user", "content": "hi", "x": json.loads("[" * 20000 + "]" * 20000)}]
+    with pytest.raises(openai.BadRequestError, match="nested too deeply"):
+        client.chat.completions.create(model="tiny", messages=deep, max_tokens=1)
+    # a body too long to read is refused before it is read
+    head = "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 4611686018427387904\r\n\r\n"
+    with socket.create_connection(("127.0.0.1", server.server_port), timeout=10) as connection:
+        connection.sendall(head.encode())
+        assert connection.recv(64).startswith(b"HTTP/1.0 413")
+
+
+def test_completion_rendered_as_a_load_begins(tiny_model, tmp_path, monkeypatch):
+    # a completion rendered by one model's template while a load of another begins is rendered
+    # again, by the other's, rather than failing once its model is gone
+    (other := tmp_path / "other.gguf").symlink_to(tiny_model[0])
+    completion, loading = server_module._completion, []
+
+    def rendered(body, server, loaded):
+        asked = completion(body, server, loaded)
+        if not loading:  # the first time, a load begins meanwhile
+            loading.append(threading.Thread(target=server.load, args=("other",)))
+            loading[0].start()
+            while server.ready.is_set():
+                time.sleep(0.001)
+        return asked
+
+    monkeypatch.setattr(server_module, "_completion", rendered)
+    with serving(tiny_model[0], other, max_context=CONTEXT) as server:
+        server.load("tiny")
+        assert chat(connect(server), "hello", max_tokens=2).model == "other"
+        loading[0].join()
 
 
 def test_worker_error(client, monkeypatch):
@@ -884,9 +941,36 @@ def test_shared_system_prompt(served, model_path):
 def test_cut_off_call_is_no_text(client, replies_with, stream):
     # whole or streamed, a reply that ends for its length in a call it had begun says the text
     # before the call alone
-    replies_with('Checking.\n<tool_call>\n{"name": "weather", "argu')
+    replies_with('Checking.\n<tool_call>\n{"name": "weather", "argu', cut_off=True)
     kwargs = {"tools": [WEATHER], "stream": stream}
     assert complete(client, "Weather in Paris?", **kwargs) == ("Checking.", "length")
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_cut_off_after_a_call(client, replies_with, stream):
+    # a reply cut off after a whole call, in another it had begun, ends for its length: the
+    # client learns that calls may be missing, rather than running the first alone
+    whole = '<tool_call>\n{"name": "weather", "arguments": {"city": "Paris"}}\n</tool_call>\n'
+    replies_with(whole + '<tool_call>\n{"name": "weather", "argu', cut_off=True)
+    response = chat(client, "Weather in Paris and Rome?", tools=[WEATHER], stream=stream)
+    if stream:
+        choices = [chunk.choices[0] for chunk in response]
+        (call,), reason = choices[-2].delta.tool_calls, choices[-1].finish_reason
+        content = "".join(c.delta.content or "" for c in choices)
+    else:
+        (call,), reason = response.choices[0].message.tool_calls, response.choices[0].finish_reason
+        content = response.choices[0].message.content or ""
+    assert content == "" and reason == "length"
+    assert json.loads(call.function.arguments) == {"city": "Paris"}
+
+
+def test_reasons():
+    # whether a request reasons, for its sampling, as its template is told
+    chat = SimpleNamespace(default_effort="medium")
+    assert _reasons(chat, {}) and not _reasons(chat, {"reasoning_effort": "none"})
+    assert not _reasons(SimpleNamespace(default_effort="none"), {})
+    assert _reasons(SimpleNamespace(default_effort="none"), {"reasoning_effort": "low"})
+    assert not _reasons(chat, {"enable_thinking": False})
 
 
 def test_cut_off_call():

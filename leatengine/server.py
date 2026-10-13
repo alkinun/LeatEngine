@@ -45,7 +45,7 @@ from leatengine.chat import (
     split_reply,
     tool_call_start,
 )
-from leatengine.defaults import Overrides, recommended
+from leatengine.defaults import OPTIONS, Overrides, recommended
 from leatengine.draft import own_drafter
 from leatengine.engine import Engine, Sequence
 from leatengine.gguf import GGUF
@@ -69,6 +69,16 @@ def _between(low: float, high: float) -> Callable[[Any], bool]:
     return lambda v: (_integer(v) or isinstance(v, float)) and low <= v <= high
 
 
+def _option(name: str, low: float | None = None) -> tuple[Callable[[Any], bool], str]:
+    # a sampling option's check and description, of the bounds an operator's file has too; `low`
+    # in place of its least, as top_k's -1 for every token, which vLLM takes
+    kind, least, most = OPTIONS[name]
+    least = least if low is None else low
+    if kind is int:
+        return (lambda v: _integer(v) and least <= v <= most), f"an integer from {least} to {most}"
+    return _between(least, most), f"a number from {least} to {most}"
+
+
 def _tool(v: Any) -> bool:
     # a function to call, named; its parameters, a JSON schema, the template reads as it may
     return (
@@ -78,17 +88,18 @@ def _tool(v: Any) -> bool:
     )
 
 
+_MAX_BODY = 64 << 20  # bytes of a request's body at most, images and all
 _STOP = 256  # characters a stop string has at most, each checked against the text's end per token
 
 # the request fields leatengine reads, when present: what makes them valid, and how to say so
 _FIELDS: dict[str, tuple[Callable[[Any], bool], str]] = {
     "messages": (lambda v: isinstance(v, list) and bool(v) and all(isinstance(m, dict) for m in v),
                  "a non-empty list of objects"),
-    "temperature": (_between(0, 2), "a number from 0 to 2"),
-    "top_k": (_integer, "an integer"),
-    "top_p": (_between(0, 1), "a number from 0 to 1"),
-    "min_p": (_between(0, 1), "a number from 0 to 1"),
-    "presence_penalty": (_between(-2, 2), "a number from -2 to 2"),
+    "temperature": _option("temperature"),
+    "top_k": _option("top_k", low=-1),
+    "top_p": _option("top_p"),
+    "min_p": _option("min_p"),
+    "presence_penalty": _option("presence_penalty"),
     "max_tokens": (lambda v: _integer(v) and v > 0, "a positive integer"),
     "max_completion_tokens": (lambda v: _integer(v) and v > 0, "a positive integer"),
     "seed": (_integer, "an integer"),
@@ -245,11 +256,13 @@ class Server(ThreadingHTTPServer):
         and compiles its graphs; returns when it is ready. Loading the loaded model does nothing."""
         if name not in self.models:
             raise ValueError(f"there is no model {name!r}")
-        with self._loads_lock:  # a completion asked from now on waits for it, rendered by its
-            # template
+        # queued under the lock that a completion is queued under, once it has checked that no
+        # load is pending: a completion rendered by the template of the model loaded is queued
+        # before the load, and one asked from now on waits for it
+        with self._loads_lock:
             self._loads += 1
             self.ready.clear()
-        self.requests.put(load := _Load(name))
+            self.requests.put(load := _Load(name))
         if (error := load.done.get()) is not None:
             raise RuntimeError(f"loading {name} failed: {error!r}") from error
 
@@ -314,10 +327,11 @@ class Server(ThreadingHTTPServer):
         self, error: Exception, waiting: collections.deque[_Completion | _Load],
         running: dict[Sequence, "_Writer"],
     ) -> None:  # fmt: skip
-        # ends every request with the error, the running completions' sequences too
-        for sequence, writer in running.items():
-            if self.loaded is not None:
-                self.loaded.engine.cancel(sequence)
+        # ends every request with the error, the running completions' sequences too, and forgets
+        # the cache, which the failure may have left part written
+        if self.loaded is not None:
+            self.loaded.engine.reset()
+        for writer in running.values():
             writer.c.out.put(error)
         for request in waiting:
             (request.done if isinstance(request, _Load) else request.out).put(error)
@@ -341,8 +355,9 @@ class Server(ThreadingHTTPServer):
         try:
             stepped = engine.step()
         except Exception as e:  # for every running completion's client
-            for sequence, writer in running.items():
-                engine.cancel(sequence)
+            # what the step wrote of the cache is not known, so no prefix of it is shared on
+            engine.reset()
+            for writer in running.values():
                 writer.c.out.put(e)
             running.clear()
             return
@@ -616,7 +631,7 @@ class _Handler(BaseHTTPRequestHandler):
             if (route := routes.get(self.path)) is None:
                 return self._error(404, f"there is no GET {self.path}")
             if self._authorized():
-                route()
+                self._run(route)
 
     def do_POST(self) -> None:
         self.path = urllib.parse.urlsplit(self.path).path
@@ -631,14 +646,31 @@ class _Handler(BaseHTTPRequestHandler):
             if not self._authorized():
                 return
             try:
-                if (length := int(self.headers.get("Content-Length") or 0)) < 0:  # which would
-                    # read on till the client hangs up
-                    raise ValueError("a body's length cannot be negative")
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self._error(400, "Content-Length must be an integer")
+            if length < 0:  # which would read on till the client hangs up
+                return self._error(400, "a body's length cannot be negative")
+            if length > _MAX_BODY:
+                return self._error(413, f"a body has {_MAX_BODY} bytes at most, not {length}")
+            try:
                 body = json.loads(self.rfile.read(length))
             except (ValueError, RecursionError) as e:  # not JSON, or nested too deep to parse
                 return self._error(400, str(e))
-            with contextlib.suppress(OSError):  # the client hung up, while a model loaded say
-                route(body)
+            self._run(route, body)
+
+    def _run(self, route: Callable[..., None], *args: Any) -> None:
+        # a route, answered 500 for an error it did not expect, if it had not answered yet, and
+        # the error printed; a client that hung up, while a model loaded say, is answered nothing
+        try:
+            route(*args)
+        except OSError:
+            pass
+        except Exception:
+            if self.status is None:
+                with contextlib.suppress(OSError):
+                    self._error(500, "the server failed to answer: see its log")
+            raise
 
     def send_response(self, code: int, message: str | None = None) -> None:
         self.status = code
@@ -661,14 +693,14 @@ class _Handler(BaseHTTPRequestHandler):
         # send it or Anthropic's; if not, it is answered so
         if (keys := self.server.keys) is None:
             return True
-        given = self.headers.get("x-api-key")
+        given = (self.headers.get("x-api-key") or "").strip()
         bearer = self.headers.get("Authorization", "")
-        if given is None and bearer[:7].lower() == "bearer ":
+        if not given and bearer[:7].lower() == "bearer ":
             given = bearer[7:].strip()
         try:
             self.key = keys.name(given) or ""
-        except ValueError as e:  # the file of keys is broken
-            self._error(500, str(e))
+        except (OSError, ValueError) as e:  # the file of keys is unreadable or broken
+            self._error(500, f"the server's keys cannot be read: {e}")
             return False
         if not self.key:
             message = "this server needs an API key" if not given else "the API key is not valid"
@@ -735,21 +767,31 @@ class _Handler(BaseHTTPRequestHandler):
                          "usage": {"prompt_tokens": used, "total_tokens": used}})  # fmt: skip
 
     def _complete(self, body: Any) -> None:
-        self.server.ready.wait()  # for the model loading, if one is, whose template renders it
-        try:
-            completion = _completion(body, self.server)
-        except (ValueError, TypeError, jinja2.TemplateError) as e:
-            return self._error(400, str(e))
-        except _Unset as e:  # the operator's file of sampling, broken
-            return self._error(500, str(e))
-        completion.key = self.key
-        self.server.requests.put(completion)
+        server = self.server
+        while True:
+            server.ready.wait()  # for the model loading, if one is, whose template renders it
+            loaded = server.loaded
+            try:
+                completion = _completion(body, server, loaded)
+            except (ValueError, TypeError, jinja2.TemplateError) as e:
+                return self._error(400, str(e))
+            except RecursionError:
+                return self._error(400, "the request is nested too deeply")
+            except _Unset as e:  # the operator's file of sampling, broken
+                return self._error(500, str(e))
+            completion.key = self.key
+            # queued only if no load began while it was rendered, else rendered again by the
+            # template of the model loaded next
+            with server._loads_lock:
+                if not server._loads and server.loaded is loaded:
+                    server.requests.put(completion)
+                    break
         try:
             if completion.stream:
                 self._stream(completion)
             else:
                 self._reply(completion)
-        except OSError:  # the client hung up
+        finally:  # the client hung up, or the handler failed: either way no one reads on
             completion.cancelled.set()
 
     def _reply(self, c: _Completion) -> None:
@@ -765,7 +807,7 @@ class _Handler(BaseHTTPRequestHandler):
             message["reasoning_content"] = reply.reasoning
         if calls:
             message |= {"content": content or None, "tool_calls": _tool_calls(calls)}
-            reason = "tool_calls"
+            reason = _with_calls(reason)
         choice = {"index": 0, "message": message, "logprobs": None, "finish_reason": reason}
         body = {"choices": [choice], "usage": _usage(c), "timings": _timings(c)}
         self._json(200, self._head(c, "chat.completion") | body)
@@ -801,7 +843,7 @@ class _Handler(BaseHTTPRequestHandler):
                 c,
                 {"tool_calls": [{"index": i} | call for i, call in enumerate(_tool_calls(calls))]},
             )
-            reason = "tool_calls"
+            reason = _with_calls(reason)
         # the timings on the last chunk, as llama.cpp's server sends them
         timings = {"timings": _timings(c)}
         self._chunk(c, {}, reason, {} if c.stream_usage else timings)
@@ -895,8 +937,8 @@ def _embedder(path: Path) -> Engine:
     return engine
 
 
-def _completion(body: Any, server: Server) -> _Completion:
-    # what a request body asks for, or a ValueError saying what is wrong with it
+def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completion:
+    # what a request body asks for of the `loaded` model, or a ValueError saying what is wrong
     if not isinstance(body, dict) or body.get("messages") is None:
         raise ValueError("a chat completion needs messages")
     for key, (valid, expected) in _FIELDS.items():
@@ -907,7 +949,7 @@ def _completion(body: Any, server: Server) -> _Completion:
             raise ValueError(f"{key}={body[key]!r} is not supported")
     if (choice := body.get("tool_choice") or "auto") not in ("auto", "none"):
         raise ValueError(f"tool_choice={choice!r} is not supported, only 'auto' and 'none'")
-    if (loaded := server.loaded) is None:
+    if loaded is None:
         raise ValueError("no model is loaded")
     # tool_choice "none" as OpenAI's API has it: the tools still declared, so that the prompt is
     # as of "auto", which the cache may hold, and the reply opened as an answer, as harmony's
@@ -968,10 +1010,13 @@ def _sampling(server: Server, loaded: _Loaded) -> tuple[dict[str, float], dict[s
 
 
 def _reasons(chat: ChatTemplate, options: dict[str, Any]) -> bool:
-    # whether a model reasons, as its template is told: as enable_thinking says, if the template
-    # is told it, else as its default effort is, a model of levels at every one, as gpt-oss does
+    # whether a model reasons, as its template is told: as enable_thinking or reasoning_effort
+    # says, if the template is told either, else as its default effort is, a model of levels at
+    # every one, as gpt-oss does
     if "enable_thinking" in options:
         return bool(options["enable_thinking"])
+    if "reasoning_effort" in options:
+        return options["reasoning_effort"] != "none"
     return (chat.default_effort or "none") != "none"
 
 
@@ -986,7 +1031,7 @@ def _calls(
         return reply.content, []
     if not reply.calls:
         content, calls = parse_tool_calls(reply.content, tools)
-        if reason == "length" and not calls and not content.lstrip().startswith("{"):
+        if reason == "length" and (calls or not content.lstrip().startswith("{")):
             content = content[: tool_call_start(content)]
         return content, calls
     # as the model made them, as OpenAI's API passes them on, of tools not given and of arguments
@@ -1005,6 +1050,12 @@ def _calls(
                 arguments = parsed
         calls.append({"name": name, "arguments": arguments})
     return reply.content, calls
+
+
+def _with_calls(reason: str) -> str:
+    # the finish reason of a reply that calls tools: "tool_calls" where it stopped, but "length"
+    # where max_tokens or the context cut it off, as a call after those it holds may have been
+    return "tool_calls" if reason == "stop" else reason
 
 
 def _tool_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -83,7 +83,8 @@ class Keys:
         except FileNotFoundError:
             return {}
         if not isinstance(keys, dict) or not all(
-            isinstance(k, dict) and isinstance(k.get("sha256"), str) for k in keys.values()
+            NAME.fullmatch(n) and isinstance(k, dict) and isinstance(k.get("sha256"), str)
+            for n, k in keys.items()
         ):
             raise ValueError(f"{self.path} is no file of leatengine's keys")
         return keys
