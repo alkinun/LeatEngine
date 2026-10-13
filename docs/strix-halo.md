@@ -16,6 +16,12 @@ This document is a qualification procedure, not a claim of measured support or p
 The current kernels select their RDNA 3 path for architecture major 11. Whether this gives
 correct, efficient execution on `gfx1151` must be confirmed on the physical machine.
 
+Decode attention over heads wider than 512 dimensions, as GLM-4.7-Flash's multi-head latent
+attention uses (576), is skipped on the emulator: its compiled kernel uses more than 128 VGPRs,
+and the emulator misreads 16-bit operands in those registers. The same kernel passes on NVIDIA,
+and in the emulator when compiled within 128 VGPRs; `pytest -m gpu -k attention_groups` on the
+physical machine checks it.
+
 ## Prepare the host
 
 Use Linux with firmware and an amdgpu driver that support the device. Install uv, Git, and

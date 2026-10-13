@@ -23,6 +23,24 @@ those results rather than treating its process exit status as a qualification ve
 Its built-in batched comparison uses different prompt lengths for the two engines, so it is
 exploratory and must not be presented as a controlled performance comparison.
 
+## Measured on this checkout: new architectures on the RTX 3090
+
+Measured on an RTX 3090 (driver 610.43.03, CUDA 13.3, Linux 7.1) against llama.cpp CUDA builds
+(`2e88c49c9` for Mellum and LFM2.5), one sequence, Q4_K_M files from Hugging Face. Speeds are
+`leatengine bench -p 512 -n 128 -r 2` against `llama-bench -p 512 -n 128 -r 2`, in tokens per
+second. Quality is `leatengine perplexity --kl-base` against llama.cpp's logits of the first 8
+chunks of 512 tokens of wikitext-2's test set: mean KL divergence and top-token agreement. For
+scale, the last column gives llama.cpp's own CPU backend against its CUDA one, on 2 chunks.
+
+| | llama.cpp pp512 | leatengine pp512 | llama.cpp tg128 | leatengine tg128 | KL, top-1 | llama.cpp CPU vs CUDA |
+|---|---:|---:|---:|---:|---:|---:|
+| Mellum 2.1 12B A2.5B Thinking | 7790 | 8126 | 294 | 311 | 0.0078, 95.8% | 0.0095 |
+| LFM2.5 24B A2B | 5998 | 5135 | 280 | 292 | 0.051, 89.9% | 0.039, 90.7% |
+
+LFM2.5's short convolutions multiply three outputs of one projection, which makes it unusually
+sensitive to rounding on every backend; its prefill trails llama.cpp in the int8 matrix kernels'
+handling of its small per-expert batches.
+
 ## Inherited RTX 3090 results
 
 The table below is historical evidence copied from the original

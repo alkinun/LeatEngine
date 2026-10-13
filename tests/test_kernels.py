@@ -530,19 +530,25 @@ def test_attention(n, length, symbolic):
     np.testing.assert_allclose(got, expected, rtol=2e-3, atol=2e-3)
 
 
-# GQA groups that blocks of 4 query heads do not divide: Qwen2.5 7B's of 7, and one of 9
-@pytest.mark.parametrize("heads, kv_heads", [(28, 4), (18, 2)])
+# GQA groups that blocks of 4 query heads do not divide: Qwen2.5 7B's of 7, and one of 9; and a
+# single kv head for many query heads, as multi-head latent attention's, GLM-4.7-Flash's of 576
+@pytest.mark.parametrize("heads, kv_heads, dim", [(28, 4, 128), (18, 2, 128), (20, 1, 128),
+                                                  (20, 1, 576)])  # fmt: skip
 @pytest.mark.parametrize("length", [65, 1000])
 @pytest.mark.parametrize("symbolic", [False, True])
-def test_attention_groups(heads, kv_heads, length, symbolic):
+def test_attention_groups(heads, kv_heads, dim, length, symbolic):
+    if dim > 512 and os.environ.get("DEV", "").startswith("MOCK+AMD"):
+        # the emulator misreads this kernel's 16-bit operations in VGPRs past 127, which it then
+        # takes, as their registers' high halves; within 128 VGPRs, it computes them rightly
+        pytest.skip("tinygrad's RDNA 3 emulator misreads 16-bit operands in VGPRs past 127")
     rng = np.random.default_rng(length + heads)
-    cache = rng.standard_normal((2, SLOTS, kv_heads, 1024, 128)).astype(np.float16)
-    q = rng.standard_normal((1, heads, 1, 128)).astype(np.float32)
+    cache = rng.standard_normal((2, SLOTS, kv_heads, 1024, dim)).astype(np.float16)
+    q = rng.standard_normal((1, heads, 1, dim)).astype(np.float32)
     valid = UOp.variable("start_pos", 0, 1023).bind(length - 1) + 1 if symbolic else length
     q_t, cache_t = Tensor(q).realize(), Tensor(cache).realize()
     assert kernels.supports_attention(q_t, cache_t)
-    got = kernels.attention(q_t, cache_t, [slot(symbolic)], [valid], 128**-0.5).numpy()
-    got = got.reshape(-1, 128)
+    got = kernels.attention(q_t, cache_t, [slot(symbolic)], [valid], dim**-0.5).numpy()
+    got = got.reshape(-1, dim)
     expected = reference_attention(q[0], cache, length - 1)[0]
     np.testing.assert_allclose(got, expected, rtol=2e-3, atol=2e-3)
 

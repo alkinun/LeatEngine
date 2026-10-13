@@ -71,14 +71,18 @@ def _attention_partial_kernel(
     qs = [load_vector(q[head * group + h, token, lane * per_lane], per_lane) for h in range(group)]
     rounds = UOp.range(((chunks - block).maximum(0) + partials - 1) // partials, 4, AxisType.LOOP)
     chunk = since // KEYS + block + rounds * partials
+    # the kv head, of a single one through a division tinygrad cannot fold to 0: the keys' index
+    # then takes the head's index, as of several, and tinygrad declares it with the index before
+    # the loop over chunks, rather than at its first use inside, out of scope past the loop
+    kv = head // split if kv_heads > 1 else opaque(head) // split
     valid, scores, values = [], [], []
     for j in range(per_wave):
         key = chunk * KEYS + wave * per_wave + j
         valid.append((key < length) & (key >= since) if window else key < length)
         row = (chunk * KEYS) % positions + wave * per_wave + j if ring else key
-        k = load_vector(cache[0, slot, head // split, row, lane * per_lane], per_lane)
+        k = load_vector(cache[0, slot, kv, row, lane * per_lane], per_lane)
         # values load during scoring, so both streams are in flight together
-        v = load_vector(cache[1, slot, head // split, row, lane * per_lane], per_lane)
+        v = load_vector(cache[1, slot, kv, row, lane * per_lane], per_lane)
         values.append([valid[j].where(x, zero) for x in v])
         dots = [warp_sum(sum((a * b for a, b in zip(qh, k, strict=True)), zero)) for qh in qs]
         scores.append([valid[j].where(d * scale, -1e30) for d in dots])
