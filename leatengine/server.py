@@ -44,6 +44,7 @@ from leatengine.chat import (
     partial_end,
     split_reply,
     tool_call_start,
+    typed_arguments,
 )
 from leatengine.defaults import OPTIONS, Overrides, recommended
 from leatengine.draft import own_drafter
@@ -1020,18 +1021,19 @@ def _reasons(chat: ChatTemplate, options: dict[str, Any]) -> bool:
     # every one, as gpt-oss does
     if "enable_thinking" in options:
         return bool(options["enable_thinking"])
-    if "reasoning_effort" in options:
-        return options["reasoning_effort"] != "none"
+    for told in ("reasoning_effort", "reasoning_strength"):
+        if told in options:
+            return options[told] != "none"
     return (chat.default_effort or "none") != "none"
 
 
 def _calls(
     reply: Reply, tools: list[dict[str, Any]] | None, reason: str
 ) -> tuple[str, list[dict[str, Any]]]:
-    # a reply's text and its calls to the tools: those of the harmony format, every one, or those
-    # of the text. A call the context cut off, of a reply that ended for its length, is no text:
-    # the text ends where it began, but for a reply all of JSON, as Llama 3's calls are, which may
-    # be text whole.
+    # a reply's text and its calls to the tools: those of the harmony and ATEM formats, every one,
+    # or those of the text. A call the context cut off, of a reply that ended for its length, is no
+    # text: the text ends where it began, but for a reply all of JSON, as Llama 3's calls are,
+    # which may be text whole.
     if not tools:
         return reply.content, []
     if not reply.calls:
@@ -1046,6 +1048,9 @@ def _calls(
     names, calls = {tool.get("function", {}).get("name") for tool in tools}, []
     for call in reply.calls:
         name, arguments = call["name"], call["arguments"]
+        if call.get("typed") is False:  # ATEM's values of text, typed as the tool takes them
+            calls.append({"name": name, "arguments": typed_arguments(call, tools)})
+            continue
         # a tool's name run into the channel it is called on, as gpt-oss writes
         # to=functions.searchcommentary at times, leaving out the <|channel|> between
         bare = re.sub(r"(commentary|analysis|final)$", "", name)

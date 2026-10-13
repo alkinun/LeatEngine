@@ -12,6 +12,7 @@ from leatengine.chat import (
     parse_tool_calls,
     split_reply,
     tool_call_start,
+    typed_arguments,
 )
 from leatengine.gguf import GGUF
 from leatengine.tokenizer import USER_DEFINED, Tokenizer
@@ -152,6 +153,8 @@ def test_form():
     assert chat()[0].answer == ""  # of a format that marks no answer
     gemma = with_marker("<|channel>")
     assert gemma.form == "gemma4" and gemma.opens_thinking("<|turn>model\n<|channel>thought\n")
+    atem = chat(TEMPLATE + "{# <atem:function_calls> #}")[0]
+    assert atem.form == "atem" and atem.answer == " to=user<|message|>"
     assert not gemma.opens_thinking("<|turn>model\n<|channel>thought\n<channel|>")
 
 
@@ -181,6 +184,10 @@ LEVELS = (
 )
 GEMMA = "{%- set enable_thinking = enable_thinking | default(false) -%}"
 QWEN = "{%- if enable_thinking is defined and enable_thinking is false %}<think></think>{% endif %}"
+MUSE = (
+    "{% set rs = reasoning_strength if reasoning_strength is defined and reasoning_strength "
+    "else 'high' %}{{ rs }}"
+)
 COHERE = '{% if reasoning_effort | lower == "none" %}{% endif %}'
 SOLAR = (
     '{% set reasoning_effort = reasoning_effort if reasoning_effort is defined else "high" %}'
@@ -200,6 +207,7 @@ SOLAR = (
         (QWEN + TEMPLATE, ("none", "high"), "high"),  # on, unless turned off
         (COHERE + TEMPLATE, ("none", "high"), "high"),  # "none" alone compared: off or on
         (SOLAR + TEMPLATE, ("minimal", "low", "high"), "high"),  # a conditional default
+        (MUSE + TEMPLATE, ("low", "medium", "high"), "high"),  # Muse Glimmer's own name for it
     ],
 )
 def test_efforts(template, efforts, default):
@@ -221,6 +229,19 @@ def test_effort():
     shown = chat(GPT_OSS + "Reasoning: {{ reasoning_effort }}")[0]
     assert shown.render([], **shown.effort("xhigh")) == "Reasoning: high"
     assert shown.render([]) == "Reasoning: medium"
+    # told by Muse Glimmer's reasoning_strength
+    muse = chat(MUSE)[0]
+    assert muse.render([], **muse.effort("low")) == "low" and muse.render([]) == "high"
+
+
+def test_typed_arguments():
+    # ATEM's values of text, as the tool's schema types them: text where it takes strings, else
+    # JSON where the value is
+    city = {"type": "string"}
+    schema = {"properties": {"city": city, "days": {"type": "integer"}, "tags": {}}}
+    tools = [{"type": "function", "function": {"name": "weather", "parameters": schema}}]
+    call = {"name": "weather", "arguments": {"city": "42", "days": "3", "tags": '["a"]'}}
+    assert typed_arguments(call, tools) == {"city": "42", "days": 3, "tags": ["a"]}
 
 
 WEATHER = [{"type": "function", "function": {"name": "weather"}}]
@@ -369,6 +390,16 @@ HARMONY_CALL = (
     "<|channel|>analysis<|message|>Need a tool.<|end|><|start|>assistant<|channel|>commentary "
     'to=functions.weather <|constrain|>json<|message|>{"city": "Paris"}'
 )
+# Muse Glimmer's ATEM messages after the prompt's <|start|>assistant: reasoning to itself, then an
+# answer to the user, or a call; <|eom|> decoding as text or not
+ATEM = (
+    " to=self<|message|>The user wants weather.<|eom|><|start|>assistant to=user<|message|>Sunny."
+)
+ATEM_CALL = (
+    " to=self<|message|>Need a tool.<|start|>assistant to=weather<|message|><atem:function_calls>\n"
+    '<atem:invoke name="weather">\n<atem:parameter name="city">Paris</atem:parameter>\n'
+    '<atem:parameter name="days">3</atem:parameter>\n</atem:invoke>\n</atem:function_calls>'
+)
 
 
 @pytest.mark.parametrize(
@@ -385,6 +416,9 @@ HARMONY_CALL = (
         (HARMONY, "harmony", False, Reply("The user wants weather.", "It is sunny.")),
         (HARMONY_CALL, "harmony", False,
          Reply("Need a tool.", "", [{"name": "weather", "arguments": '{"city": "Paris"}'}])),
+        (ATEM, "atem", False, Reply("The user wants weather.", "Sunny.")),
+        (ATEM_CALL, "atem", False, Reply("Need a tool.", "", [
+            {"name": "weather", "arguments": {"city": "Paris", "days": "3"}, "typed": False}])),
     ],
 )  # fmt: skip
 def test_split_reply(text, form, thinking, reply):
@@ -403,6 +437,7 @@ def test_split_reply_done():
     "text, form",
     [
         (HARMONY, "harmony"),
+        (ATEM, "atem"),
         ("<think>a b</think> c d", "think"),
         ("\n<think>a</think> b", "think"),
         ("<|channel>thought\na b<channel|> c d", "gemma4"),

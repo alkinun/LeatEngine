@@ -49,10 +49,12 @@ class ChatTemplate:
         tokens = metadata["tokenizer.ggml.tokens"]
         self._bos = "" if tokenizer.bos_id is None else tokens[tokenizer.bos_id]
         self._eos = "" if tokenizer.eos_id is None else tokens[tokenizer.eos_id]
-        # how replies mark their reasoning: gpt-oss's harmony channels, Gemma 4's thought channel,
-        # or the <think> blocks of Qwen3 and DeepSeek-R1's distillations, whose templates write them
+        # how replies mark their reasoning: gpt-oss's harmony channels, Muse Glimmer's ATEM
+        # messages to itself, Gemma 4's thought channel, or the <think> blocks of Qwen3 and
+        # DeepSeek-R1's distillations, whose templates write them
         self._form = (
             "harmony" if "<|channel|>" in tokens
+            else "atem" if "atem:function_calls" in source
             else "gemma4" if "<|channel>" in tokens
             else "think" if "<think>" in source
             else None
@@ -65,7 +67,7 @@ class ChatTemplate:
 
     @property
     def form(self) -> str | None:
-        """How replies mark their reasoning: "harmony", "gemma4", "think", or None."""
+        """How replies mark their reasoning: "harmony", "atem", "gemma4", "think", or None."""
         return self._form
 
     @property
@@ -86,10 +88,10 @@ class ChatTemplate:
         the lesser of two as near; of one that cannot be told, nothing."""
         if self._told == "enable_thinking":
             return {"enable_thinking": asked != "none"}
-        if self._told == "reasoning_effort":
+        if self._told in ("reasoning_effort", "reasoning_strength"):
             rank = EFFORTS.index
             nearest = min(self._efforts, key=lambda e: (abs(rank(e) - rank(asked)), rank(e)))
-            return {"reasoning_effort": nearest}
+            return {self._told: nearest}
         return {}
 
     def render(
@@ -142,10 +144,12 @@ class ChatTemplate:
 
 def _reasoning(source: str) -> tuple[tuple[str, ...], str | None, str | None]:
     # the efforts a template's model reasons at, its default, and the variable that tells the
-    # template: reasoning_effort, of the values the template compares it with, its default among
-    # them, or else low to high, as gpt-oss's; enable_thinking, off or on, off by default only where
-    # the template says so; or none
-    if "reasoning_effort" in source:
+    # template: reasoning_effort, or Muse Glimmer's reasoning_strength, of the values the template
+    # compares it with, its default among them, or else low to high, as gpt-oss's;
+    # enable_thinking, off or on, off by default only where the template says so; or none
+    told = next((v for v in ("reasoning_effort", "reasoning_strength") if v in source), None)
+    if told is not None:
+        source = source.replace(told, "reasoning_effort")
         # compared after any filters, as Cohere2's reasoning_effort | lower == "none"
         compared = re.findall(r"reasoning_effort(?:\s*\|\s*\w+)*\s*[!=]=\s*['\"](\w+)", source)
         compared += re.findall(r"['\"](\w+)['\"]\s*[!=]=\s*reasoning_effort", source)
@@ -155,8 +159,8 @@ def _reasoning(source: str) -> tuple[tuple[str, ...], str | None, str | None]:
         # reasoning_effort if reasoning_effort is defined else "high"
         set_to = re.search(r"reasoning_effort\s*=\s*['\"](\w+)"
                            r"|reasoning_effort\s*\|\s*default\(\s*['\"](\w+)"
-                           r"|reasoning_effort\s+if\s+reasoning_effort\s+is\s+defined\s+else\s+"
-                           r"['\"](\w+)", source)  # fmt: skip
+                           r"|reasoning_effort\s+if\s+reasoning_effort\s+is\s+defined[^%}]*?"
+                           r"\s+else\s+['\"](\w+)", source)  # fmt: skip
         named = next((d for d in set_to.groups() if d), None) if set_to else None
         levels = {*(compared or _LEVELS), *([named] if named else [])} & set(EFFORTS)
         if levels == {"none"}:  # a template that tells "none" from the rest alone: off or on
@@ -164,7 +168,7 @@ def _reasoning(source: str) -> tuple[tuple[str, ...], str | None, str | None]:
         if levels:
             efforts = tuple(e for e in EFFORTS if e in levels)
             default = named if named in levels else efforts[len(efforts) // 2]
-            return efforts, default, "reasoning_effort"
+            return efforts, default, told
     if "enable_thinking" in source:
         off = re.search(r"enable_thinking\s*\|\s*default\(\s*false", source, re.IGNORECASE)
         return ("none", "high"), "none" if off else "high", "enable_thinking"
@@ -185,10 +189,11 @@ class Reply:
 # where a form's block of reasoning opens and closes, before the text: <think> blocks, and Gemma
 # 4's thought channel
 _THINKING = {"think": ("<think>", "</think>"), "gemma4": ("<|channel>thought", "<channel|>")}
-# what opens a form's reply that answers, rather than calls a tool
-_ANSWER = {"harmony": "<|channel|>final<|message|>"}
-# the harmony format's markers, and those blocks'
+# what opens a form's reply that answers, rather than calls a tool, after its prompt
+_ANSWER = {"harmony": "<|channel|>final<|message|>", "atem": " to=user<|message|>"}
+# the harmony format's markers, ATEM's ends of a message, and those blocks'
 _REPLY_MARKERS = ("<|start|>", "<|channel|>", "<|message|>", "<|end|>", "<|constrain|>",
+                  "<|eom|>", "<|eot|>",
                   *(marker for markers in _THINKING.values() for marker in markers))  # fmt: skip
 
 
@@ -201,6 +206,8 @@ def split_reply(text: str, form: str | None, thinking: bool = False, done: bool 
         text = text[: len(text) - partial_end(text, _REPLY_MARKERS)]
     if form == "harmony":
         return _harmony(text)
+    if form == "atem":
+        return _atem(text)
     if form in _THINKING:
         opens, closes = _THINKING[form]
         start = text.find(opens)
@@ -233,6 +240,49 @@ def _harmony(text: str) -> Reply:
         else:
             reply.content += body
     return reply
+
+
+def _atem(text: str) -> Reply:
+    # Muse Glimmer's messages, each <|start|>assistant to=RECIPIENT<|message|> and its text, but
+    # the first, whose header the prompt opened: to=self is reasoning, to=user text, and to any
+    # other recipient a call, an <atem:function_calls> block of ATEM's invokes. Their ends,
+    # <|eom|> and <|eot|>, decode as nothing, or are dropped where they decode as text.
+    reply = Reply()
+    for message in text.split("<|start|>"):
+        header, marked, body = message.partition("<|message|>")
+        if not marked:  # a header, so far
+            continue
+        body = body.replace("<|eom|>", "").replace("<|eot|>", "")
+        recipient = to.group(1) if (to := re.search(r"to=([^\s<]+)", header)) else "user"
+        if recipient == "self":
+            reply.reasoning += body
+        elif recipient == "user":
+            reply.content += body
+        else:
+            invokes = _ATEM_INVOKE.findall(body) or [(recipient, "")]
+            for name, parameters in invokes:
+                arguments = dict(_ATEM_PARAMETER.findall(parameters))
+                reply.calls.append({"name": name, "arguments": arguments, "typed": False})
+    return reply
+
+
+# ATEM's invokes of a function and its parameters, each value as written: text, or JSON of a list
+# or object, which the tool's schema tells apart, as typed_arguments() reads them
+_ATEM_INVOKE = re.compile(r'<atem:invoke name="([^"]+)">(.*?)</atem:invoke>', re.S)
+_ATEM_PARAMETER = re.compile(r'<atem:parameter name="([^"]+)">(.*?)</atem:parameter>', re.S)
+
+
+def typed_arguments(call: dict[str, Any], tools: list[dict[str, Any]]) -> dict[str, Any]:
+    """A call's arguments, each value of text typed as its tool's schema has it, as Qwen3.5's
+    are: text where it takes strings alone, else JSON where the value is."""
+    functions = {f.get("name"): f for tool in tools if (f := tool.get("function"))}
+    schema = functions.get(call["name"])
+    out = {}
+    for key, value in call["arguments"].items():
+        kind = _schema(schema, "parameters", "properties", key, "type")
+        types = {kind} if isinstance(kind, str) else set(kind) if isinstance(kind, list) else set()
+        out[key] = _typed(value, types)
+    return out
 
 
 def partial_end(text: str, markers: Sequence[str]) -> int:

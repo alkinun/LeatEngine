@@ -58,6 +58,7 @@ _FAMILIES: list[tuple[str, str, Options, Options | None]] = [
     ("gemma3", "", {"top_p": 0.95, "top_k": 64}, None),
     ("gemma4", "", {"temperature": 1.0, "top_p": 0.95, "top_k": 64}, None),
     ("llama", "llama", {"temperature": 0.6, "top_p": 0.9}, None),
+    ("muse-glimmer", "", {"temperature": 1.0, "top_p": 0.95, "top_k": 64}, None),
     ("llama", "mistralsmall", {"temperature": 0.15}, None),
 ]  # fmt: skip
 

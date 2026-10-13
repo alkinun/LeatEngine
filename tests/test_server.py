@@ -432,7 +432,9 @@ def test_tool_call(client, replies_with, stream, reply, content):
      ("think", "\n<think>Sunny, I recall.</think>It is sunny."),  # its newline not the text's
      ("gemma4", "<|channel>thought\nSunny, I recall.<channel|>It is sunny."),
      ("harmony", "<|channel|>analysis<|message|>Sunny, I recall.<|end|><|start|>assistant"
-                 "<|channel|>final<|message|>It is sunny.")],
+                 "<|channel|>final<|message|>It is sunny."),
+     ("atem", " to=self<|message|>Sunny, I recall.<|eom|><|start|>assistant to=user<|message|>"
+              "It is sunny.")],
 )  # fmt: skip
 def test_reasoning(client, replies_with, monkeypatch, stream, form, reply):
     # Qwen3's and gpt-oss's reasoning, apart from the text
@@ -496,6 +498,23 @@ def test_harmony_tool_call(client, replies_with, monkeypatch, stream, header, bo
     assert reason == "tool_calls" and (call.function.name, call.function.arguments) == (
         name, arguments)  # fmt: skip
     assert content == ""
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_atem_tool_call(client, replies_with, monkeypatch, stream):
+    # Muse Glimmer's call: an ATEM block to the tool, its text values typed as the tool takes them
+    monkeypatch.setattr(ChatTemplate, "form", property(lambda self: "atem"))
+    replies_with(" to=self<|message|>Need a tool.<|eom|><|start|>assistant to=weather<|message|>"
+                 '<atem:function_calls>\n<atem:invoke name="weather">\n<atem:parameter name="city">'
+                 "Paris</atem:parameter>\n</atem:invoke>\n</atem:function_calls>")  # fmt: skip
+    response = chat(client, "Weather in Paris?", tools=[WEATHER], stream=stream)
+    if stream:
+        choices = [chunk.choices[0] for chunk in response]
+        (call,), reason = choices[-2].delta.tool_calls, choices[-1].finish_reason
+    else:
+        (call,), reason = response.choices[0].message.tool_calls, response.choices[0].finish_reason
+    assert reason == "tool_calls" and call.function.name == "weather"
+    assert json.loads(call.function.arguments) == {"city": "Paris"}
 
 
 @pytest.mark.parametrize("stream", [False, True])
