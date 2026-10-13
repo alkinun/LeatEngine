@@ -260,11 +260,26 @@ PARIS = {"name": "weather", "arguments": {"city": "Paris"}}
         ('<|tool_call>call:weather{city:<|"|>Paris<|"|>}<tool_call|>', ""),  # Gemma 4
         ('<|tool_call>call:weather{ city : <|"|>Paris<|"|> }<tool_call|>', ""),  # with spaces
         ("Checking.<|tool_call_start|>[weather(city='Paris')]<|tool_call_end|>", "Checking."),
+        ("<tool_call>weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+         ""),  # GLM-4.7
         ('<|tool_call_start|>weather(city="Paris")<|tool_call_end|>', ""),  # LFM2, not a list
     ],
 )  # fmt: skip
 def test_tool_calls(reply, text):
     assert parse_tool_calls(reply, WEATHER) == (text, [PARIS])
+
+
+def test_glm_tool_call_arguments():
+    # GLM-4.7's values, typed as the tool's schema has them: text, or JSON of other types
+    schema = {"properties": {"city": {"type": "string"}, "days": {"type": "integer"}}}
+    tools = [{"type": "function", "function": {"name": "weather", "parameters": schema}}]
+    reply = ("<tool_call>weather\n<arg_key>city</arg_key>\n<arg_value>42</arg_value>\n"
+             "<arg_key>days</arg_key><arg_value>3</arg_value>\n</tool_call>")  # fmt: skip
+    assert parse_tool_calls(reply, tools)[1] == [
+        {"name": "weather", "arguments": {"city": "42", "days": 3}}
+    ]
+    malformed = "<tool_call>weather<arg_key>city</arg_key>Paris</tool_call>"
+    assert parse_tool_calls(malformed, tools) == (malformed, [])
 
 
 def test_python_tool_calls():

@@ -277,13 +277,7 @@ def typed_arguments(call: dict[str, Any], tools: list[dict[str, Any]]) -> dict[s
     """A call's arguments, each value of text typed as its tool's schema has it, as Qwen3.5's
     are: text where it takes strings alone, else JSON where the value is."""
     functions = {f.get("name"): f for tool in tools if (f := tool.get("function"))}
-    schema = functions.get(call["name"])
-    out = {}
-    for key, value in call["arguments"].items():
-        kind = _schema(schema, "parameters", "properties", key, "type")
-        types = {kind} if isinstance(kind, str) else set(kind) if isinstance(kind, list) else set()
-        out[key] = _typed(value, types)
-    return out
+    return _typed_values(call["arguments"], functions.get(call["name"]))
 
 
 def partial_end(text: str, markers: Sequence[str]) -> int:
@@ -315,7 +309,9 @@ def parse_tool_calls(reply: str, tools: list[dict[str, Any]]) -> tuple[str, list
     Llama 3 calls a tool by replying with nothing but {"name": ..., "parameters": {...}}, Qwen
     with <tool_call>{"name": ..., "arguments": {...}}</tool_call> after any text, Qwen3.5 with
     <tool_call><function=name><parameter=key>value</parameter>...</function></tool_call>, values
-    as text where the tool takes a string and else as JSON, Gemma 4 with
+    as text where the tool takes a string and else as JSON, GLM-4.7 with
+    <tool_call>name<arg_key>key</arg_key><arg_value>value</arg_value>...</tool_call>, its values
+    typed alike, Gemma 4 with
     <|tool_call>call:name{key:value,...}<tool_call|>, and LFM2 with a Python list of calls of
     keyword arguments, <|tool_call_start|>[name(key=value, ...), ...]<|tool_call_end|>.
     """
@@ -326,7 +322,9 @@ def parse_tool_calls(reply: str, tools: list[dict[str, Any]]) -> tuple[str, list
     calls: list[dict[str, Any] | None] = []
     for b in blocks:
         if b[1] is not None:
-            calls.append(_json_call(b[1]) or _xml_call(b[1], functions))
+            calls.append(
+                _json_call(b[1]) or _xml_call(b[1], functions) or _glm_call(b[1], functions)
+            )
         elif b[4] is not None:
             python = _python_calls(b[4])
             calls += [None] if python is None else python
@@ -367,12 +365,31 @@ def _xml_call(text: str, functions: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if _PARAMETER.sub("", match[2]).strip():  # anything but parameters
         return None
-    arguments: dict[str, Any] = {}
-    for key, value in _PARAMETER.findall(match[2]):
-        kind = _schema(functions.get(match[1]), "parameters", "properties", key, "type")
+    arguments = dict(_PARAMETER.findall(match[2]))
+    return {"name": match[1], "arguments": _typed_values(arguments, functions.get(match[1]))}
+
+
+# GLM-4.7's calls inside <tool_call>: a function's name, then each key and its value
+_GLM_ARGUMENT = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.S)
+_GLM_CALL = re.compile(rf"\s*([^<\s]+)\s*((?:{_GLM_ARGUMENT.pattern}\s*)*)", re.S)
+
+
+def _glm_call(text: str, functions: dict[str, Any]) -> dict[str, Any] | None:
+    # a call of GLM-4.7's, its values typed as its tool's schema has them
+    if not (match := _GLM_CALL.fullmatch(text)):
+        return None
+    arguments = dict(_GLM_ARGUMENT.findall(match[2]))
+    return {"name": match[1], "arguments": _typed_values(arguments, functions.get(match[1]))}
+
+
+def _typed_values(arguments: dict[str, str], function: Any) -> dict[str, Any]:
+    # values of text typed as a function's schema has them, if any, as _typed() types them
+    out = {}
+    for key, value in arguments.items():
+        kind = _schema(function, "parameters", "properties", key, "type")
         types = {kind} if isinstance(kind, str) else set(kind) if isinstance(kind, list) else set()
-        arguments[key] = _typed(value, types)
-    return {"name": match[1], "arguments": arguments}
+        out[key] = _typed(value, types)
+    return out
 
 
 def _typed(text: str, types: set[str]) -> Any:

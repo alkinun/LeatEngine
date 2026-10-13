@@ -72,7 +72,8 @@ use an appropriate TLS proxy when encrypted transport is needed. See [API and co
 
 - GGUF models and quantized weights; supported architecture families include Llama/Mistral,
   Qwen2, Qwen3, Qwen3 MoE, Qwen3.5 dense/MoE, Gemma3, Gemma4, Gemma Embedding2, gpt-oss, Phi3,
-  and Mellum.
+  Mellum, Muse Glimmer (text), LFM2 MoE, and DeepSeek V2-style multi-head latent attention as
+  GLM-4.7-Flash uses it.
   Compatibility depends on the architecture and tensors in the file, not just its model name.
 - Continuous batching, chunked prefill, prefix reuse, and sliding-window KV caches.
 - Speculative decoding with supported MTP layers or assistant drafters.
