@@ -66,6 +66,16 @@ def test_end_of_generation_tokens():
     assert gemma.eog_ids == {gemma.eos_id, *ids(gemma, "<|tool_response>")}
 
 
+def test_reply_markers_decode_as_text():
+    # the markers of reply formats decode as text whatever their type, as harmony's channels and
+    # LFM2's calls, for the reply to be parsed; other control tokens decode as nothing
+    tok = with_tokens({"<|tool_call_start|>": CONTROL, "<|tool_call_end|>": CONTROL,
+                       "<|channel|>": CONTROL})  # fmt: skip
+    marked = tok.encode("<|tool_call_start|>ab<|tool_call_end|><|eot|>", bos=False, special=True)
+    assert tok.decode(marked) == "<|tool_call_start|>ab<|tool_call_end|>"
+    assert ids(tok, "<|channel|>")[0] in tok.special_ids  # still no text a penalty lowers
+
+
 def test_sentencepiece_bytes_it_lacks():
     # a byte the vocab has no <0xXX> token of is the token of that byte alone, or else dropped, as
     # llama.cpp: only an ASCII byte is one, not é's bytes the characters Ã and ©

@@ -31,9 +31,12 @@ _FIM_EOG = {
     "fim_rep": {"<|fim_repo|>", "<|repo_name|>", "<fim-repo>", "<REPO>", "<reponame>"},
     "fim_sep": {"<|file_sep|>"},
 }
-# gpt-oss's harmony format: tokens that decode as text, as llama.cpp has them, and its ends of a
-# message that do not end a generation, as llama.cpp's workaround has it
-_HARMONY = {"<|channel|>", "<|message|>", "<|start|>", "<|constrain|>"}
+# the markers of reply formats, which decode as text, whatever their type, so that a reply's
+# reasoning and calls are told apart, as llama.cpp keeps them for its parsers: gpt-oss's harmony
+# channels, as Muse Glimmer's messages have them too, and LFM2's calls. And harmony's ends of a
+# message, which do not end a generation, as llama.cpp's workaround has it.
+_MARKERS = {"<|channel|>", "<|message|>", "<|start|>", "<|constrain|>", "<|tool_call_start|>",
+            "<|tool_call_end|>"}  # fmt: skip
 SPACE = "\u2581"  # how SentencePiece spells a space
 _CACHED = 1 << 24  # characters of words a tokenizer keeps the tokens of, to encode them again
 
@@ -185,7 +188,7 @@ class Tokenizer:
         harmony = {"<|return|>", "<|call|>"} <= ends or {"<|calls|>", "<|flush|>"} <= ends
         normal_s = bool(ends & {"<|tool_response>", "<|plamo:eos|>"})
         for i, t in enumerate(tokens):  # as llama.cpp overrides them
-            if t in _HARMONY or (harmony and t == "<|end|>"):
+            if t in _MARKERS or (harmony and t == "<|end|>"):
                 types[i] = USER_DEFINED
                 eog.discard(i)
             elif normal_s and t == "</s>":
