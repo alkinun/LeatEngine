@@ -242,6 +242,26 @@ def test_route(tokens):
     np.testing.assert_allclose(weights.reshape(n, 8), p / p.sum(-1, keepdims=True), rtol=1e-6)
 
 
+@pytest.mark.parametrize("normalize, scale", [(True, 1.0), (True, 1.8), (False, 2.5)])
+def test_route_sigmoid(normalize, scale):
+    # DeepSeek V3's routing: experts chosen by the sigmoid of their scores plus a bias, weighted
+    # by the sigmoid alone, normalized or not, then scaled; as the reference ops route
+    rng = np.random.default_rng(15)
+    scores = rng.standard_normal((5, 64)).astype(np.float32)
+    bias = rng.standard_normal(64).astype(np.float32) * 0.5
+    routing = ops.Routing(sigmoid=True, bias=Tensor(bias), normalize=normalize, scale=scale)
+    ids, weights = (t.numpy().reshape(5, 4) for t in kernels.route(Tensor(scores), 4, routing))
+    probs = 1 / (1 + np.exp(-scores.astype(np.float64)))
+    best = np.argsort(-(probs + bias), -1, kind="stable")[:, :4]
+    np.testing.assert_array_equal(ids, best)
+    chosen = np.take_along_axis(probs, best, -1)
+    expected = (chosen / chosen.sum(-1, keepdims=True) if normalize else chosen) * scale
+    np.testing.assert_allclose(weights, expected, rtol=1e-5)
+    reference, ref_weights = ops._routed(Tensor(scores), 4, routing)
+    np.testing.assert_array_equal(reference.numpy(), best)
+    np.testing.assert_allclose(ref_weights.numpy(), expected, rtol=1e-5)
+
+
 def test_route_distinct():
     # distinct experts, though a token scores fewer than it takes: the rest, of -inf or NaN, with
     # no weight

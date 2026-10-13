@@ -13,7 +13,9 @@ from tinygrad.uop.ops import AxisType, KernelInfo
 
 from leatengine.kernels.common import (
     LOG2E,
+    SOFTMAX,
     WARP,
+    Routing,
     argmax_step,
     ballot,
     carry,
@@ -130,15 +132,25 @@ def scores(x: Tensor, norm: tuple[Tensor, float], router: QTensor) -> Tensor:
 
 
 @functools.cache
-def _route_kernel(ids: UOp, weights: UOp, scores: UOp, tokens: int | UOp, used: int) -> UOp:
+def _route_kernel(
+    ids: UOp, weights: UOp, scores: UOp, *bias: UOp, tokens: int | UOp, used: int,
+    routing: tuple[bool, bool, float],
+) -> UOp:  # fmt: skip
     # a warp per token: `used` rounds of argmax over the experts' scores, the first index on ties,
-    # each taking its winner out of the next; then the softmax of the winners' scores. Scores of
-    # -inf or NaN count as the least finite one, below a winner taken out, which so is never
-    # taken again.
+    # each taking its winner out of the next; then the softmax of the winners' scores. Or, of
+    # routing (sigmoid, normalize, scale) by sigmoid, the argmax of the scores' sigmoids plus the
+    # bias, if given, and the winners' sigmoids, normalized to sum to 1 if `normalize`. Either way
+    # times `scale`. Values of -inf or NaN count as the least finite one, below a winner taken
+    # out, which so is never taken again.
+    sigmoid, normalize, scale = routing
     token, lane = UOp.range(tokens, 0, AxisType.GLOBAL), lane_range()
     ats = [(lane + WARP * j).cast(dtypes.int32) for j in range(int(scores.shape[1]) // WARP)]
     least = UOp.const(-3.4028234663852886e38, dtypes.float32)  # float32's least finite value
     values = [scores[token, at].load() for at in ats]
+    if sigmoid:
+        values = [_sigmoid(v) for v in values]
+        if bias:
+            values = [v + bias[0][at].load() for v, at in zip(values, ats, strict=True)]
     values = [(v > least).where(v, least) for v in values]
     best: list[tuple[UOp, UOp]] = []
     for _ in range(used):
@@ -150,25 +162,39 @@ def _route_kernel(ids: UOp, weights: UOp, scores: UOp, tokens: int | UOp, used: 
             at.eq(best[-1][1]).where(-math.inf, value)
             for value, at in zip(values, ats, strict=True)
         ]
-    exps = [((top - best[0][0]) * LOG2E).exp2() for top, _ in best]
+    if sigmoid:  # each winner's own sigmoid, without the bias
+        exps = [_sigmoid(scores[token, index].load()) for _, index in best]
+    else:
+        exps = [((top - best[0][0]) * LOG2E).exp2() for top, _ in best]
     total = sum(exps[1:], exps[0])
+    if sigmoid and normalize:  # over at least f16's least normal number, as llama.cpp's
+        total = total.maximum(6.103515625e-5)
+    elif sigmoid:
+        total = UOp.const(1.0, dtypes.float32)
     stores = []
     for i, ((_, index), e) in enumerate(zip(best, exps, strict=True)):
         at = (token * used + i).valid(lane.eq(0))
-        stores += [ids[at].store(index), weights[at].store(e / total)]
+        weight = e / total if scale == 1 else e / total * scale
+        stores += [ids[at].store(index), weights[at].store(weight)]
     info = KernelInfo(name=f"route_{used}", opts_to_apply=())
     return UOp.group(*stores).end(token, lane).sink(arg=info)
 
 
-def route(scores: Tensor, used: int) -> tuple[Tensor, Tensor]:
-    """The `used` best scoring experts of each row of `scores` (T, experts), as ids (T * used)
-    int32, and the softmax of their scores."""
+def _sigmoid(x: UOp) -> UOp:
+    return (1 + (x * -LOG2E).exp2()).reciprocal()
+
+
+def route(scores: Tensor, used: int, routing: Routing = SOFTMAX) -> tuple[Tensor, Tensor]:
+    """The `used` experts each row of `scores` (T, experts) takes, as ids (T * used) int32, and
+    their weights, as `routing` has them."""
     count, tokens = scores.max_shape[0], scores.shape[0]
     ids = Tensor.empty(count * used, dtype=dtypes.int32, device=scores.device)
     weights = Tensor.empty(count * used, dtype=dtypes.float32, device=scores.device)
     scores, tokens = carry(scores.float().pad_to(scores.max_shape).contiguous(), tokens)
-    fxn = functools.partial(_route_kernel, tokens=tokens, used=used)
-    ids, weights = Tensor.custom_kernel(ids, weights, scores, fxn=fxn)[:2]
+    flags = (routing.sigmoid, routing.normalize, routing.scale)
+    fxn = functools.partial(_route_kernel, tokens=tokens, used=used, routing=flags)
+    bias = () if routing.bias is None else (routing.bias.float().contiguous(),)
+    ids, weights = Tensor.custom_kernel(ids, weights, scores, *bias, fxn=fxn)[:2]
     return ids, weights
 
 
@@ -300,17 +326,17 @@ def mixture(
     x: Tensor, scores: Tensor, gate: QTensor, up: QTensor | None, down: QTensor, used: int,
     norm: tuple[Tensor, float], kind: str = "silu", scales: Tensor | None = None,
     residual: bool = True, biases: tuple[Tensor, Tensor, Tensor] | None = None,
-    live: int | UOp | None = None,
+    live: int | UOp | None = None, routing: Routing = SOFTMAX,
 ) -> Tensor:  # fmt: skip
     """x + the mixture of experts for tokens x (1, T, dim) and their router `scores` (1, T,
-    experts): each token's `used` best scoring experts, weighted by the softmax of their scores
-    and by each expert's scale if given, run glu(kind)(n @ gate.T, n @ up.T) @ down.T on
+    experts): each token's `used` best scoring experts, weighted as `routing` has it and by
+    each expert's scale if given, run glu(kind)(n @ gate.T, n @ up.T) @ down.T on
     n = rms_norm(x, *norm), as common.glu has it, with biases (experts, rows) of gate, up and
     down if given; without x if not residual. Where up is None, gate stacks both, each expert's
     gate rows first. Tokens past the first `live`, if given, pad a batch: on the matrix-vector
     kernels they read no experts, and their mixture is 0."""
     _, tokens, dim = x.shape
-    ids, weights = route(scores.reshape(tokens, gate.shape[0]), used)
+    ids, weights = route(scores.reshape(tokens, gate.shape[0]), used, routing)
     # few tokens, as many as known or bound to at most that many, or matrices the tensor-core
     # kernels do not fit, take the matrix-vector kernels
     few = int(x.max_shape[1]) <= MATVEC_TOKENS

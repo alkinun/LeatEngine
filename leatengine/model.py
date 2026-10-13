@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, cast
 
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import DType
@@ -23,6 +23,9 @@ _LAYER = ("attn_norm", "attn_q", "attn_k", "attn_output", "ffn_norm")
 # and of beta, the decay's rate and bias, the causal convolution, the output's norm and projection
 _DELTA_NET = ("attn_norm", "attn_qkv", "attn_gate", "ssm_alpha", "ssm_beta", "ssm_a", "ssm_dt.bias",
               "ssm_conv1d", "ssm_norm", "ssm_out", "ffn_norm")  # fmt: skip
+# the tensors of an LFM2 short convolution layer in place of attention: its input norm, the
+# projections of the gates b and c and the input x together, the convolution, and the output's
+_SHORT_CONV = ("attn_norm", "shortconv.in_proj", "shortconv.conv", "shortconv.out_proj", "ffn_norm")
 _MLP = ("ffn_gate", "ffn_up", "ffn_down")
 _EXPERTS = ("ffn_gate_inp", "ffn_down_exps")  # the router, and the experts' down projections
 # a layer's block of its own input, EmbeddingGemma 2's: its gate, projection and norm
@@ -32,10 +35,12 @@ _PER_LAYER = ("inp_gate", "proj", "post_norm")
 _ROPE_HALVES = {
     "llama": False, "qwen2": True, "qwen3": True, "qwen3moe": True, "gemma3": True,
     "gemma4": True, "gemma-embedding2": True, "gpt-oss": True, "phi3": True, "qwen35": True,
-    "qwen35moe": True, "mellum": True, "muse-glimmer": False,
+    "qwen35moe": True, "mellum": True, "muse-glimmer": False, "lfm2moe": True,
 }  # fmt: skip
 QWEN35 = ("qwen35", "qwen35moe")  # Qwen3.5's and Qwen3.6's architectures: dense, and of experts
 GEMMA4 = ("gemma4", "gemma-embedding2")  # Gemma 4's, and EmbeddingGemma 2's of its layers
+# expert_gating_func of the sigmoid, as llama.cpp's LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID
+_SIGMOID_GATING = 2
 # the period of attention.sliding_window_pattern where a GGUF has none, as llama.cpp's
 _SLIDING_EVERY = {"gemma3": 6, "gpt-oss": 2, "mellum": 4, "muse-glimmer": 4}
 # the architectures whose sliding-window layers turn by the RoPE base of the others where the GGUF
@@ -96,12 +101,20 @@ class Config:
     windows: tuple[int, ...]
     ropes: tuple[Rope, ...]
     scales: tuple[float, ...]
-    # the layers that are Gated DeltaNet's rather than attention, and its sizes
+    # the layers that are recurrent rather than attention: Gated DeltaNet's, of its sizes, or else
+    # LFM2's short convolutions, of `short_conv` tokens
     recurrent: tuple[bool, ...]
     delta_net: DeltaNet | None = None
+    short_conv: int = 0
     q_gate: bool = False  # q's projection also gives each head a gate for its output, as Qwen3.5's
     experts: int = 0  # MLPs per layer of a mixture of experts, 0 for one MLP
     experts_used: int = 0  # experts each token takes
+    dense_lead: int = 0  # the first layers' MLPs, of a mixture of experts' model
+    # how the router's scores weigh the experts: by sigmoid rather than softmax, normalized, and
+    # scaled, as ops.Routing has it
+    sigmoid_gating: bool = False
+    expert_weights_norm: bool = True
+    expert_weights_scale: float = 1.0
     glu: str = "silu"  # how an MLP's gate and up combine, as ops.glu has it
     embed_scale: float = 1.0
     embed_norm: bool = False  # the embeddings RMSNormed without a weight, as Muse Glimmer's
@@ -182,6 +195,10 @@ class Config:
             recurrent = tuple((i + 1) % every != 0 for i in range(n_layers))
             if isinstance(layers := m.get("attention.recurrent_layers"), list):  # as llama.cpp
                 recurrent = tuple(bool(r) for r in layers[:n_layers])
+        # LFM2's: the layers of no kv heads are short convolutions
+        short_conv = m.get("shortconv.l_cache", 0)
+        if short_conv:
+            recurrent = tuple(heads == 0 for heads in per_layer(m["attention.head_count_kv"]))
         return Config(
             arch=arch,
             n_layers=n_layers,
@@ -198,9 +215,14 @@ class Config:
             scales=scales,
             recurrent=recurrent,
             delta_net=delta_net,
+            short_conv=short_conv,
             q_gate=arch in QWEN35,
             experts=m.get("expert_count", 0),
             experts_used=m.get("expert_used_count", 0),
+            dense_lead=m.get("leading_dense_block_count", 0),
+            sigmoid_gating=m.get("expert_gating_func") == _SIGMOID_GATING,
+            expert_weights_norm=m.get("expert_weights_norm", True),
+            expert_weights_scale=m.get("expert_weights_scale", 0.0) or 1.0,
             glu=_GLU.get(arch, "silu"),
             embed_scale=math.sqrt(dim) if arch in ("gemma3", *GEMMA4) else 1.0,
             v_norm=arch in GEMMA4,
@@ -306,13 +328,19 @@ class Transformer:
             proj, rows = weights["per_layer_model_proj.weight"], config.per_layer
             for n, layer in enumerate(self.layers):
                 layer["per_layer_model_proj"] = _rows(proj, n * rows, (n + 1) * rows)
-        mlp = (_EXPERTS if config.experts else _MLP) + (_PER_LAYER if config.per_layer else ())
+        inputs = _PER_LAYER if config.per_layer else ()
         # values of their own, but in Gemma 4, whose full-attention layers' keys are their values
         attention = _LAYER + (() if config.arch == "gemma4" else ("attn_v",))
+        recurrent = _SHORT_CONV if config.short_conv else _DELTA_NET
+
+        def needed(i: int) -> tuple[str, ...]:  # the tensors layer i reads at least
+            mlp = _EXPERTS if config.experts and i >= config.dense_lead else _MLP
+            return (recurrent if config.recurrent[i] else attention) + mlp + inputs
+
         missing = [
             f"blk.{i}.{n}"
-            for i, (layer, recurrent) in enumerate(zip(self.layers, config.recurrent, strict=True))
-            for n in (_DELTA_NET if recurrent else attention) + mlp
+            for i, layer in enumerate(self.layers)
+            for n in needed(i)
             if n not in layer
         ]
         if missing:
@@ -333,7 +361,11 @@ class Transformer:
         # EmbeddingGemma 2's; logits of tied embeddings when output.weight is absent or that
         self.projection = weights["output.weight"] if config.projected else None
         self.output = self.embed if config.projected else weights.get("output.weight", self.embed)
-        self.output_norm = weights["output_norm.weight"].dequant()
+        # under LFM2's name for it too, as llama.cpp's converter writes it
+        output_norm = weights.get("output_norm.weight", weights.get("token_embd_norm.weight"))
+        if output_norm is None:
+            raise ValueError("missing the output norm, output_norm.weight")
+        self.output_norm = output_norm.dequant()
         # the norm of each layer's input of its own, if any
         self.per_layer_norm = (
             weights["per_layer_proj_norm.weight"].dequant() if config.per_layer else None
@@ -361,24 +393,19 @@ class Transformer:
                 config.kv_heads, config.head_dims, config.recurrent, self.sizes, strict=True
             )
         ]
-        # a Gated DeltaNet layer's state of each slot: the last inputs of its convolution, and
-        # the recurrence's state of each value head, keys by values
-        d = config.delta_net
-        self.states = [
-            (zeros(slots, d.conv - 1, 2 * d.k_heads * d.k_dim + d.v_heads * d.v_dim),
-             zeros(slots, d.v_heads, d.k_dim, d.v_dim)) if d and recurrent else None
-            for recurrent in config.recurrent
-        ]  # fmt: skip
+        # a recurrent layer's state of each slot: of Gated DeltaNet, the last inputs of its
+        # convolution, and the recurrence's state of each value head, keys by values; of a short
+        # convolution, its last inputs
+        self.states = [_states(config, slots) if recurrent else None
+                       for recurrent in config.recurrent]  # fmt: skip
         # and a copy of them kept partway through a prompt, from which a later one may go on
-        self.kept = [
-            None if s is None else (zeros(*map(int, s[0].shape)), zeros(*map(int, s[1].shape)))
-            for s in self.states
+        self.kept: list[tuple[Tensor, ...] | None] = [
+            None if s is None else tuple(zeros(*map(int, t.shape)) for t in s) for s in self.states
         ]
         # and those after each of a run's `saved_tokens` tokens, from which it may go back
-        self.saved = [
+        self.saved: list[tuple[Tensor, ...] | None] = [
             None if s is None or not saved_tokens
-            else (zeros(saved_tokens, *map(int, s[0].shape[1:])),
-                  zeros(saved_tokens, *map(int, s[1].shape[1:])))
+            else tuple(zeros(saved_tokens, *map(int, t.shape[1:])) for t in s)
             for s in self.states
         ]  # fmt: skip
 
@@ -420,7 +447,9 @@ class Transformer:
                              "sliding windows hold at once: give the most a run takes")  # fmt: skip
         first = x  # the first layer's inputs, from which each layer's own input is projected
         for i in range(self.config.n_layers):
-            if self.config.recurrent[i]:
+            if self.config.recurrent[i] and self.config.short_conv:
+                x = self._short_conv(i, x, spans, save)
+            elif self.config.recurrent[i]:
                 x = self._delta_net(i, x, spans, save)
             else:
                 x = self._attention(i, x, spans, positions)
@@ -565,10 +594,23 @@ class Transformer:
         mixed, z = ops.linears(x, w["attn_qkv"], w["attn_gate"], norm=(s["attn_norm"], eps))
         gates = ops.router(x, (s["attn_norm"], eps), w["ssm_alpha_beta"])
         decay = (s["ssm_a"], s["ssm_dt.bias"])
-        saved = self.saved[i] if save else None
+        saved = cast(tuple[Tensor, Tensor] | None, self.saved[i] if save else None)
         out = ops.delta_net(mixed, z, gates, w["ssm_conv1d"].dequant(), decay,
-                            (s["ssm_norm"], eps), states, spans, saved)  # fmt: skip
+                            (s["ssm_norm"], eps), cast(tuple[Tensor, Tensor], states), spans,
+                            saved)  # fmt: skip
         return ops.linear(out, w["ssm_out"], residual=x)
+
+    def _short_conv(self, i: int, x: Tensor, spans: list[Span], save: bool = False) -> Tensor:
+        # x + an LFM2 short convolution block's output, in place of attention: the gates b and c
+        # and the input projected together, then c times the causal convolution of b times it
+        w, s, eps = self.layers[i], self.small[i], self.config.norm_eps
+        states = self.states[i]
+        assert states is not None
+        (bcx,) = ops.linears(x, w["shortconv.in_proj"], norm=(s["attn_norm"], eps))
+        saved = self.saved[i] if save else None
+        conv = w["shortconv.conv"].dequant()
+        out = ops.short_conv(bcx, conv, states[0], spans, None if saved is None else saved[0])
+        return ops.linear(out, w["shortconv.out_proj"], residual=x)
 
     def _feed_forward(self, i: int, x: Tensor, live: int | UOp | None = None) -> Tensor:
         # x + the MLP block's output: an MLP, a mixture of experts, as in Gemma 4 both, each output
@@ -579,7 +621,7 @@ class Transformer:
         eps, scale = c.norm_eps, None if c.per_layer else s.get("layer_output_scale")
         norm = (s["ffn_norm"], eps)
         mlp = (w["ffn_gate"], w["ffn_up"], w["ffn_down"]) if "ffn_gate" in w else None
-        if mlp and not c.experts:
+        if mlp and "ffn_gate_inp" not in w:  # an MLP alone, of a model of experts' first layers too
             if "post_ffw_norm" not in s:
                 return ops.feed_forward(x, *mlp, norm, c.glu)
             out = ops.feed_forward(x, *mlp, norm, c.glu, residual=False)
@@ -593,13 +635,15 @@ class Transformer:
         if "ffn_down_exps.bias" in s:  # gpt-oss's
             biases = (s["ffn_gate_exps.bias"], s["ffn_up_exps.bias"], s["ffn_down_exps.bias"])
         experts = (scores, gate, up, w["ffn_down_exps"], c.experts_used)
+        routing = ops.Routing(c.sigmoid_gating, s.get("exp_probs_b.bias"), c.expert_weights_norm,
+                              c.expert_weights_scale)  # fmt: skip
         if "ffn_gate_inp_shexp" in w:  # Qwen3.5's shared expert, scaled by its gate's sigmoid
             mixed = ops.mixture(x, *experts, norm, c.glu, residual=False, live=live)
             shexp = (w["ffn_gate_shexp"], w["ffn_up_shexp"], w["ffn_down_shexp"])
             out = ops.feed_forward(x, *shexp, norm, c.glu, residual=False)
             return x + mixed + out * ops.router(x, norm, w["ffn_gate_inp_shexp"]).sigmoid()
         if not mlp:
-            return ops.mixture(x, *experts, norm, c.glu, biases=biases, live=live)
+            return ops.mixture(x, *experts, norm, c.glu, biases=biases, live=live, routing=routing)
         scales = s["ffn_down_exps.scale"]
         mixed = ops.mixture(
             x, *experts, (s["pre_ffw_norm_2"], eps), c.glu, scales, False, live=live
@@ -674,8 +718,16 @@ def _stack(layer: dict[str, QTensor]) -> None:
         layer["ffn_gate_inp_shexp"] = QTensor(gate.data, gate.type, (1, *gate.shape))
 
 
+def _states(c: Config, slots: int) -> tuple[Tensor, ...]:
+    # a recurrent layer's states of each slot
+    if (d := c.delta_net) is not None:
+        conv = zeros(slots, d.conv - 1, 2 * d.k_heads * d.k_dim + d.v_heads * d.v_dim)
+        return conv, zeros(slots, d.v_heads, d.k_dim, d.v_dim)
+    return (zeros(slots, c.short_conv - 1, c.dim),)
+
+
 def _copy_slot(
-    sources: list[tuple[Tensor, Tensor] | None], targets: list[tuple[Tensor, Tensor] | None],
+    sources: list[tuple[Tensor, ...] | None], targets: list[tuple[Tensor, ...] | None],
     slot: int | UOp,
 ) -> None:  # fmt: skip
     pairs = [(s, t) for ss, ts in zip(sources, targets, strict=True) if ss and ts

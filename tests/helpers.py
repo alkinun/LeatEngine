@@ -1501,13 +1501,88 @@ def _reference_muse_glimmer(w: dict[str, np.ndarray], tokens: list[int]) -> np.n
     return np.tanh(logits / MG_CAP) * MG_CAP
 
 
+# LFM2 MoE: short convolutions in place of attention but in the layers of kv heads, an MLP in the
+# first, experts chosen by the sigmoid of their scores plus a bias in the others; tied embeddings,
+# and the output norm under llama.cpp's name for it
+L_KV_HEADS, L_WIDTH, L_THETA = (0, KV_HEADS, 0), 3, 1e6
+
+
+def _write_lfm2moe(path: Path) -> dict[str, np.ndarray]:
+    w, weights, add = _writer(path, "lfm2moe")
+    a = "lfm2moe."
+    for key, value in [("block_count", len(L_KV_HEADS)), ("embedding_length", D),
+                       ("feed_forward_length", HIDDEN), ("attention.head_count", HEADS),
+                       ("expert_count", EXPERTS), ("expert_used_count", USED),
+                       ("expert_feed_forward_length", EXPERT_HIDDEN),
+                       ("leading_dense_block_count", 1), ("expert_gating_func", 2),
+                       ("shortconv.l_cache", L_WIDTH)]:  # fmt: skip
+        w.add_uint32(a + key, value)
+    w.add_array(a + "attention.head_count_kv", list(L_KV_HEADS))
+    w.add_float32(a + "rope.freq_base", L_THETA)
+    add("token_embd.weight", *TENSORS["token_embd.weight"])
+    add("token_embd_norm.weight", (D,))
+    for i, kv_heads in enumerate(L_KV_HEADS):
+        b = f"blk.{i}."
+        add(b + "attn_norm.weight", (D,))
+        add(b + "ffn_norm.weight", (D,))
+        if kv_heads:
+            add(b + "attn_q_norm.weight", (HEAD_DIM,))
+            add(b + "attn_k_norm.weight", (HEAD_DIM,))
+            for name in ATTENTION:
+                add(b + name + ".weight", *TENSORS[name])
+        else:
+            add(b + "shortconv.in_proj.weight", (3 * D, D), GGMLType.Q8_0, 1e-3)
+            add(b + "shortconv.conv.weight", (D, L_WIDTH), GGMLType.F32, 0.5)
+            add(b + "shortconv.out_proj.weight", (D, D), GGMLType.Q8_0, 1e-3)
+        for name in MLP if i == 0 else MOE:
+            add(b + name + ".weight", *TENSORS[name])
+        if i:
+            add(b + "exp_probs_b.bias", (EXPERTS,), GGMLType.F32, 0.5)
+    _finish(w)
+    return weights
+
+
+def _reference_lfm2moe(w: dict[str, np.ndarray], tokens: list[int]) -> np.ndarray:
+    T, positions = len(tokens), np.arange(len(tokens))
+    angles = positions[:, None, None] * L_THETA ** (-np.arange(0, HEAD_DIM, 2) / HEAD_DIM)
+    cos, sin = np.cos(angles), np.sin(angles)
+    x = w["token_embd.weight"][tokens].astype(np.float64)
+    for i, kv_heads in enumerate(L_KV_HEADS):
+        lw = _layer(w, i)
+        h = norm(x, lw["attn_norm"])
+        if kv_heads:
+            q, k, v = (h @ lw[n].T for n in ("attn_q", "attn_k", "attn_v"))
+            q = rotate_halves(norm(q.reshape(T, HEADS, HEAD_DIM), lw["attn_q_norm"]), cos, sin)
+            k = rotate_halves(norm(k.reshape(T, KV_HEADS, HEAD_DIM), lw["attn_k_norm"]), cos, sin)
+            out = attention(q, k, v.reshape(T, KV_HEADS, HEAD_DIM), _mask(T, 0), HEAD_DIM**-0.5)
+            x = x + out @ lw["attn_output"].T
+        else:
+            b, c, xs = np.split(h @ lw["shortconv.in_proj"].T, 3, axis=-1)
+            inputs = np.concatenate([np.zeros((L_WIDTH - 1, D)), b * xs])
+            conv = sum(inputs[j : j + T] * lw["shortconv.conv"][:, j] for j in range(L_WIDTH))
+            x = x + (c * conv) @ lw["shortconv.out_proj"].T
+        h = norm(x, lw["ffn_norm"])
+        if i == 0:
+            x = x + mlp(h, lw["ffn_gate"], lw["ffn_up"], lw["ffn_down"])
+            continue
+        probs = sigmoid(h @ lw["ffn_gate_inp"].T)
+        out = np.zeros_like(h)
+        for t in range(T):
+            best = np.argsort(-(probs[t] + lw["exp_probs_b.bias"]), kind="stable")[:USED]
+            for e in best:
+                gate, up, down = (lw[f"ffn_{n}_exps"][e] for n in ("gate", "up", "down"))
+                out[t] += probs[t, e] / probs[t, best].sum() * mlp(h[t], gate, up, down)
+        x = x + out
+    return norm(x, w["token_embd_norm.weight"]) @ w["token_embd.weight"].T
+
+
 _WRITERS = {
     "gemma3": _write_gemma3, "gpt-oss": _write_gpt_oss, "phi3": _write_phi3,
-    "mellum": _write_mellum, "muse-glimmer": _write_muse_glimmer,
+    "mellum": _write_mellum, "muse-glimmer": _write_muse_glimmer, "lfm2moe": _write_lfm2moe,
     "qwen35": lambda path: _write_qwen35(path, "qwen35"),
     "qwen35moe": lambda path: _write_qwen35(path, "qwen35moe"),
 }  # fmt: skip
 _REFERENCES = {
     "gpt-oss": _reference_gpt_oss, "phi3": _reference_phi3, "mellum": _reference_mellum,
-    "muse-glimmer": _reference_muse_glimmer,
+    "muse-glimmer": _reference_muse_glimmer, "lfm2moe": _reference_lfm2moe,
 }  # fmt: skip

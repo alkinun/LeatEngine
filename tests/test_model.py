@@ -5,11 +5,12 @@ import numpy as np
 import pytest
 from tinygrad import Tensor, UOp, dtypes
 
-from leatengine import bench
+from leatengine import bench, ops
 from leatengine.engine import FEW_TOKENS, KEEP_BACK, Engine, graph
 from leatengine.gguf import GGUF
 from leatengine.kernels import VARIABLES
-from leatengine.model import CACHE_TILE, Config, Transformer, _stack, rope_table
+from leatengine.model import CACHE_TILE, Config, Transformer, _stack, rope_table, zeros
+from leatengine.ops import Span
 from leatengine.quant import GGMLType, QTensor
 from leatengine.sampler import GREEDY, Sampling
 from tests.helpers import (
@@ -37,6 +38,7 @@ ARCHS = [
     "qwen35moe",
     "mellum",
     "muse-glimmer",
+    "lfm2moe",
 ]
 
 
@@ -66,8 +68,11 @@ def test_kernels_match_reference(tiny, arch):
     pos = UOp.variable("start_pos", 0, CONTEXT - 1)
     each = [model.logits(model(Tensor([[t]], dtype=dtypes.int32), pos.bind(i))).numpy()[0, 0]
             for i, t in enumerate(PROMPT)]  # fmt: skip
+    # LFM2's short convolutions multiply the outputs of one int8-activated projection, gate by
+    # input by gate, which compounds its rounding: as llama.cpp's MMQ and MMVQ would round it
+    tolerance = 0.08 if arch == "lfm2moe" else 0.05
     for got in (whole, np.stack(each)):
-        np.testing.assert_allclose(got, expected, atol=0.05 * np.abs(expected).max())
+        np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max())
 
 
 def test_cache_whole_tiles(tiny_model):
@@ -170,6 +175,32 @@ def test_stack_alpha_beta():
     np.testing.assert_array_equal(stacked.dequant().numpy(), expected)
 
 
+def test_lfm2_config():
+    # LFM2's layers of no kv heads are short convolutions; the first leading_dense_block_count
+    # take an MLP, and its experts are weighed by the sigmoid, normalized, as llama.cpp's
+    lfm2 = {"attention.head_count_kv": [0, 8, 0, 0], "shortconv.l_cache": 3,
+            "leading_dense_block_count": 2, "expert_gating_func": 2}  # fmt: skip
+    c = config("lfm2moe", lfm2)
+    assert c.recurrent == (True, False, True, True) and c.short_conv == 3 and c.dense_lead == 2
+    assert c.sigmoid_gating and c.expert_weights_norm and c.expert_weights_scale == 1.0
+    assert not config("qwen3moe").sigmoid_gating
+
+
+@pytest.mark.usefixtures("reference_ops")
+def test_short_conv_saves_each_state():
+    # the state after each token of a run, as a run that stopped there would leave it
+    rng = np.random.default_rng(3)
+    bcx, conv = rng.standard_normal((1, 5, 24)), rng.standard_normal((8, 3))
+    bcx, conv = Tensor(bcx.astype(np.float32)), Tensor(conv.astype(np.float32))
+    state, saved = zeros(1, 2, 8), zeros(5, 2, 8)
+    whole = ops.short_conv(bcx, conv, state, [Span(0, 0, 5)], saved).numpy()
+    for t in range(5):
+        alone = zeros(1, 2, 8)
+        part = ops.short_conv(bcx[:, : t + 1], conv, alone, [Span(0, 0, t + 1)]).numpy()
+        np.testing.assert_allclose(part, whole[:, : t + 1], rtol=1e-6)
+        np.testing.assert_allclose(saved[t].numpy(), alone[0].numpy(), rtol=1e-6)
+
+
 def test_rope_metadata():
     # as llama.cpp: a scaling factor of no type, or of the old key, scales positions linearly;
     # attn_factor scales sliding layers' cos and sin too; gpt-oss's sliding layers take
@@ -213,7 +244,8 @@ def test_generate_matches_reference(tiny, arch):
     # a prompt that extends the previous one reuses the cache: only the new tokens are prefilled,
     # but for a model with recurrent state, which holds every token its slot ran
     longer = PROMPT + out[:3] + [7]
-    assert engine.cached_prefix(longer) == (0 if arch.startswith("qwen35") else len(PROMPT) + 3)
+    recurrent = arch.startswith("qwen35") or arch == "lfm2moe"
+    assert engine.cached_prefix(longer) == (0 if recurrent else len(PROMPT) + 3)
     again = list(engine.generate(longer, 4))
     assert again == list(Engine(path, max_context=CONTEXT, prefill_chunk=5).generate(longer, 4))
 

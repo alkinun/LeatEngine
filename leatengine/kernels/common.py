@@ -8,6 +8,7 @@ import functools
 import math
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from tinygrad import Device, Tensor, UOp, dtypes
@@ -369,3 +370,19 @@ def carry_all(t: Tensor, values: list[int | UOp]) -> tuple[Tensor, tuple[int | U
 def storage_words(w: QTensor) -> Tensor:
     # .contiguous() on a bitcast of contiguous storage is a view; without it tinygrad copies
     return w.data.flatten().bitcast(WORD_TYPE[w.type]).contiguous()
+
+
+@dataclass(frozen=True)
+class Routing:
+    """How a mixture of experts weighs the experts its router scores: by the softmax of the chosen
+    ones' scores; or by the sigmoid of each score, the experts chosen by it plus a `bias`
+    (experts,) if given, as DeepSeek V3's, and normalized to sum to 1 if `normalize`; either way
+    then times `scale`."""
+
+    sigmoid: bool = False
+    bias: Tensor | None = None
+    normalize: bool = True
+    scale: float = 1.0
+
+
+SOFTMAX = Routing()

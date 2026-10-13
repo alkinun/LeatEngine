@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from tinygrad import Tensor, UOp, dtypes
 
 from leatengine import kernels
-from leatengine.kernels.common import OAI_ALPHA, OAI_LIMIT
+from leatengine.kernels.common import OAI_ALPHA, OAI_LIMIT, SOFTMAX, Routing
 from leatengine.quant import NATIVE, QTensor
 
 
@@ -91,20 +91,21 @@ def mixture(
     x: Tensor, scores: Tensor, gate: QTensor, up: QTensor | None, down: QTensor, used: int,
     norm: tuple[Tensor, float], kind: str = "silu", scales: Tensor | None = None,
     residual: bool = True, biases: tuple[Tensor, Tensor, Tensor] | None = None,
-    live: int | UOp | None = None,
+    live: int | UOp | None = None, routing: Routing = SOFTMAX,
 ) -> Tensor:  # fmt: skip
     # x + a mixture of experts for n = rms_norm(x, *norm), as feed_forward, given the router's
     # scores (B, T, experts): each token takes the MLPs of the `used` experts it scores highest,
-    # weighted by the softmax of their scores and by each expert's scale if given. Experts are
+    # weighted as `routing` has it and by each expert's scale if given. Experts are
     # stacked matrices (experts, rows, cols), with biases (experts, rows) of gate, up and down if
     # given; where up is None, gate stacks both, the gate's rows first in each. Only the chosen
     # experts are read. Tokens past the first `live`, if given, pad a batch: the kernels give
     # them no experts, rather than reading experts of their own, and the reference ops theirs.
     if _fast() and kernels.supports_mixture(x, gate, up, down):
-        args = (used, norm, kind, scales, residual, biases, live)
+        args = (used, norm, kind, scales, residual, biases, live, routing)
         return kernels.mixture(x, scores, gate, up, down, *args)
-    top, experts = scores.topk(used)
-    weights = top.softmax(-1) if scales is None else top.softmax(-1) * scales[experts]
+    experts, weights = _routed(scores, used, routing)
+    if scales is not None:
+        weights = weights * scales[experts]
     B, T, dim = x.shape
     if math.prod(x.max_shape[:-1]) * used > gate.shape[0]:  # more pairs than experts
         chosen = (experts.unsqueeze(-1) == Tensor.arange(gate.shape[0])).float()
@@ -122,6 +123,20 @@ def mixture(
         out = out + biases[2][ids].unsqueeze(1)
     mixed = (out.reshape(B, T, used, dim) * weights.reshape(B, T, used, 1)).sum(2)
     return x + mixed if residual else mixed
+
+
+def _routed(scores: Tensor, used: int, routing: Routing) -> tuple[Tensor, Tensor]:
+    # the `used` experts each token takes of its scores (..., experts), and their weights
+    if not routing.sigmoid:
+        top, experts = scores.topk(used)
+        weights = top.softmax(-1)
+    else:
+        probs = scores.sigmoid()
+        _, experts = (probs if routing.bias is None else probs + routing.bias).topk(used)
+        weights = probs.gather(-1, experts)
+        if routing.normalize:  # over at least f16's least normal number, as llama.cpp's
+            weights = weights / weights.sum(-1, keepdim=True).maximum(6.103515625e-5)
+    return experts, weights if routing.scale == 1 else weights * routing.scale
 
 
 def _every_expert(
@@ -481,6 +496,49 @@ def _delta_net(
     Tensor.realize(*writes)
     gated = rms_norm(Tensor.stack(*out, dim=1), *norm) * z.reshape(1, n, heads, v_dim).silu()
     return gated.reshape(1, n, heads * v_dim).shrink_to((1, T, heads * v_dim))
+
+
+def short_conv(
+    bcx: Tensor, conv: Tensor, state: Tensor, spans: list[Span], saved: Tensor | None = None
+) -> Tensor:
+    # LFM2's gated short convolution over the spans' tokens in turn, each from and into its slot's
+    # state, as llama.cpp's. bcx (1, T, 3 * dim) holds each token's gates b and c and its input x;
+    # the causal convolution of conv's weights (dim, width) runs over b * x of the token and the
+    # width - 1 tokens before it, which the state (slots, width - 1, dim) holds. A span from
+    # position 0 starts its sequence, from a zero state. The state after each token goes to
+    # `saved`, if given, (at least T, width - 1, dim), the t-th token's to row t. Returns c times
+    # the convolution (1, T, dim).
+    if len(spans) == 1:
+        return _short_conv(bcx, conv, state, spans[0], saved)
+    outs, at = [], 0
+    for span in spans:
+        n = int(span.length)
+        kept = None if saved is None else saved[at : at + n]
+        outs.append(_short_conv(bcx[:, at : at + n], conv, state, span, kept))
+        at += n
+    return outs[0].cat(*outs[1:], dim=1)
+
+
+def _short_conv(
+    bcx: Tensor, conv: Tensor, state: Tensor, span: Span, saved: Tensor | None = None
+) -> Tensor:
+    # short_conv() for one span. A bound number of tokens runs as many as there may be, of zeros
+    # past the span's, which stores the state after the span's last token alone.
+    T, slot, width = bcx.shape[1], span.slot, int(conv.shape[1])
+    n = T if isinstance(T, int) else int(T.vmax)
+    b, c, x = bcx.pad_to(bcx.max_shape).chunk(3, dim=-1)
+    # read first: realized with the write below, tinygrad may write the state before reading it
+    before = Tensor(span.start > 0).where(state[slot : slot + 1], 0.0).contiguous().realize()
+    inputs = before.cat(b * x, dim=1)  # the convolution's: those before the span's, then its
+    out = inputs[:, :n] * conv[:, 0]
+    for j in range(1, width):
+        out = out + inputs[:, j : j + n] * conv[:, j]
+    writes = [state[slot : slot + 1].assign(inputs[:, T : T + width - 1])]
+    if saved is not None:  # after token t, the inputs t + 1 .. t + width - 1
+        windows = [inputs[:, t + 1 : t + width] for t in range(n)]
+        writes.append(saved[:n].assign(Tensor.cat(*windows)))
+    Tensor.realize(*writes)
+    return (c * out).shrink_to((1, T, int(conv.shape[0])))
 
 
 def _l2_norm(x: Tensor, eps: float) -> Tensor:
