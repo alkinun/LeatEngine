@@ -128,7 +128,7 @@ _UNSUPPORTED = {
 
 @dataclass(frozen=True)
 class _Finish:
-    reason: str  # "stop" or "length"
+    reason: str  # "stop", "length", or "cancelled" as the client hung up
     cached: int  # prompt tokens the cache held
     tokens: int  # tokens generated
     prefill_time: float  # seconds from the start of generation to the first token
@@ -256,15 +256,24 @@ class Server(ThreadingHTTPServer):
         and compiles its graphs; returns when it is ready. Loading the loaded model does nothing."""
         if name not in self.models:
             raise ValueError(f"there is no model {name!r}")
-        # queued under the lock that a completion is queued under, once it has checked that no
-        # load is pending: a completion rendered by the template of the model loaded is queued
-        # before the load, and one asked from now on waits for it
+        # queued under the lock ask() queues a completion under: one rendered by the template of
+        # the model loaded is queued before the load, and one asked from now on waits for it
         with self._loads_lock:
             self._loads += 1
             self.ready.clear()
             self.requests.put(load := _Load(name))
         if (error := load.done.get()) is not None:
             raise RuntimeError(f"loading {name} failed: {error!r}") from error
+
+    def ask(self, completion: _Completion, rendered: "_Loaded | None") -> bool:
+        """Queues a completion rendered by the template of the model `rendered`, if no load has
+        begun since and that model is still the one loaded; False if not, as it must be rendered
+        again by the template of the model loaded next."""
+        with self._loads_lock:  # which load() queues under, so that no load slips in between
+            if self._loads or self.loaded is not rendered:
+                return False
+            self.requests.put(completion)
+            return True
 
     def server_close(self) -> None:
         super().server_close()
@@ -780,12 +789,8 @@ class _Handler(BaseHTTPRequestHandler):
             except _Unset as e:  # the operator's file of sampling, broken
                 return self._error(500, str(e))
             completion.key = self.key
-            # queued only if no load began while it was rendered, else rendered again by the
-            # template of the model loaded next
-            with server._loads_lock:
-                if not server._loads and server.loaded is loaded:
-                    server.requests.put(completion)
-                    break
+            if server.ask(completion, loaded):
+                break
         try:
             if completion.stream:
                 self._stream(completion)
@@ -1090,7 +1095,8 @@ def _timings(c: _Completion) -> dict[str, Any]:
     # as llama.cpp's server reports them: the prompt's tokens past those cached, timed from the
     # start of generation, after any wait for a slot, to the first token; and the reply's tokens,
     # timed from the first to the last: the first comes of the prompt's last step, so that time
-    # holds one step fewer than there are tokens, and of a reply of one token, no rate
+    # holds one step fewer than there are tokens, and of a reply of one token, no rate. Rates are
+    # over all the tokens nonetheless, as llama.cpp's are.
     f = c.finish
     timings: dict[str, Any] = {"cache_n": f.cached}
     parts = (("prompt", len(c.prompt) - f.cached, f.prefill_time, True),

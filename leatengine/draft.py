@@ -16,7 +16,7 @@ from leatengine.gguf import GGUF
 from leatengine.model import QWEN35, Transformer, rope_table
 from leatengine.ops import Span
 
-Rows = list[int | UOp]  # a value for each sequence of a draft
+PerSequence = list[int | UOp]  # a value for each sequence of a draft
 
 
 class Drafter(Protocol):
@@ -24,7 +24,7 @@ class Drafter(Protocol):
     sequences: int
 
     def draft(
-        self, tokens: Tensor, hidden: Tensor, slots: Rows, positions: Rows, count: int
+        self, tokens: Tensor, hidden: Tensor, slots: PerSequence, positions: PerSequence, count: int
     ) -> Tensor:
         """`count` tokens drafted greedily after each of several sequences' `tokens` (1, n),
         sequence i's at position positions[i] of cache slot slots[i], which the target has run up
@@ -159,7 +159,7 @@ class Gemma4Assistant:
                 self.rope[source] = rope_table(rope, target.max_context, own)
 
     def draft(
-        self, tokens: Tensor, hidden: Tensor, slots: Rows, positions: Rows, count: int
+        self, tokens: Tensor, hidden: Tensor, slots: PerSequence, positions: PerSequence, count: int
     ) -> Tensor:
         scale, n, drafted = self.target.config.embed_scale, len(slots), []
         for _ in range(count):
@@ -181,7 +181,7 @@ class Gemma4Assistant:
     def shift(self, slot: int | UOp, offset: int | UOp) -> None:
         pass  # of Gemma 4, whose RoPE is plain
 
-    def _step(self, x: Tensor, slots: Rows, positions: Rows) -> tuple[Tensor, Tensor]:
+    def _step(self, x: Tensor, slots: PerSequence, positions: PerSequence) -> tuple[Tensor, Tensor]:
         # the hidden states for the next step and the logits, after x (1, n, width)
         c, eps, n = self.target.config, self.eps, len(slots)
         spans = [Span(slot, pos - 1) for slot, pos in zip(slots, positions, strict=True)]
@@ -247,7 +247,7 @@ class Qwen35Mtp:
         self.layer = Transformer(config, weights, target.max_context, target.slots)
 
     def draft(
-        self, tokens: Tensor, hidden: Tensor, slots: Rows, positions: Rows, count: int
+        self, tokens: Tensor, hidden: Tensor, slots: PerSequence, positions: PerSequence, count: int
     ) -> Tensor:
         n, drafted = len(slots), []
         for i in range(count):
