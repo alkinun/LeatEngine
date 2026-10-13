@@ -1576,13 +1576,122 @@ def _reference_lfm2moe(w: dict[str, np.ndarray], tokens: list[int]) -> np.ndarra
     return norm(x, w["token_embd_norm.weight"]) @ w["token_embd.weight"].T
 
 
+# DeepSeek V2's multi-head latent attention, as GLM-4.7-Flash's: queries through a compression of
+# Q_RANK, keys and values from one of KV_RANK; each head's query and key of NOPE dimensions RoPE
+# leaves and ROPE it turns, adjacent pairs, the key's shared by every head, and its value of V_DIM.
+# An MLP in the first layer, then experts chosen by the sigmoid plus a bias, normalized and
+# scaled, beside a shared expert.
+DS_Q_RANK, DS_KV_RANK, DS_NOPE, DS_ROPE, DS_V_DIM, DS_SCALE = 64, 96, 32, 32, 32, 1.8
+
+
+def _write_deepseek2(path: Path) -> dict[str, np.ndarray]:
+    w, weights, add = _writer(path, "deepseek2")
+    a = "deepseek2."
+    for key, value in [("block_count", LAYERS), ("embedding_length", D),
+                       ("feed_forward_length", HIDDEN), ("attention.head_count", HEADS),
+                       ("attention.head_count_kv", 1), ("expert_count", EXPERTS),
+                       ("expert_used_count", USED), ("expert_feed_forward_length", EXPERT_HIDDEN),
+                       ("expert_shared_count", 1), ("expert_group_count", 1),
+                       ("expert_group_used_count", 1), ("expert_gating_func", 2),
+                       ("leading_dense_block_count", 1), ("attention.q_lora_rank", DS_Q_RANK),
+                       ("attention.kv_lora_rank", DS_KV_RANK),
+                       ("attention.key_length", DS_KV_RANK + DS_ROPE),
+                       ("attention.value_length", DS_KV_RANK),
+                       ("attention.key_length_mla", DS_NOPE + DS_ROPE),
+                       ("attention.value_length_mla", DS_V_DIM),
+                       ("rope.dimension_count", DS_ROPE)]:  # fmt: skip
+        w.add_uint32(a + key, value)
+    w.add_float32(a + "rope.freq_base", 10000.0)
+    w.add_float32(a + "expert_weights_scale", DS_SCALE)
+    w.add_bool(a + "expert_weights_norm", True)
+    add("token_embd.weight", *TENSORS["token_embd.weight"])
+    add("output.weight", *TENSORS["output.weight"])
+    add("output_norm.weight", (D,))
+    q8 = GGMLType.Q8_0
+    for i in range(LAYERS):
+        b = f"blk.{i}."
+        for name, shape in (("attn_norm", (D,)), ("attn_q_a_norm", (DS_Q_RANK,)),
+                            ("attn_kv_a_norm", (DS_KV_RANK,)), ("ffn_norm", (D,))):  # fmt: skip
+            add(b + name + ".weight", shape)
+        add(b + "attn_q_a.weight", (DS_Q_RANK, D), q8, 1e-3)
+        add(b + "attn_q_b.weight", (HEADS * (DS_NOPE + DS_ROPE), DS_Q_RANK), q8, 2e-3)
+        add(b + "attn_kv_a_mqa.weight", (DS_KV_RANK + DS_ROPE, D), q8, 1e-3)
+        add(b + "attn_k_b.weight", (HEADS, DS_KV_RANK, DS_NOPE), q8, 2e-3)
+        add(b + "attn_v_b.weight", (HEADS, DS_V_DIM, DS_KV_RANK), q8, 2e-3)
+        add(b + "attn_output.weight", (D, HEADS * DS_V_DIM), q8, 2e-3)
+        if i == 0:
+            for name in MLP:
+                add(b + name + ".weight", *TENSORS[name])
+            continue
+        for name in MOE:
+            add(b + name + ".weight", *TENSORS[name])
+        add(b + "exp_probs_b.bias", (EXPERTS,), GGMLType.F32, 0.5)
+        for name in ("gate", "up", "down"):
+            shape = (D, EXPERT_HIDDEN) if name == "down" else (EXPERT_HIDDEN, D)
+            add(b + f"ffn_{name}_shexp.weight", shape, GGMLType.Q8_0, 1e-3)
+    _finish(w)
+    return weights
+
+
+def _reference_deepseek2(w: dict[str, np.ndarray], tokens: list[int]) -> np.ndarray:
+    # as multi-head attention of each head's keys and values decompressed, the compressed keys and
+    # the RoPE ones rounded to f16 as the engine's cache holds them
+    T, positions = len(tokens), np.arange(len(tokens))
+    angles = positions[:, None, None] * 10000.0 ** (-np.arange(0, DS_ROPE, 2) / DS_ROPE)
+    cos, sin = np.cos(angles), np.sin(angles)
+
+    def rope(z):  # adjacent pairs
+        out = np.empty_like(z)
+        out[..., 0::2] = z[..., 0::2] * cos - z[..., 1::2] * sin
+        out[..., 1::2] = z[..., 0::2] * sin + z[..., 1::2] * cos
+        return out
+
+    def f16(z):
+        return z.astype(np.float16).astype(np.float64)
+
+    x = w["token_embd.weight"][tokens].astype(np.float64)
+    for i in range(LAYERS):
+        lw = _layer(w, i)
+        h = norm(x, lw["attn_norm"])
+        q = norm(h @ lw["attn_q_a"].T, lw["attn_q_a_norm"]) @ lw["attn_q_b"].T
+        q = q.reshape(T, HEADS, DS_NOPE + DS_ROPE)
+        kv = h @ lw["attn_kv_a_mqa"].T
+        latent = f16(norm(kv[:, :DS_KV_RANK], lw["attn_kv_a_norm"]))
+        k_rope = f16(rope(kv[:, None, DS_KV_RANK:]))  # (T, 1, rope)
+        heads = []
+        for hd in range(HEADS):
+            k = np.concatenate([latent @ lw["attn_k_b"][hd], k_rope[:, 0]], -1)
+            v = latent @ lw["attn_v_b"][hd].T
+            qh = np.concatenate([q[:, hd, :DS_NOPE], rope(q[:, None, hd, DS_NOPE:])[:, 0]], -1)
+            scores = qh @ k.T / np.sqrt(DS_NOPE + DS_ROPE) + _mask(T, 0)
+            p = np.exp(scores - scores.max(-1, keepdims=True))
+            heads.append(p / p.sum(-1, keepdims=True) @ v)
+        x = x + np.concatenate(heads, -1) @ lw["attn_output"].T
+        h = norm(x, lw["ffn_norm"])
+        if i == 0:
+            x = x + mlp(h, lw["ffn_gate"], lw["ffn_up"], lw["ffn_down"])
+            continue
+        probs = sigmoid(h @ lw["ffn_gate_inp"].T)
+        out = mlp(h, lw["ffn_gate_shexp"], lw["ffn_up_shexp"], lw["ffn_down_shexp"])
+        for t in range(T):
+            best = np.argsort(-(probs[t] + lw["exp_probs_b.bias"]), kind="stable")[:USED]
+            for e in best:
+                gate, up, down = (lw[f"ffn_{n}_exps"][e] for n in ("gate", "up", "down"))
+                weight = probs[t, e] / probs[t, best].sum() * DS_SCALE
+                out[t] += weight * mlp(h[t], gate, up, down)
+        x = x + out
+    return norm(x, w["output_norm.weight"]) @ w["output.weight"].T
+
+
 _WRITERS = {
     "gemma3": _write_gemma3, "gpt-oss": _write_gpt_oss, "phi3": _write_phi3,
     "mellum": _write_mellum, "muse-glimmer": _write_muse_glimmer, "lfm2moe": _write_lfm2moe,
+    "deepseek2": _write_deepseek2,
     "qwen35": lambda path: _write_qwen35(path, "qwen35"),
     "qwen35moe": lambda path: _write_qwen35(path, "qwen35moe"),
 }  # fmt: skip
 _REFERENCES = {
     "gpt-oss": _reference_gpt_oss, "phi3": _reference_phi3, "mellum": _reference_mellum,
     "muse-glimmer": _reference_muse_glimmer, "lfm2moe": _reference_lfm2moe,
+    "deepseek2": _reference_deepseek2,
 }  # fmt: skip

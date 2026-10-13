@@ -39,6 +39,7 @@ ARCHS = [
     "mellum",
     "muse-glimmer",
     "lfm2moe",
+    "deepseek2",
 ]
 
 
@@ -184,6 +185,20 @@ def test_lfm2_config():
     assert c.recurrent == (True, False, True, True) and c.short_conv == 3 and c.dense_lead == 2
     assert c.sigmoid_gating and c.expert_weights_norm and c.expert_weights_scale == 1.0
     assert not config("qwen3moe").sigmoid_gating
+
+
+def test_mla_config():
+    # DeepSeek V2's multi-head latent attention: scores scaled by each head's whole query and key;
+    # its YaRN and its groups of experts, as DeepSeek V3's, are refused rather than run wrong
+    mla = {"attention.kv_lora_rank": 512, "attention.q_lora_rank": 768,
+           "attention.key_length": 576, "attention.key_length_mla": 256,
+           "attention.value_length_mla": 256, "rope.dimension_count": 64}  # fmt: skip
+    c = config("deepseek2", mla)
+    assert c.mla is not None and (c.mla.nope, c.mla.rope, c.mla.v_dim) == (192, 64, 256)
+    assert c.scales == (1 / 16,) * 4 and c.head_dims == (576,) * 4 and not c.rope_halves
+    for unsupported in (YARN, {"expert_group_used_count": 4}):
+        with pytest.raises(NotImplementedError, match="multi-head latent attention"):
+            config("deepseek2", mla | unsupported)
 
 
 @pytest.mark.usefixtures("reference_ops")

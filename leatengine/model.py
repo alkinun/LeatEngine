@@ -35,7 +35,7 @@ _PER_LAYER = ("inp_gate", "proj", "post_norm")
 _ROPE_HALVES = {
     "llama": False, "qwen2": True, "qwen3": True, "qwen3moe": True, "gemma3": True,
     "gemma4": True, "gemma-embedding2": True, "gpt-oss": True, "phi3": True, "qwen35": True,
-    "qwen35moe": True, "mellum": True, "muse-glimmer": False, "lfm2moe": True,
+    "qwen35moe": True, "mellum": True, "muse-glimmer": False, "lfm2moe": True, "deepseek2": False,
 }  # fmt: skip
 QWEN35 = ("qwen35", "qwen35moe")  # Qwen3.5's and Qwen3.6's architectures: dense, and of experts
 GEMMA4 = ("gemma4", "gemma-embedding2")  # Gemma 4's, and EmbeddingGemma 2's of its layers
@@ -85,6 +85,24 @@ class DeltaNet:
 
 
 @dataclass(frozen=True)
+class MLA:
+    """The sizes of multi-head latent attention, DeepSeek V2's, as GLM-4.7-Flash has it: the rank
+    of the queries' compression, 0 for none, and of the keys' and values'; and each head's
+    dimensions of its query and key that turn by no RoPE, that RoPE turns, and of its value.
+
+    It runs as llama.cpp's absorbed MLA: one head of keys and values for all, each of the RoPE
+    dimensions and then the compressed ones, and each query head's dimensions that RoPE leaves
+    taken into the compressed ones by attn_k_b; each head's output, of the compressed values,
+    taken to its value's dimensions by attn_v_b."""
+
+    q_rank: int
+    kv_rank: int
+    nope: int
+    rope: int
+    v_dim: int
+
+
+@dataclass(frozen=True)
 class Config:
     arch: str
     n_layers: int
@@ -106,6 +124,7 @@ class Config:
     recurrent: tuple[bool, ...]
     delta_net: DeltaNet | None = None
     short_conv: int = 0
+    mla: MLA | None = None  # attention as multi-head latent attention
     q_gate: bool = False  # q's projection also gives each head a gate for its output, as Qwen3.5's
     experts: int = 0  # MLPs per layer of a mixture of experts, 0 for one MLP
     experts_used: int = 0  # experts each token takes
@@ -180,7 +199,16 @@ class Config:
         ropes = [
             _rope(m, arch, s, d if s else rotated) for s, d in zip(sliding, head_dims, strict=True)
         ]
-        if arch in GEMMA4:  # unit attention scale, as its q and k are normed
+        mla = None
+        if "attention.kv_lora_rank" in m:  # DeepSeek V2's multi-head latent attention
+            if m.get("rope.scaling.type") == "yarn" or m.get("expert_group_used_count", 1) > 1:
+                raise NotImplementedError("YaRN or expert groups of multi-head latent attention")
+            keys = m["attention.key_length_mla"]
+            mla = MLA(m.get("attention.q_lora_rank", 0), m["attention.kv_lora_rank"],
+                      keys - rotated, rotated, m["attention.value_length_mla"])  # fmt: skip
+        if mla is not None:  # of each head's whole query and key
+            scales = (1 / math.sqrt(mla.nope + mla.rope),) * n_layers
+        elif arch in GEMMA4:  # unit attention scale, as its q and k are normed
             scales = (1.0,) * n_layers
         elif arch == "gemma3" and n_layers == 62:  # 27B's query_pre_attn_scalar, as llama.cpp
             scales = (1 / math.sqrt(dim / n_heads),) * n_layers
@@ -216,6 +244,7 @@ class Config:
             recurrent=recurrent,
             delta_net=delta_net,
             short_conv=short_conv,
+            mla=mla,
             q_gate=arch in QWEN35,
             experts=m.get("expert_count", 0),
             experts_used=m.get("expert_used_count", 0),
@@ -329,8 +358,13 @@ class Transformer:
             for n, layer in enumerate(self.layers):
                 layer["per_layer_model_proj"] = _rows(proj, n * rows, (n + 1) * rows)
         inputs = _PER_LAYER if config.per_layer else ()
-        # values of their own, but in Gemma 4, whose full-attention layers' keys are their values
+        # values of their own, but in Gemma 4, whose full-attention layers' keys are their values;
+        # or the projections of multi-head latent attention, its queries' compressed or not
         attention = _LAYER + (() if config.arch == "gemma4" else ("attn_v",))
+        if (mla := config.mla) is not None:
+            queries = ("attn_q_a", "attn_q_a_norm", "attn_q_b") if mla.q_rank else ("attn_q",)
+            attention = ("attn_norm", *queries, "attn_kv_a_mqa", "attn_kv_a_norm", "attn_k_b",
+                         "attn_v_b", "attn_output", "ffn_norm")  # fmt: skip
         recurrent = _SHORT_CONV if config.short_conv else _DELTA_NET
 
         def needed(i: int) -> tuple[str, ...]:  # the tensors layer i reads at least
@@ -545,6 +579,8 @@ class Transformer:
         )
         if gate is not None:
             out = out * gate.reshape(out.shape).sigmoid()
+        if c.mla is not None:  # each head's compressed values, taken to its value's dimensions
+            out = self._mla_values(i, out)
         # gpt-oss's output bias joins the residual
         residual = x + s["attn_output.bias"] if "attn_output.bias" in s else x
         if "post_attention_norm" not in s:
@@ -560,6 +596,8 @@ class Transformer:
         # layer i's queries of x, rotated, of M-RoPE at their positions if given, and the gates
         # of their heads' outputs if any, and its cache with x's keys and values stored
         c, w, s = self.config, self.layers[i], self.small[i]
+        if c.mla is not None:
+            return (self._mla_rotated(i, x, spans), None), self._cache(i)
         B, T, _ = x.shape
         kv_heads, dim, eps = c.kv_heads[i], c.head_dims[i], c.norm_eps
         # Gemma 4's full-attention layers have no values of their own: the keys are, before norm;
@@ -584,6 +622,50 @@ class Transformer:
         q, cache = ops.rotate(q, k, v, cache, spans, rope, c.rope_halves, biases, norms, c.v_norm,
                               eps, positions is not None, self.rings[i])  # fmt: skip
         return (q, gate), cache
+
+    def _mla_rotated(self, i: int, x: Tensor, spans: list[Span]) -> Tensor:
+        # multi-head latent attention's queries of x (1, H, T, rope + kv_rank), rotated, with the
+        # head of keys and values stored in layer i's cache: the RoPE dimensions, rotated, then
+        # the compressed ones, normed; the values the keys before RoPE, of which attention's
+        # output keeps the compressed dimensions
+        c, w, s = self.config, self.layers[i], self.small[i]
+        mla, eps, (B, T, _) = c.mla, c.norm_eps, x.shape
+        assert mla is not None
+        norm = (s["attn_norm"], eps)
+        if mla.q_rank:
+            q_a, kv = ops.linears(x, w["attn_q_a"], w["attn_kv_a_mqa"], norm=norm)
+            q = ops.linear(ops.rms_norm(q_a, s["attn_q_a_norm"], eps), w["attn_q_b"])
+        else:
+            q, kv = ops.linears(x, w["attn_q"], w["attn_kv_a_mqa"], norm=norm)
+        q = q.reshape(B, T, c.n_heads, mla.nope + mla.rope)
+        q_nope, q_rope = q[..., : mla.nope], q[..., mla.nope :]
+        # each head's dimensions that RoPE leaves, taken into the compressed ones: (B, T, H, kv)
+        k_b = w["attn_k_b"].dequant()  # (H, kv_rank, nope)
+        absorbed = (q_nope.transpose(1, 2) @ k_b.transpose(1, 2)).transpose(1, 2)
+        compressed = ops.rms_norm(kv[..., : mla.kv_rank], s["attn_kv_a_norm"], eps)
+        k = kv[..., mla.kv_rank :].cat(compressed, dim=-1).reshape(B, T, 1, -1)
+        q = q_rope.cat(absorbed, dim=-1)
+        table = self.rope[i]
+        rope = None if table is None else (table, mla.rope)
+        q, _ = ops.rotate(q, k, k, self._cache(i), spans, rope, c.rope_halves, None, None, False,
+                          eps, ring=self.rings[i])  # fmt: skip
+        return q
+
+    def _mla_values(self, i: int, out: Tensor) -> Tensor:
+        # attention's output (1, T, H * (rope + kv_rank)) of multi-head latent attention, each
+        # head's compressed values taken to its value's dimensions by attn_v_b: (1, T, H * v_dim)
+        c, mla = self.config, self.config.mla
+        assert mla is not None
+        B, T, _ = out.shape
+        compressed = out.reshape(B, T, c.n_heads, -1)[..., mla.rope :]
+        v_b = self.layers[i]["attn_v_b"].dequant()  # (H, v_dim, kv_rank)
+        values = compressed.transpose(1, 2) @ v_b.transpose(1, 2)  # (B, H, T, v_dim)
+        return values.transpose(1, 2).reshape(B, T, c.n_heads * mla.v_dim)
+
+    def _cache(self, i: int) -> Tensor:
+        cache = self.cache[i]
+        assert cache is not None
+        return cache
 
     def _delta_net(self, i: int, x: Tensor, spans: list[Span], save: bool = False) -> Tensor:
         # x + a Gated DeltaNet block's output, in place of attention: queries, keys and values
@@ -637,11 +719,15 @@ class Transformer:
         experts = (scores, gate, up, w["ffn_down_exps"], c.experts_used)
         routing = ops.Routing(c.sigmoid_gating, s.get("exp_probs_b.bias"), c.expert_weights_norm,
                               c.expert_weights_scale)  # fmt: skip
-        if "ffn_gate_inp_shexp" in w:  # Qwen3.5's shared expert, scaled by its gate's sigmoid
-            mixed = ops.mixture(x, *experts, norm, c.glu, residual=False, live=live)
+        if "ffn_gate_shexp" in w:  # a shared expert, as DeepSeek's, or as Qwen3.5's scaled by
+            # its gate's sigmoid
+            mixed = ops.mixture(x, *experts, norm, c.glu, residual=False, live=live,
+                                routing=routing)  # fmt: skip
             shexp = (w["ffn_gate_shexp"], w["ffn_up_shexp"], w["ffn_down_shexp"])
             out = ops.feed_forward(x, *shexp, norm, c.glu, residual=False)
-            return x + mixed + out * ops.router(x, norm, w["ffn_gate_inp_shexp"]).sigmoid()
+            if "ffn_gate_inp_shexp" in w:
+                out = out * ops.router(x, norm, w["ffn_gate_inp_shexp"]).sigmoid()
+            return x + mixed + out
         if not mlp:
             return ops.mixture(x, *experts, norm, c.glu, biases=biases, live=live, routing=routing)
         scales = s["ffn_down_exps.scale"]
