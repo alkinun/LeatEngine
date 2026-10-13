@@ -65,6 +65,8 @@ This checks RDNA 3 kernel behavior in emulation; physical Strix Halo validation 
 
 CPU and emulated GPU jobs rebalance queued tests between workers with `--dist worksteal`,
 so long model cases do not leave the remaining tests queued behind one busy worker.
+AMD primitive kernels and the remaining GPU integration tests run in separate CI jobs;
+both contribute to the combined coverage gate.
 
 The packaging check builds both artifacts and installs each into a fresh environment. It runs
 outside the source checkout, checks both CLI entry points and package boundaries, and serves

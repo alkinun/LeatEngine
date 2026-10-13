@@ -68,6 +68,14 @@ jobs:
     # and the emulator from tinygrad's source tree, at the commit pyproject.toml pins
     runs-on: ubuntu-latest
     timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: primitives
+            selection: tests/test_kernels.py
+          - suite: models
+            selection: --ignore=tests/test_kernels.py
     steps:
       - uses: actions/checkout@v7
       - run: sudo apt-get update -q && sudo apt-get install -y -q clang lld
@@ -79,15 +87,15 @@ jobs:
         with:
           python-version: "3.14"
       - run: uv sync --locked
-      - run: uv run pytest -m gpu -n auto --dist worksteal --cov --cov-report= --durations=20
+      - run: uv run pytest -m gpu ${{ matrix.selection }} -n auto --dist worksteal --cov --cov-report= --durations=20
         env:
           DEV: MOCK+AMD
           PYTHONPATH: ${{ runner.temp }}/tinygrad
-          COVERAGE_FILE: .coverage.kernels
+          COVERAGE_FILE: .coverage.kernels-${{ matrix.suite }}
       - uses: actions/upload-artifact@v7
         with:
-          name: coverage-kernels
-          path: .coverage.kernels
+          name: coverage-kernels-${{ matrix.suite }}
+          path: .coverage.kernels-${{ matrix.suite }}
           include-hidden-files: true
 
   tokenizer:
