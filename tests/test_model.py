@@ -683,10 +683,14 @@ def test_start_needs_a_free_slot(tiny_model):
 # path; its decode path's scoring takes more than the 3090's 24 GB. Mellum 2.1 12B A2.5B, of 64
 # experts and 8 used, scores 0.0078 and 95.8% on the prompt's path and 0.0086 and 95.9% on the
 # decode path over 8 chunks: llama.cpp's own CPU backend scores 0.0095 against its CUDA one.
+# LFM2.5 24B A2B, whose short convolutions multiply three projections' outputs, is far more
+# sensitive to rounding: 0.051 and 89.9% on both paths over 8 chunks, where llama.cpp's CPU backend
+# scores 0.039 and 90.7% against its CUDA one, and leatengine 0.047 and 90.4% against its CPU one,
+# its perplexity no higher.
 LIMITS = {
     "llama": (0.0015, 0.975), "qwen2": (0.0045, 0.97), "qwen3": (0.0035, 0.97),
     "qwen3moe": (0.007, 0.97), "qwen35": (0.003, 0.975), "qwen35moe": (0.01, 0.965),
-    "Mistral Small": (0.003, 0.975), "mellum": (0.012, 0.95),
+    "Mistral Small": (0.003, 0.975), "mellum": (0.012, 0.95), "lfm2moe": (0.065, 0.88),
 }  # fmt: skip
 
 
