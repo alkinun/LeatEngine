@@ -75,10 +75,27 @@ def test_openai_messages():
     for content in ({"text": "a"}, 5, True):  # of none of OpenAI's kinds
         with pytest.raises(ValueError, match="content must be text, a list of parts, or null"):
             c.render([{"role": "user", "content": content}])
-    # a call's content of None, as OpenAI's clients send it, as text to templates that take text,
-    # as Qwen3's slices it
-    sliced = chat("{% for m in messages %}{{ m.content[:3] }}|{{ m.content is none }};{% endfor %}")
-    assert sliced[0].render(messages[1:2]) == "|False;"
+    # a call's content of None, as OpenAI's clients send it: as text to templates that take text,
+    # as Qwen2.5's; None to those that tell it from text, as DeepSeek-R1's distillations', unless
+    # they read it as text too, as Qwen3's splits it
+    texts = chat("{% for m in messages %}{{ m.content + '|' }}{% endfor %}")[0]
+    assert texts.render(messages[1:2]) == "|"
+    told = chat("{% for m in messages %}{{ m.content is none }}{% endfor %}")[0]
+    assert told.render(messages[1:2]) == "True"
+    for text in ("m.content.split('x')", "m.content + 'x'"):
+        both = "{% for m in messages %}{{ m.content is none }}{{ " + text + " }}{% endfor %}"
+        assert chat(both)[0].render(messages[1:2]).startswith("False")
+
+
+def test_generation_blocks():
+    # transformers' {% generation %} blocks, which mark the assistant's text for training, render
+    # as their bodies, as LFM2.5's template has them
+    c, _ = chat(
+        "{% for m in messages %}{% if m.role == 'assistant' %}{% generation %}{{ m.content }}"
+        "{% endgeneration %}{% else %}{{ m.content }}{% endif %};{% endfor %}"
+    )
+    messages = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]
+    assert c.render(messages) == "a;b;"
 
 
 def test_undefined_joins_as_no_text():
@@ -162,6 +179,11 @@ LEVELS = (
 )
 GEMMA = "{%- set enable_thinking = enable_thinking | default(false) -%}"
 QWEN = "{%- if enable_thinking is defined and enable_thinking is false %}<think></think>{% endif %}"
+COHERE = '{% if reasoning_effort | lower == "none" %}{% endif %}'
+SOLAR = (
+    '{% set reasoning_effort = reasoning_effort if reasoning_effort is defined else "high" %}'
+    '{% if reasoning_effort in ["low", "minimal"] %}{% endif %}'
+)
 
 
 @pytest.mark.parametrize(
@@ -174,6 +196,8 @@ QWEN = "{%- if enable_thinking is defined and enable_thinking is false %}<think>
         (LEVELS + TEMPLATE, ("low", "medium", "xhigh"), "medium"),
         (GEMMA + TEMPLATE, ("none", "high"), "none"),  # off by default, as it says
         (QWEN + TEMPLATE, ("none", "high"), "high"),  # on, unless turned off
+        (COHERE + TEMPLATE, ("none", "high"), "high"),  # "none" alone compared: off or on
+        (SOLAR + TEMPLATE, ("minimal", "low", "high"), "high"),  # a conditional default
     ],
 )
 def test_efforts(template, efforts, default):

@@ -38,8 +38,8 @@ class ChatTemplate:
         if (source := metadata.get("tokenizer.chat_template")) is None:
             raise ValueError("the model has no chat template")
         env = ImmutableSandboxedEnvironment(
-            trim_blocks=True, lstrip_blocks=True, extensions=[jinja2.ext.loopcontrols],
-            undefined=_Undefined,
+            trim_blocks=True, lstrip_blocks=True,
+            extensions=[jinja2.ext.loopcontrols, _Generation], undefined=_Undefined,
         )  # fmt: skip
         env.filters["tojson"] = _tojson
         env.globals["raise_exception"] = _raise
@@ -58,6 +58,10 @@ class ChatTemplate:
             else None
         )  # fmt: skip
         self._efforts, self._default, self._told = _reasoning(source)
+        # whether the template tells a message's content of None from text, as DeepSeek-R1's
+        # distillations' do, rendering a tool call's turn without text: it is given None then,
+        # as transformers gives it, where the template renders it; else "", as llama.cpp gives it
+        self._none = bool(re.search(r"content(?:['\"]\])?\s+is\s+(?:not\s+)?none", source))
 
     @property
     def form(self) -> str | None:
@@ -91,13 +95,20 @@ class ChatTemplate:
     def render(
         self, messages: list[dict[str, Any]], add_generation_prompt: bool = True, **kwargs
     ) -> str:
-        return self._template.render(
-            messages=[_message(_plain(m)) for m in messages],
-            add_generation_prompt=add_generation_prompt,
-            bos_token=self._bos,
-            eos_token=self._eos,
-            **_plain(kwargs),
-        )
+        def rendered(none: bool) -> str:
+            return self._template.render(
+                messages=[_message(_plain(m), none) for m in messages],
+                add_generation_prompt=add_generation_prompt,
+                bos_token=self._bos,
+                eos_token=self._eos,
+                **_plain(kwargs),
+            )
+
+        if self._none and any(m.get("content", "") is None for m in messages):
+            # a template that reads it as text elsewhere, as Qwen3's splits it
+            with contextlib.suppress(TypeError, jinja2.UndefinedError):
+                return rendered(none=True)
+        return rendered(none=False)
 
     def encode(
         self, messages: list[dict[str, Any]], add_generation_prompt: bool = True, **kwargs
@@ -135,14 +146,21 @@ def _reasoning(source: str) -> tuple[tuple[str, ...], str | None, str | None]:
     # them, or else low to high, as gpt-oss's; enable_thinking, off or on, off by default only where
     # the template says so; or none
     if "reasoning_effort" in source:
-        compared = re.findall(r"reasoning_effort\s*[!=]=\s*['\"](\w+)", source)
+        # compared after any filters, as Cohere2's reasoning_effort | lower == "none"
+        compared = re.findall(r"reasoning_effort(?:\s*\|\s*\w+)*\s*[!=]=\s*['\"](\w+)", source)
         compared += re.findall(r"['\"](\w+)['\"]\s*[!=]=\s*reasoning_effort", source)
         for listed in re.findall(r"reasoning_effort\s+(?:not\s+)?in\s*[\[(]([^\])]*)", source):
             compared += re.findall(r"['\"](\w+)['\"]", listed)
-        set_to = re.search(r"reasoning_effort\s*=\s*['\"](\w+)|reasoning_effort\s*\|\s*default"
-                           r"\(\s*['\"](\w+)", source)  # fmt: skip
+        # its default: set, of a filter, or of a conditional, as Solar Open's reasoning_effort =
+        # reasoning_effort if reasoning_effort is defined else "high"
+        set_to = re.search(r"reasoning_effort\s*=\s*['\"](\w+)"
+                           r"|reasoning_effort\s*\|\s*default\(\s*['\"](\w+)"
+                           r"|reasoning_effort\s+if\s+reasoning_effort\s+is\s+defined\s+else\s+"
+                           r"['\"](\w+)", source)  # fmt: skip
         named = next((d for d in set_to.groups() if d), None) if set_to else None
         levels = {*(compared or _LEVELS), *([named] if named else [])} & set(EFFORTS)
+        if levels == {"none"}:  # a template that tells "none" from the rest alone: off or on
+            levels.add("high")
         if levels:
             efforts = tuple(e for e in EFFORTS if e in levels)
             default = named if named in levels else efforts[len(efforts) // 2]
@@ -389,20 +407,21 @@ def images(messages: list[dict[str, Any]]) -> list[bytes]:
     return out
 
 
-def _message(message: dict[str, Any]) -> dict[str, Any]:
+def _message(message: dict[str, Any], none: bool = False) -> dict[str, Any]:
     # an OpenAI message as templates read it: content as one string, its text parts joined by
     # newlines and its images, `image_url` parts or transformers' `image` ones, IMAGE; and tool
     # calls only where there are some, with their arguments as objects rather than JSON text; and
     # reasoning as `thinking` too, as gpt-oss's template reads it, and llama.cpp and vLLM give it:
     # of replies that called tools, it keeps it until the turn's answer, and of those with text
-    # too, it takes the text for their reasoning, and refuses both
+    # too, it takes the text for their reasoning, and refuses both. Content of None stays None
+    # for a template that tells it from text, if `none`.
     message = dict(message)
     if not isinstance(message.get("content"), str | list | None):  # which a template would read
         # as text, and fail on as it may, as Qwen3's slicing an object
         raise ValueError("a message's content must be text, a list of parts, or null")
-    if "content" in message and message["content"] is None:  # as OpenAI's clients send a call's,
-        # which templates that take content for text, as Qwen3's and Gemma 3's, cannot read: as
-        # llama.cpp gives it, where every template that reads None renders it as it does ""
+    if "content" in message and message["content"] is None and not none:  # as OpenAI's clients
+        # send a call's, which templates that take content for text, as Qwen2.5's and Gemma 3's,
+        # cannot read: as llama.cpp gives it
         message["content"] = ""
     reasoning = message.get("reasoning_content")
     if reasoning and not message.get("content") and "thinking" not in message:
@@ -454,6 +473,21 @@ def _tojson(value: Any, ensure_ascii=False, indent=None, separators=None, sort_k
 
 def _raise(message: str) -> None:
     raise jinja2.exceptions.TemplateError(message)
+
+
+class _Generation(jinja2.ext.Extension):
+    # transformers' {% generation %}...{% endgeneration %}, which marks the assistant's text for
+    # training masks: its body renders as it is, in a scope of its own, as there
+    tags = {"generation"}
+
+    def parse(self, parser: Any) -> jinja2.nodes.Node:
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        call = self.call_method("_render", [])
+        return jinja2.nodes.CallBlock(call, [], [], body).set_lineno(lineno)
+
+    def _render(self, caller: Any) -> str:
+        return caller()
 
 
 class _Undefined(jinja2.Undefined):
