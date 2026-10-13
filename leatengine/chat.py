@@ -1,6 +1,7 @@
 """Chat prompts, rendered with the model's own Jinja template from GGUF metadata, and replies
 split into their reasoning, text and tool calls, in each supported model's syntax."""
 
+import ast
 import base64
 import binascii
 import contextlib
@@ -291,10 +292,12 @@ def partial_end(text: str, markers: Sequence[str]) -> int:
     return max((n for m in markers for n in range(1, len(m)) if text.endswith(m[:n])), default=0)
 
 
-# Qwen and Gemma 4 mark their tool calls, which may follow other text
-_MARKERS = ("<tool_call>", "<|tool_call>")
+# Qwen, Gemma 4 and LFM2 mark their tool calls, which may follow other text
+_MARKERS = ("<tool_call>", "<|tool_call>", "<|tool_call_start|>")
 _CALLS = re.compile(
-    r"<tool_call>(.*?)</tool_call>|<\|tool_call>call:([^{]+)(\{.*?\})<tool_call\|>", re.S
+    r"<tool_call>(.*?)</tool_call>|<\|tool_call>call:([^{]+)(\{.*?\})<tool_call\|>"
+    r"|<\|tool_call_start\|>(.*?)<\|tool_call_end\|>",
+    re.S,
 )
 _QUOTE = '<|"|>'  # Gemma 4's string quotes
 # Qwen3.5's calls inside <tool_call>: a function, and a parameter on each value's lines
@@ -312,19 +315,23 @@ def parse_tool_calls(reply: str, tools: list[dict[str, Any]]) -> tuple[str, list
     Llama 3 calls a tool by replying with nothing but {"name": ..., "parameters": {...}}, Qwen
     with <tool_call>{"name": ..., "arguments": {...}}</tool_call> after any text, Qwen3.5 with
     <tool_call><function=name><parameter=key>value</parameter>...</function></tool_call>, values
-    as text where the tool takes a string and else as JSON, and Gemma 4 with
-    <|tool_call>call:name{key:value,...}<tool_call|>.
+    as text where the tool takes a string and else as JSON, Gemma 4 with
+    <|tool_call>call:name{key:value,...}<tool_call|>, and LFM2 with a Python list of calls of
+    keyword arguments, <|tool_call_start|>[name(key=value, ...), ...]<|tool_call_end|>.
     """
     functions = {f.get("name"): f for tool in tools if (f := tool.get("function"))}
     if not (blocks := list(_CALLS.finditer(reply))):
         call = _json_call(reply, functions)
         return ("", [call]) if call else (reply, [])
-    calls = [
-        (_json_call(b[1]) or _xml_call(b[1], functions))
-        if b[1] is not None
-        else _gemma_call(b[2], b[3])
-        for b in blocks
-    ]
+    calls: list[dict[str, Any] | None] = []
+    for b in blocks:
+        if b[1] is not None:
+            calls.append(_json_call(b[1]) or _xml_call(b[1], functions))
+        elif b[4] is not None:
+            python = _python_calls(b[4])
+            calls += [None] if python is None else python
+        else:
+            calls.append(_gemma_call(b[2], b[3]))
     if any(call is None for call in calls):
         return reply, []
     return reply[: blocks[0].start()].rstrip(), [call for call in calls if call]
@@ -391,6 +398,56 @@ def _schema(value: Any, *keys: str) -> Any:
     for key in keys:
         value = value.get(key) if isinstance(value, dict) else None
     return value
+
+
+def _python_calls(text: str) -> list[dict[str, Any]] | None:
+    # LFM2's calls: a Python list of calls, or one call, each of a name, dotted or not, and keyword
+    # arguments of literals, JSON's true, false and null too. Parsed, never run.
+    try:
+        tree = ast.parse(text.strip(), mode="eval").body
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    calls = []
+    for node in tree.elts if isinstance(tree, ast.List | ast.Tuple) else [tree]:
+        if not isinstance(node, ast.Call) or node.args or (name := _dotted(node.func)) is None:
+            return None
+        try:
+            arguments = {kw.arg: _literal(kw.value) for kw in node.keywords if kw.arg is not None}
+        except (ValueError, RecursionError):
+            return None
+        if len(arguments) != len(node.keywords):  # **kwargs
+            return None
+        calls.append({"name": name, "arguments": arguments})
+    return calls
+
+
+def _dotted(node: ast.expr) -> str | None:
+    # a call's name, as weather or tools.weather
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute) and (base := _dotted(node.value)) is not None:
+        return f"{base}.{node.attr}"
+    return None
+
+
+_NAMED = {"true": True, "false": False, "null": None, "True": True, "False": False, "None": None}
+
+
+def _literal(node: ast.expr) -> Any:
+    # a literal's value, of Python's syntax or JSON's; ValueError for anything else
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in _NAMED:
+        return _NAMED[node.id]
+    if isinstance(node, ast.List | ast.Tuple):
+        return [_literal(e) for e in node.elts]
+    if isinstance(node, ast.Dict) and all(k is not None for k in node.keys):
+        return {_literal(k): _literal(v) for k, v in zip(node.keys, node.values, strict=True)}  # type: ignore[arg-type]
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub | ast.UAdd):
+        value = _literal(node.operand)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            return -value if isinstance(node.op, ast.USub) else value
+    raise ValueError(f"not a literal: {ast.dump(node)[:80]}")
 
 
 def _gemma_call(name: str, text: str) -> dict[str, Any] | None:

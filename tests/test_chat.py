@@ -259,10 +259,31 @@ PARIS = {"name": "weather", "arguments": {"city": "Paris"}}
          "</tool_call>", ""),  # Qwen3.5
         ('<|tool_call>call:weather{city:<|"|>Paris<|"|>}<tool_call|>', ""),  # Gemma 4
         ('<|tool_call>call:weather{ city : <|"|>Paris<|"|> }<tool_call|>', ""),  # with spaces
+        ("Checking.<|tool_call_start|>[weather(city='Paris')]<|tool_call_end|>", "Checking."),
+        ('<|tool_call_start|>weather(city="Paris")<|tool_call_end|>', ""),  # LFM2, not a list
     ],
 )  # fmt: skip
 def test_tool_calls(reply, text):
     assert parse_tool_calls(reply, WEATHER) == (text, [PARIS])
+
+
+def test_python_tool_calls():
+    # LFM2's: several calls, of Python's literals and JSON's, dotted names, and negative numbers;
+    # none where anything is not a call of literal keyword arguments, which is never run
+    weather = "weather(city='Paris', days=-3, hourly=true, at=None)"
+    search = 'tools.search(q="a\'b", tags=["x", 1.5], opts={"k": false})'
+    _, calls = parse_tool_calls(
+        f"<|tool_call_start|>[{weather}, {search}]<|tool_call_end|>", WEATHER
+    )
+    days = {"city": "Paris", "days": -3, "hourly": True, "at": None}
+    query = {"q": "a'b", "tags": ["x", 1.5], "opts": {"k": False}}
+    assert calls == [{"name": "weather", "arguments": days},
+                     {"name": "tools.search", "arguments": query}]  # fmt: skip
+    for bad in ("[weather('Paris')]", "[weather(city=open('x'))]", "[weather(**kw)]", "[1 +",
+                "[f()(x=1)]", "[weather(city=-'a')]"):  # fmt: skip
+        reply = f"<|tool_call_start|>{bad}<|tool_call_end|>"
+        assert parse_tool_calls(reply, WEATHER) == (reply, [])
+    assert tool_call_start("Checking.<|tool_call_st") == len("Checking.")
 
 
 def test_tool_call_arguments():
