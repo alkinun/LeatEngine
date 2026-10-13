@@ -2,7 +2,7 @@
 against llama.cpp on the same files, speculative decoding over chat prompts, and the server
 answering a streamed chat. Writes a Markdown report to reports/ and prints it.
 
-    uv run python scripts/validate.py MODEL.gguf|DIR ... [--llama-cpp llama.cpp/build/bin]
+    uv run python scripts/validate_hardware.py MODEL.gguf|DIR ... [--llama-cpp llama.cpp/build/bin]
 
 Every model runs in a process of its own, so each has the GPU's memory to itself. DEV picks the
 device, AMD by default for Strix Halo. A drafter is found for each model of an MTP layer

@@ -28,10 +28,10 @@ Linux TTM/GTT limits can affect usable memory; verify their behavior on this mac
 applying tuning. No kernel-memory settings are assumed validated here.
 
 ```bash
-uv sync --locked
+uv sync --locked --python 3.14
 DEV=AMD uv run python -c "from tinygrad import Device; print(Device['AMD'].arch)"
 DEV=AMD uv run pytest -m gpu
-DEV=AMD uv run python scripts/validate.py /models --llama-cpp /path/to/llama.cpp/build/bin
+DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp /path/to/llama.cpp/build/bin
 ```
 
 Run the real-GPU tests in a single process. Start with a model that comfortably fits memory,

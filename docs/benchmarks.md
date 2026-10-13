@@ -7,7 +7,7 @@ uv run leatengine bench MODEL.gguf -p 512 -n 128 -r 3 --json
 uv run leatengine bench MODEL.gguf -s 4 --json
 uv run leatengine bench MODEL.gguf --chat --draft DRAFTER.gguf --json
 uv run leatengine perplexity MODEL.gguf --text wiki.test.raw --ctx 512 --json
-DEV=AMD uv run python scripts/validate.py /models --llama-cpp /path/to/llama.cpp/build/bin
+DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp /path/to/llama.cpp/build/bin
 ```
 
 Use `--recommended` with `bench --chat` to measure recommended sampling rather than greedy

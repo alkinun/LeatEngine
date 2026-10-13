@@ -93,7 +93,7 @@ def artifacts(directory: Path) -> list[Path]:
         for required in (
             "leatengine/cli.py",
             "tests/helpers.py",
-            "scripts/validate.py",
+            "scripts/validate_hardware.py",
             "scripts/check_package.py",
             "docs/development.md",
             "README.md",

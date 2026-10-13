@@ -16,6 +16,11 @@ uv run python scripts/check_package.py
 ```
 
 Use Python 3.14 to match the primary CI environment; the CPU suite also runs on 3.12.
+Local stress tests with uv-managed CPython 3.13.14 encountered intermittent native worker
+crashes during CPU and emulated AMD execution, with and without coverage. Their cause is
+not yet isolated; passing individual reruns do not establish stability. Use Python 3.14
+for development and installation while this is investigated.
+
 The runtime requires tinygrad, Jinja2, and Pillow. Development dependencies provide independent
 GGUF/numerical references, HTTP-client tests, and quality checks. tinygrad is pinned to commit
 `9d7054488aee0e455e226514ba4b8b2f32329c29`; changing it is a deliberate compatibility update.

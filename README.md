@@ -16,7 +16,7 @@ GPU execution also requires the backend's driver and compiler: NVIDIA's open ker
 and NVRTC, or AMD's KFD device and ROCm comgr. See the [Strix Halo guide](docs/strix-halo.md).
 
 ```bash
-uv tool install 'git+https://github.com/alkinun/LeatEngine.git'
+uv tool install --python 3.14 'git+https://github.com/alkinun/LeatEngine.git'
 leatengine --help
 ```
 
