@@ -67,10 +67,10 @@ def test_end_of_generation_tokens():
 
 
 def test_sentencepiece_bytes_it_lacks():
-    # a byte the vocab has no <0xXX> token of is its own character's token, or else dropped, as
-    # llama.cpp
-    tokens = ["<unk>", "<s>", "\u2581", "a", "b", "<0x41>"]
-    types = [UNKNOWN, CONTROL, NORMAL, NORMAL, NORMAL, BYTE]
+    # a byte the vocab has no <0xXX> token of is the token of that byte alone, or else dropped, as
+    # llama.cpp: only an ASCII byte is one, not é's bytes the characters Ã and ©
+    tokens = ["<unk>", "<s>", "\u2581", "a", "b", "<0x41>", "\u00c3", "\u00a9"]
+    types = [UNKNOWN, CONTROL, NORMAL, NORMAL, NORMAL, BYTE, NORMAL, NORMAL]
     tok = Tokenizer(
         {"tokenizer.ggml.model": "llama", "tokenizer.ggml.tokens": tokens,
          "tokenizer.ggml.scores": [0.0] * len(tokens), "tokenizer.ggml.token_type": types,

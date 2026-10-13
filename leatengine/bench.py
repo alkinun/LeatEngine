@@ -26,7 +26,8 @@ from leatengine.sampler import GREEDY, Sampling
 class Speed:
     prefill: float  # tokens/s over a prompt, including sampling the first token
     decode: float  # tokens/s in all generating after one-token prompts, `sequences` at once
-    weight_gbs: float  # weight bytes streamed per second while decoding, once per batch
+    weight_gbs: float  # the target's weight bytes streamed per second while decoding: once a
+    # batch a step, which with a drafter gives several tokens
     sequences: int = 1
 
 
@@ -50,7 +51,7 @@ def speed(
     # are past their prompts, as llama-batched-bench's.
     rng = random.Random(0)
     prompt = [rng.randrange(engine.config.vocab_size) for _ in range(max(prompt_tokens, sequences))]
-    prefill, decode = [], []
+    prefill, decode, steps = [], [], []
     for _ in range(reps + 2):
         engine.reset()
         start = time.perf_counter()
@@ -63,10 +64,12 @@ def speed(
         ]
         while not all(s.tokens for s in started):
             engine.step()
-        start, made = time.perf_counter(), 0
+        start, made, stepped = time.perf_counter(), 0, 0
         while len(engine.active) == sequences:
-            made += len(engine.step())
-        decode.append(made / (time.perf_counter() - start))
+            made, stepped = made + len(engine.step()), stepped + 1
+        elapsed = time.perf_counter() - start
+        decode.append(made / elapsed)
+        steps.append(stepped / elapsed)
     engine.reset()
     # the bytes a token reads: the embedding only where it is also the output layer, and of a
     # mixture of experts, only the share each token uses
@@ -77,9 +80,9 @@ def speed(
     streamed = sum(
         t.nbytes * share[n] for n, t in tensors.items() if n != "token_embd.weight" or tied
     )
+    reads = statistics.median(steps[2:]) * -(-sequences // BATCH)  # of the weights, a second
     tg = statistics.median(decode[2:])
-    reads = -(-sequences // BATCH) / sequences  # weight reads per token: one per batch a step
-    return Speed(statistics.median(prefill[2:]), tg, streamed * tg * reads / 1e9, sequences)
+    return Speed(statistics.median(prefill[2:]), tg, streamed * reads / 1e9, sequences)
 
 
 # requests of the kinds a home assistant gets, for decode speed on replies whose tokens a drafter

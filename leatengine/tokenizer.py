@@ -315,14 +315,15 @@ class Tokenizer:
 
     def _ids(self, part: str) -> list[int]:
         # a merged part's token, or else its bytes': as <0xXX> tokens where they are not
-        # byte-level, or the byte's own character, as llama.cpp; bytes the vocab lacks are dropped
+        # byte-level, or as llama.cpp the token of that one byte, which only an ASCII byte is,
+        # rather than the character of its code point; bytes the vocab lacks are dropped
         if part in self._vocab:
             return [self._vocab[part]]
         if self._byte_level:
             return [self._vocab[c] for c in part if c in self._vocab]
         ids = []
         for b in part.encode():
-            for spelled in (f"<0x{b:02X}>", chr(b)):
+            for spelled in (f"<0x{b:02X}>", chr(b) if b < 0x80 else None):
                 if spelled in self._vocab:
                     ids.append(self._vocab[spelled])
                     break

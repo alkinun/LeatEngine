@@ -130,6 +130,8 @@ def test_images():
     for url in ("https://example.com/a.png", "data:image/png;base64,not base64!"):
         with pytest.raises(ValueError, match="data: URL|not base64"):
             images([{"content": [{"type": "image_url", "image_url": {"url": url}}]}])
+    with pytest.raises(ValueError, match="must be an image_url part"):  # an image of no data
+        images([{"content": other}])
 
 
 def with_marker(marker: str) -> ChatTemplate:

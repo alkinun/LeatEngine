@@ -395,6 +395,8 @@ def images(messages: list[dict[str, Any]]) -> list[bytes]:
     for message in messages:
         parts = message.get("content")
         for part in parts if isinstance(parts, list) else []:
+            if isinstance(part, dict) and part.get("type") == "image":  # transformers', of no data
+                raise ValueError("an image must be an image_url part, of a data: URL")
             if not isinstance(part, dict) or part.get("type") != "image_url":
                 continue
             url = part["image_url"].get("url") if isinstance(part.get("image_url"), dict) else None

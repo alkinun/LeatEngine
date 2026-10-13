@@ -14,11 +14,11 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from leatengine.defaults import Overrides
+from leatengine.defaults import OPTIONS, Overrides
 from leatengine.keys import Keys
 
 if TYPE_CHECKING:
-    from leatengine.chat import ChatTemplate
+    from leatengine.chat import ChatTemplate, Reply
     from leatengine.server import Server
     from leatengine.vision import Image
 
@@ -32,13 +32,13 @@ def main(argv: list[str] | None = None) -> None:
     run = commands.add_parser("run", help="chat with a model in the terminal")
     run.add_argument("model", type=Path, help="GGUF file")
     run.add_argument("--max-context", type=_positive, default=4096)
-    run.add_argument("--temperature", type=float, default=0.7)
+    run.add_argument("--temperature", type=_option("temperature"), default=0.7)
     run.add_argument(
-        "--top-k", type=int, default=0, help="keep the k likeliest tokens; 0 keeps all"
+        "--top-k", type=_option("top_k"), default=0, help="keep the k likeliest tokens; 0 keeps all"
     )
-    run.add_argument("--top-p", type=float, default=1.0)
-    run.add_argument("--min-p", type=float, default=0.0)
-    run.add_argument("--presence-penalty", type=float, default=0.0)
+    run.add_argument("--top-p", type=_option("top_p"), default=1.0)
+    run.add_argument("--min-p", type=_option("min_p"), default=0.0)
+    run.add_argument("--presence-penalty", type=_option("presence_penalty"), default=0.0)
     run.add_argument("--system", help="system prompt")
     run.add_argument(
         "--mmproj", type=Path,
@@ -53,11 +53,11 @@ def main(argv: list[str] | None = None) -> None:
 
     serve = commands.add_parser("serve", help="serve the OpenAI chat completions API")
     serve.add_argument(
-        "models", type=Path, nargs="+",
+        "models", type=Path, nargs="*",
         help="GGUF files, or directories of them; the first file loads at start, others on request",
     )  # fmt: skip
     serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--port", type=int, default=8080)
+    serve.add_argument("--port", type=_port, default=8080)
     serve.add_argument("--max-context", type=_positive, default=4096)
     serve.add_argument(
         "--slots", type=_positive, default=4,
@@ -142,6 +142,8 @@ def main(argv: list[str] | None = None) -> None:
     quality.add_argument("--json", action="store_true", help="print one JSON object")
 
     args = parser.parse_args(argv)
+    if args.command == "serve":
+        _check_serve(serve, args)
     if args.command in ("run", "serve", "bench", "perplexity"):
         _device()
     handlers = {
@@ -177,9 +179,41 @@ def _positive(text: str) -> int:
     return n
 
 
+def _option(name: str) -> Any:
+    # a sampling option's argument type, of the bounds a request's and the sampling file's have
+    kind, low, high = OPTIONS[name]
+
+    def parse(text: str) -> int | float:
+        value = kind(text)
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError(f"must be from {low} to {high}, got {text}")
+        return value
+
+    parse.__name__ = kind.__name__  # as argparse names the type in its errors
+    return parse
+
+
+def _port(text: str) -> int:
+    if not 0 <= (n := int(text)) <= 65535:
+        raise argparse.ArgumentTypeError(f"must be from 0 to 65535, got {n}")
+    return n
+
+
+def _check_serve(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    # --keys and --sampling take a file or none, so a model right after either is taken for its
+    # file: said, rather than a model's file read as keys
+    for flag in ("keys", "sampling"):
+        if (path := getattr(args, flag)) is not None and (path.suffix == ".gguf" or path.is_dir()):
+            parser.error(f"--{flag} takes its file, not {path}: give the models before it, or "
+                         f"its file after it")  # fmt: skip
+    if not args.models:
+        parser.error("the following arguments are required: models")
+
+
 def _url(host: str, port: int) -> str:
     # an address to browse to: this machine's, where the server takes every one
-    return f"http://{'127.0.0.1' if host in ('0.0.0.0', '::', '') else host}:{port}"
+    host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    return f"http://{f'[{host}]' if ':' in host else host}:{port}"
 
 
 def _run(args: argparse.Namespace) -> None:
@@ -261,7 +295,7 @@ def _prompt(
     return chat.tokens(rendered, [image.tokens for image in images]), chat.opens_thinking(rendered)
 
 
-def _show(parts, shown: tuple[str, str]) -> tuple[str, str]:
+def _show(parts: "Reply", shown: tuple[str, str]) -> tuple[str, str]:
     # prints what is new of a reply's reasoning, dimmed, and of its text
     reasoning, content = shown
     if len(parts.reasoning) > len(reasoning):

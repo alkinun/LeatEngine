@@ -9,7 +9,7 @@ import pytest
 
 from leatengine import bench, cli
 from leatengine.chat import ChatTemplate
-from leatengine.cli import main
+from leatengine.cli import _url, main
 from leatengine.engine import Engine
 from leatengine.gguf import GGUF
 from leatengine.tokenizer import Tokenizer
@@ -150,6 +150,16 @@ def test_run(tiny_model, monkeypatch, capsys):
     assert chats[1][1]["content"] in out and out.count("tok/s]") == 2
 
 
+@pytest.mark.parametrize(
+    "bad", [["--min-p", "1.5"], ["--temperature", "-1"], ["--top-k", "-1"], ["--top-p", "x"]]
+)
+def test_run_sampling_bounds(tiny_model, capsys, bad):
+    # sampling past the bounds a request's have is refused before the model loads
+    with pytest.raises(SystemExit):
+        main(["run", str(tiny_model[0]), *bad])
+    assert f"argument {bad[0]}" in capsys.readouterr().err
+
+
 def test_run_past_the_context(tiny_model, monkeypatch, capsys):
     # past --max-context, the chat starts over from the message just written, and a message too
     # long alone is dropped, each said so
@@ -240,6 +250,22 @@ def test_serve_directories(tiny_model, tmp_path, monkeypatch, capsys):
         main(["serve", str(empty)])
     with pytest.raises(SystemExit, match="--draft is of one model"):
         main(["serve", str(models), str(tiny_model[0]), "--draft", str(tiny_model[0])])
+    # a model right after --keys or --sampling, which take a file or none, is said to be no file
+    # of theirs, rather than read as one
+    for flag in ("--keys", "--sampling"):
+        for models_after in ([str(tiny_model[0])], [str(models), str(tiny_model[0])]):
+            with pytest.raises(SystemExit):
+                main(["serve", flag, *models_after])
+            assert f"{flag} takes its file, not" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        main(["serve", "--port", "70000", str(models)])
+    assert "must be from 0 to 65535" in capsys.readouterr().err
+
+
+def test_url():
+    assert _url("0.0.0.0", 80) == _url("", 80) == "http://127.0.0.1:80"
+    assert _url("::1", 8080) == "http://[::1]:8080" and _url("::", 1) == "http://127.0.0.1:1"
+    assert _url("example.com", 1) == "http://example.com:1"
 
 
 def test_keys(tmp_path, capsys):
