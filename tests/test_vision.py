@@ -315,6 +315,23 @@ def test_drafter_takes_images(tiny, tiny_assistant, tiny_mmproj):
     assert list(drafting.generate(prompt, 8, images=[drafting.image(data)])) == expected
 
 
+def test_mtp_takes_image_positions(tiny, projectors, monkeypatch):
+    # Qwen3.5's MTP layer stores the keys of an image's tokens at their M-RoPE positions, as the
+    # target runs them, rather than at plain RoPE's
+    path, mmproj = tiny("qwen35moe")[0], projectors("qwen3vl_merger")
+    drafting = Engine(path, max_context=CONTEXT, vision=mmproj[0], draft=path)
+    assert drafting.drafter is not None
+    layer, stored = drafting.drafter.layer, []  # type: ignore[attr-defined]
+    store = layer.store
+    monkeypatch.setattr(layer, "store", lambda i, x, spans, positions=None: stored.append(
+        positions) or store(i, x, spans, positions))  # fmt: skip
+    image = drafting.image(png(50, 20))
+    prompt = [5, 77, *image.tokens, 120]
+    list(drafting.generate(prompt, 2, images=[image]))
+    # the image's chunk alone, of the chunks and steps the layer took in
+    assert sum(positions is not None for positions in stored) == 1 < len(stored)
+
+
 def test_start_checks_images(tiny, tiny_mmproj):
     e = engine(tiny, tiny_mmproj)
     image = e.image(png(30, 30))

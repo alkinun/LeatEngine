@@ -32,9 +32,12 @@ class Drafter(Protocol):
         int32."""
         ...
 
-    def follow(self, tokens: Tensor, hidden: Tensor, spans: list[Span]) -> None:
+    def follow(
+        self, tokens: Tensor, hidden: Tensor, spans: list[Span], positions: Tensor | None = None
+    ) -> None:
         """Takes in what the target ran: tokens (1, T), its spans', and the target's normed
-        hidden states (1, T, dim) at the positions before theirs."""
+        hidden states (1, T, dim) at the positions before theirs; of M-RoPE, an image's tokens
+        at their `positions` (T, 3), as the target ran them."""
         ...
 
     def copy(self, source: int | UOp, slot: int | UOp) -> None:
@@ -167,7 +170,9 @@ class Gemma4Assistant:
             drafted.append(tokens.reshape(n, 1))
         return drafted[0].cat(*drafted[1:], dim=1)
 
-    def follow(self, tokens: Tensor, hidden: Tensor, spans: list[Span]) -> None:
+    def follow(
+        self, tokens: Tensor, hidden: Tensor, spans: list[Span], positions: Tensor | None = None
+    ) -> None:
         pass  # it reads the target's own keys and values
 
     def copy(self, source: int | UOp, slot: int | UOp) -> None:
@@ -252,8 +257,10 @@ class Qwen35Mtp:
             drafted.append(tokens.reshape(n, 1))
         return drafted[0].cat(*drafted[1:], dim=1)
 
-    def follow(self, tokens: Tensor, hidden: Tensor, spans: list[Span]) -> None:
-        self.layer.store(0, self._inputs(tokens, hidden), spans)
+    def follow(
+        self, tokens: Tensor, hidden: Tensor, spans: list[Span], positions: Tensor | None = None
+    ) -> None:
+        self.layer.store(0, self._inputs(tokens, hidden), spans, positions)
 
     def copy(self, source: int | UOp, slot: int | UOp) -> None:
         self.layer.copy(source, slot)

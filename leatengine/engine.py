@@ -734,7 +734,7 @@ class Engine:
                 hidden = self.model.run(tokens, spans)
             else:  # the embeddings as they are, not scaled as the tokens' are
                 hidden = self.model.forward(image, spans, positions=positions)
-            hidden = self._followed(tokens, hidden, spans)
+            hidden = self._followed(tokens, hidden, spans, positions)
             logits = self.model.logits(hidden[:, -1, :])
             return sample(logits, options, seed, start + length, seen).realize()
         spans = [Span(slot, start) for slot, start in pairs]
@@ -748,10 +748,12 @@ class Engine:
         hidden = self.model.run(tokens, [Span(slot, start, tokens.shape[1], self.config.causal)])
         return self.model.pool(hidden).realize()
 
-    def _followed(self, tokens: Tensor, hidden: Tensor, spans: list[Span]) -> Tensor:
-        # hidden (1, T, dim), the target's of a run of the spans' tokens; with a drafter, which
-        # takes in the run, given each token's hidden state before it, the last of each span as
-        # its slot's, which gave its last token
+    def _followed(
+        self, tokens: Tensor, hidden: Tensor, spans: list[Span], positions: Tensor | None = None
+    ) -> Tensor:
+        # hidden (1, T, dim), the target's of a run of the spans' tokens, of M-RoPE an image's at
+        # `positions`; with a drafter, which takes in the run, given each token's hidden state
+        # before it, the last of each span as its slot's, which gave its last token
         if self.drafter is None:
             return hidden
         hidden = hidden.contiguous().realize()
@@ -762,7 +764,7 @@ class Engine:
         else:
             before = Tensor.cat(*(self._hidden[s.slot : s.slot + 1] for s in spans), dim=1)
             lasts = [hidden[:, i : i + 1] for i in range(len(spans))]
-        self.drafter.follow(tokens, before, spans)
+        self.drafter.follow(tokens, before, spans, positions)
         Tensor.realize(*(self._hidden[s.slot : s.slot + 1].assign(last)
                          for s, last in zip(spans, lasts, strict=True)))  # fmt: skip
         return hidden

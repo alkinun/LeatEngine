@@ -509,7 +509,7 @@ class Oracle:
         rows = zip(slots, positions, strict=True)
         return Tensor.cat(*(self.tokens[s : s + 1, p + 1 : p + 1 + count] for s, p in rows))
 
-    def follow(self, tokens: Tensor, hidden: Tensor, spans: list) -> None:
+    def follow(self, tokens: Tensor, hidden: Tensor, spans: list, positions=None) -> None:
         pass
 
     def copy(self, source: UOp, slot: UOp) -> None:

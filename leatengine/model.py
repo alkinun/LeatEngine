@@ -476,9 +476,10 @@ class Transformer:
                        for b, o in zip(base, own, strict=True)]  # fmt: skip
         Tensor.realize(*writes)
 
-    def store(self, i: int, x: Tensor, spans: list[Span]) -> None:
-        """Stores layer i's keys and values of x, its inputs, in its cache, as running it would."""
-        Tensor.realize(self._rotated(i, x, spans)[1])
+    def store(self, i: int, x: Tensor, spans: list[Span], positions: Tensor | None = None) -> None:
+        """Stores layer i's keys and values of x, its inputs, in its cache, as running it would:
+        of M-RoPE, at `positions` (T, 3) if given."""
+        Tensor.realize(self._rotated(i, x, spans, positions)[1])
 
     def _attention(
         self, i: int, x: Tensor, spans: list[Span], positions: Tensor | None = None
