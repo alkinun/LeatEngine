@@ -484,7 +484,8 @@ def _delta_net(
 
 
 def _l2_norm(x: Tensor, eps: float) -> Tensor:
-    # x / sqrt(|x|^2 + eps), as llama.cpp's Gated DeltaNet and transformers' have it
+    # x / sqrt(|x|^2 + eps), as transformers' Gated DeltaNet has it; llama.cpp's x / max(|x|, eps)
+    # differs only for vectors near 0
     return x * (x.square().sum(-1, keepdim=True) + eps).rsqrt()
 
 

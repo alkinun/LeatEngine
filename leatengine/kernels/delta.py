@@ -103,7 +103,8 @@ def _recurrence_kernel(
     ats = [lane + j * WARP for j in range(dims // WARP)]  # the lane's dimensions of q and k
     q = [conved[at, k_head * dims + i].load() for i in ats]
     k = [conved[at, (k_heads + k_head) * dims + i].load() for i in ats]
-    # 1 / sqrt(|x|^2 + eps), as llama.cpp's, and the normed query's product with the normed key
+    # 1 / sqrt(|x|^2 + eps), as transformers' (llama.cpp's 1 / max(|x|, eps) differs only for
+    # vectors near 0), and the normed query's product with the normed key
     q_inv = fast_rsqrt(warp_sum(_sum([x * x for x in q])) + eps) / math.sqrt(dims)
     k_inv = fast_rsqrt(warp_sum(_sum([x * x for x in k])) + eps)
     overlap = warp_sum(_sum([a * b for a, b in zip(q, k, strict=True)])) * q_inv * k_inv

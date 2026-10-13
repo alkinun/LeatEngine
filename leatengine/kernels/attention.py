@@ -713,8 +713,10 @@ def _rotate_kernel(
     place = pos % cache_positions if ring else pos  # the token's row of the cache
 
     def stored(kind: int, d: UOp) -> UOp:  # where dimension d of the warp's key or value goes
-        at = (((kind * cache_slots + slot) * kv_heads + kv) * cache_positions + place) * dim + d
-        return cache.flatten()[at.valid(is_kv)]
+        # of the warp, not of its opaque copy, an int32: tinygrad widens an index by its bounds,
+        # and a cache of 2^31 values or more needs 64 bits
+        at = ((kind * cache_slots + slot) * kv_heads + warp - heads) * cache_positions + place
+        return cache.flatten()[(at * dim + d).valid(is_kv)]
 
     x = [of_q_or_k(q, k, d) for d in flat]
     if biases:
