@@ -1380,11 +1380,68 @@ def _mask(T: int, window: int, image: np.ndarray | None = None) -> np.ndarray:
     return np.where(later | (window > 0) & (back >= window), -np.inf, 0)
 
 
+# Mellum: Qwen3 MoE's layers, but for a sliding window over each layer of the pattern's but the
+# full-attention ones, whose RoPE alone YaRN scales
+M_WINDOW, M_PATTERN, M_YARN = 4, (True, False), (4.0, 16)  # YaRN's factor, original context
+
+
+def _write_mellum(path: Path) -> dict[str, np.ndarray]:
+    w, weights, add = _writer(path, "mellum")
+    a = "mellum."
+    for key, value in [("block_count", LAYERS), ("embedding_length", D),
+                       ("feed_forward_length", HIDDEN), ("attention.head_count", HEADS),
+                       ("attention.head_count_kv", KV_HEADS), ("attention.key_length", HEAD_DIM),
+                       ("attention.value_length", HEAD_DIM), ("expert_count", EXPERTS),
+                       ("expert_used_count", USED), ("expert_feed_forward_length", EXPERT_HIDDEN),
+                       ("attention.sliding_window", M_WINDOW)]:  # fmt: skip
+        w.add_uint32(a + key, value)
+    w.add_array(a + "attention.sliding_window_pattern", list(M_PATTERN))
+    w.add_float32(a + "rope.freq_base", 10000.0)
+    w.add_string(a + "rope.scaling.type", "yarn")
+    w.add_float32(a + "rope.scaling.factor", M_YARN[0])
+    w.add_uint32(a + "rope.scaling.original_context_length", M_YARN[1])
+    # which llama.cpp's Mellum reads not: YaRN's own 1 + 0.1 ln(factor) scales cos and sin
+    w.add_float32(a + "rope.scaling.yarn_attn_factor", 1 + 0.1 * np.log(M_YARN[0]))
+    add("token_embd.weight", *TENSORS["token_embd.weight"])
+    add("output.weight", *TENSORS["output.weight"])
+    add("output_norm.weight", (D,))
+    for i in range(LAYERS):
+        for name in ("attn_norm", "ffn_norm", "attn_q_norm", "attn_k_norm"):
+            add(f"blk.{i}.{name}.weight", (HEAD_DIM if "_q_" in name or "_k_" in name else D,))
+        for name in ATTENTION + MOE:
+            add(f"blk.{i}.{name}.weight", *TENSORS[name])
+    _finish(w)
+    return weights
+
+
+def _reference_mellum(w: dict[str, np.ndarray], tokens: list[int]) -> np.ndarray:
+    T, positions = len(tokens), np.arange(len(tokens))
+    freqs = 10000.0 ** (-np.arange(0, HEAD_DIM, 2) / HEAD_DIM)
+    plain = np.cos(positions[:, None, None] * freqs), np.sin(positions[:, None, None] * freqs)
+    yarn = _yarn(positions, HEAD_DIM, 10000.0, *M_YARN)
+    x = w["token_embd.weight"][tokens].astype(np.float64)
+    for i, sliding in enumerate(M_PATTERN):
+        lw = _layer(w, i)
+        h = norm(x, lw["attn_norm"])
+        q, k, v = (h @ lw[n].T for n in ("attn_q", "attn_k", "attn_v"))
+        cos, sin = plain if sliding else yarn
+        q = rotate_halves(norm(q.reshape(T, HEADS, HEAD_DIM), lw["attn_q_norm"]), cos, sin)
+        k = rotate_halves(norm(k.reshape(T, KV_HEADS, HEAD_DIM), lw["attn_k_norm"]), cos, sin)
+        mask = _mask(T, M_WINDOW if sliding else 0)
+        out = attention(q, k, v.reshape(T, KV_HEADS, HEAD_DIM), mask, 1 / np.sqrt(HEAD_DIM))
+        x = x + out @ lw["attn_output"].T
+        h = norm(x, lw["ffn_norm"])
+        x = x + experts(h, h @ lw["ffn_gate_inp"].T, lambda e, row, lw=lw: mlp(
+            row, lw["ffn_gate_exps"][e], lw["ffn_up_exps"][e], lw["ffn_down_exps"][e]))  # fmt: skip
+    return norm(x, w["output_norm.weight"]) @ w["output.weight"].T
+
+
 _WRITERS = {
     "gemma3": _write_gemma3, "gpt-oss": _write_gpt_oss, "phi3": _write_phi3,
+    "mellum": _write_mellum,
     "qwen35": lambda path: _write_qwen35(path, "qwen35"),
     "qwen35moe": lambda path: _write_qwen35(path, "qwen35moe"),
 }  # fmt: skip
 _REFERENCES = {
-    "gpt-oss": _reference_gpt_oss, "phi3": _reference_phi3,
+    "gpt-oss": _reference_gpt_oss, "phi3": _reference_phi3, "mellum": _reference_mellum,
 }  # fmt: skip

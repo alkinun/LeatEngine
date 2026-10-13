@@ -35,6 +35,7 @@ ARCHS = [
     "phi3",
     "qwen35",
     "qwen35moe",
+    "mellum",
 ]
 
 
@@ -180,6 +181,11 @@ def test_rope_metadata():
     assert [r.theta for r in config("gpt-oss", oss).ropes] == [1e5, 1e5]
     ropes = config("gpt-oss", oss | {"rope.freq_base_swa": 5e5}).ropes
     assert [r.theta for r in ropes] == [5e5, 1e5] and ropes[0].yarn == ropes[1].yarn
+    # Mellum's sliding layers, every 4th but one by default, take the others' base, unscaled
+    mellum = {"attention.sliding_window": 4, "rope.freq_base": 5e5, "block_count": 4} | YARN
+    ropes = config("mellum", mellum).ropes
+    assert [r.theta for r in ropes] == [5e5] * 4
+    assert [r.yarn is not None for r in ropes] == [False, False, False, True]
 
 
 def test_longrope(tiny):

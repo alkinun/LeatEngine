@@ -32,12 +32,15 @@ _PER_LAYER = ("inp_gate", "proj", "post_norm")
 _ROPE_HALVES = {
     "llama": False, "qwen2": True, "qwen3": True, "qwen3moe": True, "gemma3": True,
     "gemma4": True, "gemma-embedding2": True, "gpt-oss": True, "phi3": True, "qwen35": True,
-    "qwen35moe": True,
+    "qwen35moe": True, "mellum": True,
 }  # fmt: skip
 QWEN35 = ("qwen35", "qwen35moe")  # Qwen3.5's and Qwen3.6's architectures: dense, and of experts
 GEMMA4 = ("gemma4", "gemma-embedding2")  # Gemma 4's, and EmbeddingGemma 2's of its layers
 # the period of attention.sliding_window_pattern where a GGUF has none, as llama.cpp's
-_SLIDING_EVERY = {"gemma3": 6, "gpt-oss": 2}
+_SLIDING_EVERY = {"gemma3": 6, "gpt-oss": 2, "mellum": 4}
+# the architectures whose sliding-window layers turn by the RoPE base of the others where the GGUF
+# gives none of their own, rather than Gemma's 10000
+_SWA_BASE_SHARED = ("gpt-oss", "mellum")
 # how an architecture's MLPs combine their gate and up, as ops.glu has it, where not by SiLU
 _GLU = {"gemma3": "gelu", "gemma4": "gelu", "gemma-embedding2": "gelu", "gpt-oss": "oai"}
 
@@ -219,7 +222,7 @@ def _rope(m: dict[str, Any], arch: str, sliding: bool, dims: int) -> Rope:
     # a layer's RoPE, of a sliding-window layer or else one that sees all positions, its cos and
     # sin times rope.scaling.attn_factor, as llama.cpp's every layer
     attn_factor, base = m.get("rope.scaling.attn_factor", 1.0), m.get("rope.freq_base", 10000.0)
-    swa_base = m.get("rope.freq_base_swa", base if arch == "gpt-oss" else 10000.0)
+    swa_base = m.get("rope.freq_base_swa", base if arch in _SWA_BASE_SHARED else 10000.0)
     if sliding and arch != "gpt-oss":  # their own base, unscaled; gpt-oss's scaled as the others
         return Rope(swa_base, dims, mscale=attn_factor)
     # rope_freqs divides the frequencies of the layers that see all positions: all of Llama

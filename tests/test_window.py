@@ -19,7 +19,7 @@ from tests.test_model import prefill_starts
 LONG = 512  # the context of the tiny models here, past their rings of 64
 CHUNK = 16  # a chunk of prompt: rings of 64 for windows of 4
 SAMPLING = Sampling(temperature=0.9, top_k=50)
-ARCHS = ["gemma4", "gemma3", "gpt-oss"]  # each of a sliding window
+ARCHS = ["gemma4", "gemma3", "gpt-oss", "mellum"]  # each of a sliding window
 PROMPT = np.random.default_rng(0).integers(0, 256, 150).tolist()
 
 
