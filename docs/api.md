@@ -15,9 +15,9 @@ and metrics extensions. It serves no HTML, frontend, or browser application.
 | `GET /metrics` | Prometheus metrics with the `leatengine_` prefix |
 
 All routes use the same authentication when keys are enabled. Request bodies are limited to
-64 MiB. Errors use an `error` object
-with `message`, `type`, `param`, and `code`. A generation error after streaming starts arrives
-as an SSE error event; clients must handle that as well as HTTP errors.
+64 MiB. Errors use an `error` object with `message`, `type`, `param`, and `code`. A generation
+error after streaming starts arrives as an SSE error event; clients must handle that as well as
+HTTP errors.
 
 ## Models
 
@@ -56,29 +56,30 @@ message roles and tool formats a model understands.
   reads each model's own call format: Llama 3's JSON replies, Qwen's `<tool_call>` blocks of JSON
   or Qwen3.5's XML, GLM-4.7's argument tags, Gemma 4's calls, LFM2's Python-style call lists,
   gpt-oss's harmony messages, and Muse Glimmer's ATEM messages. Arguments written as text are
-  typed by the tool's JSON schema.
-  A reply cut off by `max_tokens` or the context keeps `finish_reason: "length"` even when it
-  holds complete calls, as a later call may be missing.
+  typed by the tool's JSON schema. A reply cut off by `max_tokens` or the context keeps
+  `finish_reason: "length"` even when it holds complete calls, as a later call may be missing.
 - Image content parts accept `image_url` with base64 `data:` URLs. Remote image URLs are not
   fetched. Supply `--mmproj` or a recognized projector beside the model.
 - `service_tier: "flex"` schedules a completion behind foreground requests.
 - `safety_identifier`, or `user` when absent, isolates cached prefixes within an API key.
-  Clients sharing a key must supply distinct identifiers when their prompt caches should be separate.
+  Clients sharing a key must supply distinct identifiers when their prompt caches should be
+  separate.
+- `stop` takes a string or up to 16 strings, each of 256 characters at most.
 - Replies include usage and a `timings` extension. Cached token counts appear in
   `usage.prompt_tokens_details.cached_tokens`; streamed usage requires `include_usage`.
 
 This is not a complete OpenAI implementation: multiple choices, log probabilities, constrained
-JSON output, and nonzero frequency penalties are unsupported. Responses, legacy text completions,
-audio, file-storage, and tool-execution endpoints are not implemented. A prompt must fit the
-configured context; clients manage conversation history.
+JSON output, logit biases, and frequency or repetition penalties are unsupported. Responses,
+legacy text completions, audio, file-storage, and tool-execution endpoints are not implemented.
+A prompt must fit the configured context; clients manage conversation history.
 
 ## Embeddings
 
 Start with `--embed /path/to/embedding-model.gguf`. The endpoint accepts `input` as a string
-or a nonempty list of strings and returns float vectors, indexes, model ID, and token usage.
-It uses the configured embedding model, independently of the chat model. Without a configured
-embedding model, the endpoint returns 404. Inputs are truncated to the embedding context;
-model-specific query/document instructions remain the client's responsibility.
+or a nonempty list of up to 256 strings and returns float vectors, indexes, model ID, and token
+usage. It uses the configured embedding model, independently of the chat model. Without a
+configured embedding model, the endpoint returns 404. Inputs are truncated to the embedding
+context; model-specific query/document instructions remain the client's responsibility.
 
 ## Keys, state, and metrics
 
@@ -101,7 +102,8 @@ state is not discovered or migrated automatically. Explicit files retain their e
 
 Metrics describe request counts, completion outcomes, tokens, timing, queue/slot occupancy,
 and loaded models. They use `leatengine_` names and include API-key names as labels, not secrets.
-Browser-origin requests are rejected; a web app should call through its own backend.
+POST requests from web pages, which carry an `Origin` header, are refused, so that another site
+cannot make the server generate or load models; a web app should call through its own backend.
 
 ## Sampling overrides
 
