@@ -43,8 +43,7 @@ def on_nvidia(t: Tensor) -> bool:
 
 
 def on_gpu(t: Tensor) -> bool:
-    # an NVIDIA GPU, or an AMD one of waves of 32 that tinygrad renders C for: RDNA 3 and 4, as
-    # Strix Halo's
+    # an NVIDIA GPU, or an AMD one of waves of 32: RDNA 3 and 4, as Strix Halo's
     return isinstance(t.device, str) and (on_nvidia(t) or _rdna(t.device.split(":")[0]) > 0)
 
 

@@ -24,7 +24,8 @@ _LAYER = ("attn_norm", "attn_q", "attn_k", "attn_output", "ffn_norm")
 _DELTA_NET = ("attn_norm", "attn_qkv", "attn_gate", "ssm_alpha", "ssm_beta", "ssm_a", "ssm_dt.bias",
               "ssm_conv1d", "ssm_norm", "ssm_out", "ffn_norm")  # fmt: skip
 # the tensors of an LFM2 short convolution layer in place of attention: its input norm, the
-# projections of the gates b and c and the input x together, the convolution, and the output's
+# projection of the gates b and c and the input x together, the convolution, and the output's
+# projection
 _SHORT_CONV = ("attn_norm", "shortconv.in_proj", "shortconv.conv", "shortconv.out_proj", "ffn_norm")
 _MLP = ("ffn_gate", "ffn_up", "ffn_down")
 _EXPERTS = ("ffn_gate_inp", "ffn_down_exps")  # the router, and the experts' down projections
@@ -350,7 +351,8 @@ def _yarn_mscale(scale: float, multiplier: float) -> float:
 
 class Transformer:
     """Weights, RoPE tables and a KV cache of `slots` sequences of up to `max_context` tokens, and
-    for Gated DeltaNet's layers in place of attention, the recurrent state of each sequence.
+    for layers of recurrent state in place of attention, Gated DeltaNet's or LFM2's short
+    convolutions, each sequence's state.
 
     Given the most tokens a run stores at once, `run`, a sliding-window layer's cache is a ring
     of its window and that many more positions, where it is smaller than the context, as only

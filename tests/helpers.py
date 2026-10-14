@@ -1131,7 +1131,7 @@ def _reference_phi3(w: dict[str, np.ndarray], tokens: list[int]) -> np.ndarray:
 # Qwen3.5's mixture of experts: two Gated DeltaNet layers, then an attention layer whose q also
 # gives each head's output a gate, with q and k norms and RoPE over 16 of 64 dimensions; experts
 # beside a shared one with a gate of its own; and a layer past the others, for predicting
-# further tokens, which leatengine leaves unread
+# further tokens, which drafts for the model: see draft.Qwen35Mtp
 Q35_EVERY, Q35_ROTATED, Q35_HEAD = 3, 16, 64  # every 3rd layer attention; heads of 64
 Q35_SECTIONS = (3, 3, 2)  # of M-RoPE's 8 frequencies: of time, height and width
 Q_IMAGE = ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>")

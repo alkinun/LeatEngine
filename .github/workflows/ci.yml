@@ -125,7 +125,7 @@ jobs:
 
   coverage:
     # of the CPU's and the emulated GPU's runs together: what neither reaches is either untested
-    # or NVIDIA's alone, the tensor cores' kernels
+    # or NVIDIA's alone, as the tensor-core kernels' mma.sync paths
     needs: [test, kernels]
     runs-on: ubuntu-latest
     timeout-minutes: 10

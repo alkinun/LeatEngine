@@ -709,7 +709,7 @@ def test_start_needs_a_free_slot(tiny_model):
 # 0.00126 and its agreement from 98.2 to 97.9%. Qwen3.6 35B A3B, of 256 experts and recurrent
 # state, scores 0.0082 and 97.4% on both paths. Mistral Small 3.2 24B, of the llama
 # architecture, scores 0.0021 and 98.1% on the prompt's path, and 0.0025 and 98.4% on the decode
-# path, its depth adding to the noise, as the 0.0017 of 20 chunks of the README's table.
+# path, its depth adding to the noise, as its 0.0017 over 20 chunks did in the original Leat.
 # Qwen3.8 27B, dense, of recurrent state, scores 0.0014 and 98.1% on 20 chunks of the prompt's
 # path; its decode path's scoring takes more than the 3090's 24 GB. The newer architectures'
 # measurements, over 8 chunks against llama.cpp 1b70350, are in docs/benchmarks.md: Mellum's

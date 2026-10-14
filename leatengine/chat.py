@@ -178,9 +178,10 @@ def _reasoning(source: str) -> tuple[tuple[str, ...], str | None, str | None]:
 
 @dataclass
 class Reply:
-    """A reply split: its reasoning, its text, and the tool calls it makes in the harmony format,
-    gpt-oss's, each {"name": ..., "arguments": JSON text}. Other formats' calls are in the text,
-    for parse_tool_calls."""
+    """A reply split: its reasoning, its text, and the tool calls it makes in a format of
+    messages: harmony's, gpt-oss's, each {"name": ..., "arguments": JSON text}, and ATEM's, Muse
+    Glimmer's, each with its arguments as written, text to type by the tool's schema. Other
+    formats' calls are in the text, for parse_tool_calls."""
 
     reasoning: str = ""
     content: str = ""
@@ -447,7 +448,9 @@ def _dotted(node: ast.expr) -> str | None:
     return None
 
 
-_NAMED = {"true": True, "false": False, "null": None, "True": True, "False": False, "None": None}
+# JSON's literals, as a model may write them in a call of Python's syntax, whose own True, False
+# and None parse as constants
+_NAMED = {"true": True, "false": False, "null": None}
 
 
 _SCALARS = (

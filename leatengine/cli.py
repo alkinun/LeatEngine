@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        prog="leatengine", description="A minimal, fast LLM inference engine."
+        prog="leatengine", description="A minimal GGUF inference engine built on tinygrad."
     )
     commands = parser.add_subparsers(dest="command", required=True)
 

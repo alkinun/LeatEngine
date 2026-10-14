@@ -32,7 +32,7 @@ SHARED_CHUNK = 256
 # turn's opening anew, or an agent's next step. The rest takes the graph for few tokens.
 KEEP_BACK = FEW_TOKENS
 # sequences a decode step runs at most in one graph, more in turn: as many tokens as the
-# matrix-vector kernels take, which on AMD are the only kernels for several
+# matrix-vector kernels take, the only kernels for several sequences at once
 BATCH = MATVEC_TOKENS
 # tokens a drafter guesses ahead of a sequence, which the target checks at once
 DRAFT_TOKENS = 3
@@ -40,7 +40,7 @@ DRAFT_TOKENS = 3
 # the matrix-vector kernels take, as the kernels for more cost more than the guesses save, so that
 # several sequences draft fewer each. For Qwen3.6 35B A3B on the 3090, 3 sequences drafting 3
 # each decoded at 0.88 times the speed of plain steps, 4 at 0.77, and drafting 1 each, 1.11 and
-# 1.01 times.
+# 1.01 times; faster experts' kernels since took 3 to the 1.16 Qwen35Mtp records.
 SPECULATIVE_TOKENS = MATVEC_TOKENS
 
 
