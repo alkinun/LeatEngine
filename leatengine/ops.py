@@ -95,13 +95,12 @@ def mixture(
 ) -> Tensor:  # fmt: skip
     # x + a mixture of experts for n = rms_norm(x, *norm), as feed_forward, given the router's
     # scores (B, T, experts): each token takes the MLPs of the `used` experts it scores highest,
-    # weighted as `routing` has it and by each expert's scale if given. Experts are
-    # stacked matrices (experts, rows, cols), with biases (experts, rows) of gate, up and down if
-    # given; where up is None, gate stacks both, the gate's rows first in each. Only the chosen
-    # experts are read, but by the reference ops for more pairs of tokens and experts than
-    # experts, which read every one. Tokens past the first `live`, if given, pad a batch: the
-    # kernels give
-    # them no experts, rather than reading experts of their own, and the reference ops theirs.
+    # weighted as `routing` has it and by each expert's scale if given. Experts are stacked matrices
+    # (experts, rows, cols), with biases (experts, rows) of gate, up and down if given; where up is
+    # None, gate stacks both, the gate's rows first in each. Only the chosen experts are read, but
+    # by the reference ops for more pairs of tokens and experts than experts, which read every one.
+    # Tokens past the first `live`, if given, pad a batch: the kernels give them no experts, rather
+    # than reading experts of their own, and the reference ops theirs.
     if _fast() and kernels.supports_mixture(x, gate, up, down):
         args = (used, norm, kind, scales, residual, biases, live, routing)
         return kernels.mixture(x, scores, gate, up, down, *args)
