@@ -763,6 +763,7 @@ def test_matches_llama_cpp(model_path, llama_cpp, wikitext, tmp_path, decode):
     subprocess.run([llama_cpp / "llama-perplexity", *args], check=True, capture_output=True)
     engine = Engine(model_path, max_context=512)
     quality = bench.kl_divergence(engine, base, decode=decode)
+    del engine  # a failure's traceback would hold the model on the GPU through the next tests
     kl, top1 = limits
     assert quality.kl_mean is not None and quality.kl_mean < kl
     assert quality.top1 is not None and quality.top1 > top1
