@@ -15,6 +15,7 @@ from tinygrad import Device, Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import AxisType, Ops
 
+from leatengine import grids
 from leatengine.quant import FP4_VALUES, IQ4_VALUES, GGMLType, QTensor
 
 WARP = 32
@@ -30,6 +31,8 @@ WORD_TYPE = {
     GGMLType.Q5_0: dtypes.uint16, GGMLType.Q8_0: dtypes.uint16, GGMLType.MXFP4: dtypes.uint32,
     GGMLType.Q4_0: dtypes.uint16, GGMLType.Q4_1: dtypes.uint16, GGMLType.Q5_1: dtypes.uint16,
     GGMLType.IQ4_NL: dtypes.uint16, GGMLType.IQ4_XS: dtypes.uint32,
+    GGMLType.IQ2_XXS: dtypes.uint16, GGMLType.IQ2_XS: dtypes.uint16, GGMLType.IQ2_S: dtypes.uint16,
+    GGMLType.IQ3_XXS: dtypes.uint16, GGMLType.IQ3_S: dtypes.uint16,
 }  # fmt: skip
 
 
@@ -366,6 +369,40 @@ def carry_all(t: Tensor, values: list[int | UOp]) -> tuple[Tensor, tuple[int | U
         t, value = carry(t, value)
         unbound.append(value)
     return t, tuple(unbound)
+
+
+def _grid_words() -> tuple[dict[GGMLType, int], list[int]]:
+    # every IQ format's grid as words of 4 values, an IQ2 entry's 8 in 2 words, one after
+    # another, and where each format's starts
+    at: dict[GGMLType, int] = {}
+    words: list[int] = []
+    for name in ("IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S"):
+        at[GGMLType[name]], values = len(words), grids.grid(name)
+        words += [int.from_bytes(values[i : i + 4], "little") for i in range(0, len(values), 4)]
+    return at, words
+
+
+GRID_AT, _GRID_WORDS = _grid_words()
+
+
+@functools.cache
+def iq_grids(device: str) -> Tensor:
+    # the IQ formats' grids on the device: every weight kernel takes them, which those formats'
+    # read from GRID_AT on
+    return Tensor(_GRID_WORDS, dtype=dtypes.uint32, device=device).realize()
+
+
+def byte_signs(value: UOp, bits: UOp) -> UOp:
+    # the 4 bytes of a word, each under 128, negated where the low 4 bits of `bits` have its bit
+    # set, as signed bytes: the multiplication moves bit i to bit 8i, 0xFF spreads it over its
+    # byte, and flipping a byte and adding 1 negates it
+    flips = (((bits & 15) * 0x00204081) & 0x01010101).cast(dtypes.uint32)
+    return ((value ^ (flips * 0xFF)) + flips).bitcast(dtypes.int32)
+
+
+def ksigns(bits: UOp) -> UOp:
+    # 7 sign bits and an eighth that makes their count even, as ggml's ksigns_iq2xs
+    return bits | ((popcount(bits).cast(dtypes.uint32) & 1) << 7)
 
 
 def storage_words(w: QTensor) -> Tensor:

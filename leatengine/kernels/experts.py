@@ -20,6 +20,7 @@ from leatengine.kernels.common import (
     ballot,
     carry,
     glu,
+    iq_grids,
     lane_range,
     load_vector,
     on_gpu,
@@ -234,7 +235,7 @@ def _bucket(ids: Tensor, experts: int, per: int, pairs: int | UOp) -> tuple[Tens
 
 @functools.cache
 def _experts_swiglu_kernel(
-    out: UOp, gate: UOp, up: UOp, xq: UOp, xd: UOp, xs: UOp, ids: UOp, *biases: UOp,
+    out: UOp, gate: UOp, up: UOp, grid: UOp, xq: UOp, xd: UOp, xs: UOp, ids: UOp, *biases: UOp,
     pairs: int | UOp, meta: tuple[GGMLType, int, int, int, str, bool],
 ) -> UOp:  # fmt: skip
     # out[p * rows + r] = glu(kind)(gate . x, up . x) for row r of expert ids[p], where pair p is
@@ -243,7 +244,7 @@ def _experts_swiglu_kernel(
     ggml_type, cols, rows, used, kind, fused = meta
 
     def expert(w: UOp, first: int) -> Callable[[UOp, UOp], UOp]:
-        dot, stride = DOTS[ggml_type](w, xq, xd, xs, cols), 2 * rows if fused else rows
+        dot, stride = DOTS[ggml_type](w, grid, xq, xd, xs, cols), 2 * rows if fused else rows
 
         def chosen(row: UOp, unit: UOp) -> UOp:
             pair = row // rows
@@ -266,7 +267,7 @@ def _experts_swiglu_kernel(
 
 @functools.cache
 def _experts_down_kernel(
-    out: UOp, w: UOp, hq: UOp, hd: UOp, hs: UOp, ids: UOp, weights: UOp, *extra: UOp,
+    out: UOp, w: UOp, grid: UOp, hq: UOp, hd: UOp, hs: UOp, ids: UOp, weights: UOp, *extra: UOp,
     tokens: int | UOp, meta: tuple[GGMLType, int, int, int, bool, bool, bool],
 ) -> UOp:  # fmt: skip
     # out[t * rows + r] = the sum over token t's pairs p of weights[p] times row r of expert ids[p]
@@ -275,7 +276,7 @@ def _experts_down_kernel(
     # take (slot, unit) items in turn, so experts with narrow rows still keep them busy; a pair's
     # first unit takes its bias.
     ggml_type, cols, rows, used, scaled, biased, residual = meta
-    dot, units = DOTS[ggml_type](w, hq, hd, hs, cols), cols // 64
+    dot, units = DOTS[ggml_type](w, grid, hq, hd, hs, cols), cols // 64
 
     def mixed(row: UOp, item: UOp) -> UOp:
         pair = row // rows * used + item // units
@@ -333,8 +334,8 @@ def per_head(x: Tensor, w: QTensor) -> Tensor:
     xq, bound = carry(xq, tokens * heads)
     meta = (w.type, cols, rows, 1, False, False, False)
     fxn = functools.partial(_experts_down_kernel, tokens=bound, meta=meta)
-    out = Tensor.custom_kernel(out, storage_words(w), xq, xd, xs, ids.contiguous(), weights,
-                               fxn=fxn)[0]  # fmt: skip
+    srcs = storage_words(w), iq_grids(x.device), xq, xd, xs, ids.contiguous(), weights
+    out = Tensor.custom_kernel(out, *srcs, fxn=fxn)[0]
     return out.reshape(count // heads, heads, rows)[:tokens].reshape(1, tokens, heads, rows)
 
 
@@ -422,7 +423,7 @@ def _matvecs(
     xq, pairs = carry(xq, real * used)
     meta = (gate.type, cols, rows, used, kind, up is None)
     fxn = functools.partial(_experts_swiglu_kernel, pairs=pairs, meta=meta)
-    words = storage_words(gate), storage_words(gate if up is None else up)
+    words = storage_words(gate), storage_words(gate if up is None else up), iq_grids(x.device)
     gate_up = biases[:2] if biases else ()
     hidden = Tensor.custom_kernel(hidden, *words, xq, xd, xs, ids, *gate_up, fxn=fxn)[0]
     hq, hd, hs = quantize_q8(hidden.reshape(count * used, rows), rows=real * used)
@@ -435,7 +436,7 @@ def _matvecs(
     hq, bound = carry(hq, real)
     down_meta = (down.type, rows, cols, used, scales is not None, biases is not None, residual)
     fxn = functools.partial(_experts_down_kernel, tokens=bound, meta=down_meta)
-    srcs = storage_words(down), hq, hd, hs, ids, weights, *extra
+    srcs = storage_words(down), iq_grids(x.device), hq, hd, hs, ids, weights, *extra
     out = Tensor.custom_kernel(out, *srcs, fxn=fxn)[0]
     out = out.reshape(count, dim)[:tokens].reshape(x.shape)
     if live is None:

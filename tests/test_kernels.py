@@ -21,7 +21,8 @@ Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q5_0, Q8_0, MXFP4 = (
     GGMLType[t] for t in ("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q5_0", "Q8_0", "MXFP4")
 )
 # the matrix-vector kernels' other types
-OTHER = [GGMLType[t] for t in ("Q4_0", "Q4_1", "Q5_1", "IQ4_NL", "IQ4_XS", "Q2_K", "Q3_K")]
+IQ = [GGMLType[t] for t in ("IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S")]
+OTHER = [GGMLType[t] for t in ("Q4_0", "Q4_1", "Q5_1", "IQ4_NL", "IQ4_XS", "Q2_K", "Q3_K")] + IQ
 # of those, the tensor cores' too
 TILED = [GGMLType[t] for t in ("Q4_0", "IQ4_NL", "IQ4_XS", "Q2_K", "Q3_K")]
 

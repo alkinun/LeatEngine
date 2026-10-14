@@ -19,6 +19,7 @@ from leatengine.kernels.common import (
     fifth_bits,
     funnel,
     glu,
+    iq_grids,
     lane_range,
     load_words,
     minus,
@@ -29,6 +30,7 @@ from leatengine.kernels.common import (
     warp_sum,
     word16,
 )
+from leatengine.kernels.iq import IQ_FORMATS
 from leatengine.kernels.quantize import quantize_q8
 from leatengine.quant import GGMLType, QTensor
 
@@ -104,7 +106,7 @@ def _k_scale_min(w: UOp, base: UOp, sub: UOp) -> tuple[UOp, UOp]:
     return sc.float(), mn.float()
 
 
-def _k_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int, high: bool) -> Dot:
+def _k_dot(w: UOp, grid: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int, high: bool) -> Dot:
     # Q4_K block, 36 words: d and dmin as f16, 12 bytes of 6-bit scales and mins, then 32 words of
     # nibbles. Sub-blocks 2j and 2j+1 are the low and high nibbles of words 4+8j .. 11+8j, so a
     # unit is such a pair: 64 weights against 16 words of activations. Q5_K, 44 words, has 8
@@ -134,7 +136,7 @@ def _k_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int, high: bool) -> Dot:
     return dot
 
 
-def _q6_k_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
+def _q6_k_dot(w: UOp, grid: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
     # Q6_K block, 105 halfwords: ql[128] low nibbles, qh[64] high 2-bit pairs, 16 int8 scales and d
     # as f16. Each half n of 128 weights is 4 rows of 32: row k takes nibble k // 2 of
     # ql[64n + 32(k % 2):][:32] and bits 2k of qh[32n:][:32], minus 32, with a scale per 16. A unit
@@ -163,7 +165,7 @@ def _q6_k_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
     return dot
 
 
-def _low_k_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int, kind: GGMLType) -> Dot:
+def _low_k_dot(w: UOp, grid: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int, kind: GGMLType) -> Dot:
     # Q2_K and Q3_K blocks of 256 weights: each half n of 128 is 4 rows of 32, value l of row k
     # bits 2k of byte l of the half's 32 bytes, with a scale per 16 values. Q2_K, 21 words: 16
     # bytes of 4-bit scales and mins, the 64 bytes of values, then d and dmin as f16; a weight is
@@ -217,7 +219,7 @@ def _low_k_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int, kind: GGMLType) -> 
     return dot
 
 
-def _q8_0_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
+def _q8_0_dot(w: UOp, grid: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
     # Q8_0 block, 17 halfwords: d as f16, then 32 int8 weights, the activation groups' size; a
     # unit is two blocks
     def dot(row: UOp, unit: UOp, x: UOp | int) -> UOp:
@@ -235,7 +237,7 @@ def _q8_0_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
     return dot
 
 
-def _q5_0_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
+def _q5_0_dot(w: UOp, grid: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
     # Q5_0 block, 11 halfwords: d as f16, 32 high bits, then 16 bytes whose low nibbles are values
     # 0..15 and high ones 16..31; a weight is d * (q - 16). A unit is two blocks.
     def dot(row: UOp, unit: UOp, x: UOp | int) -> UOp:
@@ -258,7 +260,7 @@ def _q5_0_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
     return dot
 
 
-def _q4_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int, kind: GGMLType) -> Dot:
+def _q4_dot(w: UOp, grid: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int, kind: GGMLType) -> Dot:
     # Blocks of 32 of 16 bytes of nibbles, the low ones values 0..15 and the high ones 16..31,
     # after f16 fields, read as halfwords: Q4_0's d, a weight d * (q - 8), 9 halfwords; Q4_1's d
     # and m, d * q + m, 10; IQ4_NL's d, d * IQ4_VALUES[q], 9; Q5_1's d, m and 32 high bits, a fifth
@@ -296,7 +298,7 @@ def _q4_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int, kind: GGMLType) -> Dot
     return dot
 
 
-def _iq4_xs_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
+def _iq4_xs_dot(w: UOp, grid: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
     # IQ4_XS block, 34 words: d as f16 and 16 high bits of scales, 4 bytes of low ones, then
     # 128 bytes of nibbles, IQ4_NL's of 8 sub-blocks of 32; sub-block j's scale is d * (s - 32)
     # for s nibble j of the low bytes and bits 2j of the high ones. A unit is two sub-blocks.
@@ -321,7 +323,7 @@ def _iq4_xs_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
     return dot
 
 
-def _mxfp4_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
+def _mxfp4_dot(w: UOp, grid: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
     # MXFP4 block, 17 bytes: an exponent byte e, then 16 bytes whose low nibbles index values
     # 0..15 and high ones 16..31 into FP4_VALUES, doubled E2M1 as int8; a weight is the value times
     # 2^(e - 128). Blocks are only byte aligned: a block's 5 aligned words hold it, from byte
@@ -347,7 +349,37 @@ def _mxfp4_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
     return dot
 
 
-DOTS: dict[GGMLType, Callable[[UOp, UOp, UOp, UOp, int], Dot]] = {
+def _iq_dot(
+    w: UOp, grid: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int, kind: GGMLType
+) -> Dot:  # fmt: skip
+    # IQ formats' blocks of 256 weights, of 8 sub-blocks of 32, as iq.IQ_FORMATS has them; a
+    # unit is two sub-blocks
+    fmt = IQ_FORMATS[kind]
+
+    def half(i: UOp) -> UOp:
+        return w[i].load().cast(dtypes.uint32)
+
+    def dot(row: UOp, unit: UOp, x: UOp | int) -> UOp:
+        block, pair = unit // 4, unit % 4
+        base = (row * (cols // 256) + block) * fmt.halfwords
+        total = UOp.const(0.0, dtypes.float32)
+        for b in range(2):
+            sub = pair * 2 + b
+            g = x * (cols // 32) + block * 8 + sub
+            values, scales = fmt.decode(grid, fmt.raw(half, base, sub), sub)
+            group, acc, per = _group(xq, g), UOp.const(0, dtypes.int32), 8 // len(scales)
+            for i, s in enumerate(scales):  # each 16 or 32 values' products, by 2s + 1
+                part = UOp.const(0, dtypes.int32)
+                for m in range(i * per, (i + 1) * per):
+                    part = dp4a(values[m], group[m], part)
+                acc = acc + part * (2 * s + 1).cast(dtypes.int32)
+            total = total + xd[g].load() * acc.float()
+        return f16(half(base)) * fmt.factor * total
+
+    return dot
+
+
+DOTS: dict[GGMLType, Callable[[UOp, UOp, UOp, UOp, UOp, int], Dot]] = {
     GGMLType.Q4_K: functools.partial(_k_dot, high=False),
     GGMLType.Q5_K: functools.partial(_k_dot, high=True),
     GGMLType.Q6_K: _q6_k_dot, GGMLType.Q5_0: _q5_0_dot, GGMLType.Q8_0: _q8_0_dot,
@@ -356,13 +388,15 @@ DOTS: dict[GGMLType, Callable[[UOp, UOp, UOp, UOp, int], Dot]] = {
     GGMLType.MXFP4: _mxfp4_dot, GGMLType.IQ4_XS: _iq4_xs_dot,
     **{t: functools.partial(_q4_dot, kind=t)
        for t in (GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_1, GGMLType.IQ4_NL)},
+    **{t: functools.partial(_iq_dot, kind=t) for t in IQ_FORMATS},
 }  # fmt: skip
 
 
 @functools.cache
 def _matvec_kernel(
-    out: UOp, w: UOp, xq: UOp, xd: UOp, xs: UOp, *residual: UOp, ggml_type: GGMLType, tokens: int
-) -> UOp:
+    out: UOp, w: UOp, grid: UOp, xq: UOp, xd: UOp, xs: UOp, *residual: UOp, ggml_type: GGMLType,
+    tokens: int,
+) -> UOp:  # fmt: skip
     # out[t * rows + row] = w[row] . x[t], plus residual[t * rows + row] if given
     rows = int(out.shape[0]) // tokens
 
@@ -371,7 +405,7 @@ def _matvec_kernel(
             totals = tuple(t + residual[0][i * rows + row].load() for i, t in enumerate(totals))
         return list(totals)
 
-    dot = DOTS[ggml_type](w, xq, xd, xs, cols := 4 * int(xq.shape[0]) // tokens)
+    dot = DOTS[ggml_type](w, grid, xq, xd, xs, cols := 4 * int(xq.shape[0]) // tokens)
     dots = [_token(dot, t) for t in range(tokens)]
     name = ggml_type.name.lower()
     return rows_kernel(out, cols // 64, name, dots, combine, rows, _per_warp(tokens))
@@ -379,15 +413,15 @@ def _matvec_kernel(
 
 @functools.cache
 def _swiglu_kernel(
-    out: UOp, gate: UOp, up: UOp, xq: UOp, xd: UOp, xs: UOp, ggml_type: GGMLType, kind: str,
-    tokens: int,
+    out: UOp, gate: UOp, up: UOp, grid: UOp, xq: UOp, xd: UOp, xs: UOp, ggml_type: GGMLType,
+    kind: str, tokens: int,
 ) -> UOp:  # fmt: skip
     # out[t * rows + row] = glu(kind)(gate[row] . x[t], up[row] . x[t])
     def combine(row: UOp, *totals: UOp) -> list[UOp]:
         return [glu(kind)(g, u) for g, u in zip(totals[::2], totals[1::2], strict=True)]
 
     cols = 4 * int(xq.shape[0]) // tokens
-    gate_dot, up_dot = (DOTS[ggml_type](w, xq, xd, xs, cols) for w in (gate, up))
+    gate_dot, up_dot = (DOTS[ggml_type](w, grid, xq, xd, xs, cols) for w in (gate, up))
     dots = [_token(dot, t) for t in range(tokens) for dot in (gate_dot, up_dot)]
     name, rows = f"glu_{kind}_{ggml_type.name.lower()}", int(out.shape[0]) // tokens
     return rows_kernel(out, cols // 64, name, dots, combine, rows, _per_warp(tokens, 2))
@@ -431,7 +465,8 @@ def matvecs(
     for w in ws:
         out = Tensor.empty(tokens * w.shape[0], dtype=dtypes.float32, device=x.device)
         fxn = functools.partial(_matvec_kernel, ggml_type=w.type, tokens=tokens)
-        out = Tensor.custom_kernel(out, storage_words(w), xq, xd, xs, *res, fxn=fxn)[0]
+        words = storage_words(w), iq_grids(x.device)
+        out = Tensor.custom_kernel(out, *words, xq, xd, xs, *res, fxn=fxn)[0]
         outs.append(out.reshape(*x.shape[:-1], w.shape[0]))
     return outs
 
@@ -446,6 +481,6 @@ def swiglu(
     xq, xd, xs = quantize_q8(x.reshape(tokens, x.shape[-1]), norm)
     out = Tensor.empty(tokens * gate.shape[0], dtype=dtypes.float32, device=x.device)
     fxn = functools.partial(_swiglu_kernel, ggml_type=gate.type, kind=kind, tokens=tokens)
-    words = storage_words(gate), storage_words(up)
+    words = storage_words(gate), storage_words(up), iq_grids(x.device)
     out = Tensor.custom_kernel(out, *words, xq, xd, xs, fxn=fxn)[0]
     return out.reshape(*x.shape[:-1], gate.shape[0])
