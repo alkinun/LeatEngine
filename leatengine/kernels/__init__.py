@@ -7,7 +7,7 @@ the op itself: leatengine.ops chooses between them and the reference ops. AMD's 
 with the system's clang, without ROCm: see leatengine.kernels.clang.
 """
 
-from leatengine.kernels import clang
+from leatengine.kernels import clang, lowering
 from leatengine.kernels.argmax import argmax, supports_argmax
 from leatengine.kernels.attention import (
     attention,
@@ -17,7 +17,7 @@ from leatengine.kernels.attention import (
     supports_flash_attention,
     supports_rotate,
 )
-from leatengine.kernels.common import GROUP, canonicalize_once, on_matrix_cores
+from leatengine.kernels.common import GROUP, on_matrix_cores
 from leatengine.kernels.cutoff import cutoff, supports_cutoff
 from leatengine.kernels.delta import delta_net, supports_delta_net
 from leatengine.kernels.experts import (
@@ -41,10 +41,10 @@ from leatengine.kernels.matvec import MATVEC_TOKENS, matvecs, supports_matvec, s
 from leatengine.kernels.norms import add_normed, supports_add_normed
 from leatengine.kernels.quantize import quantize_q8
 
-# AMD devices made from here on compile with clang, and tinygrad canonicalizes each kernel's
-# body once
+# AMD devices made from here on compile with clang, and tinygrad schedules and lowers kernels as
+# leatengine.kernels.lowering has it
 clang.install()
-canonicalize_once()
+lowering.install()
 
 # the bound variables kernels bind inside a graph, by name: TinyJit replays a graph with the
 # values its arguments carry, and these ride along there

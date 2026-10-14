@@ -516,7 +516,7 @@ def test_kernel_bodies_canonicalized_once():
     # calls of one body share the form tinygrad's own function gives, worked out once
     import tinygrad.schedule as schedule
 
-    from leatengine.kernels.common import _CANONICAL
+    from leatengine.kernels.lowering import _CANONICAL
 
     local = UOp.alloc((4,), dtypes.float32, addrspace=AddrSpace.LOCAL)
     body = UOp.sink(local.index(UOp.const(0, dtypes.int32)).store(UOp.const(1.0, dtypes.float32)))
@@ -527,6 +527,23 @@ def test_kernel_bodies_canonicalized_once():
     assert canonical[0].body is canonical[1].body is not body
     plain = UOp.sink(UOp.const(1.0, dtypes.float32)).call(UOp.variable("a", 0, 9))
     assert schedule.canonicalize_call_body(plain) is plain and _CANONICAL[plain.body] is None
+
+
+def test_lowered_programs_kept(monkeypatch):
+    # a program tinygrad lowers goes to its disk cache, where a process that has not lowered it
+    # finds it; a change to the sources that lower it lowers it anew
+    import tinygrad.codegen as codegen
+
+    from leatengine.kernels import lowering
+
+    programs, before = codegen.to_program_cache, set(dict.keys(codegen.to_program_cache))
+    (Tensor.arange(13) * 17 + Tensor.ones(13)).realize()
+    key = next(iter(set(dict.keys(programs)) - before))
+    program = dict.pop(programs, key)
+    assert key in programs and programs[key].key == program.key
+    dict.pop(programs, key)
+    monkeypatch.setattr(lowering, "_sources", lambda: "another tinygrad")
+    assert key not in programs and programs.get(key) is None
 
 
 def test_one_generation_at_a_time(tiny_model):

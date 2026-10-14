@@ -54,6 +54,10 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Hello!"}],"max_tokens":128,"stream":true}'
 ```
 
+`run` and `serve` compile a model's graphs before its first reply. tinygrad keeps the compiled
+kernels in `~/.cache/tinygrad`, so a model starts faster after its first time: on an RTX 3090,
+Llama 3.1 8B's warm-up takes about 20 seconds the first time and 13 after.
+
 `DEV=AMD`, `DEV=NV`, or `DEV=CPU` explicitly selects a backend. Without `DEV`, the CLI checks
 for NVIDIA and then AMD devices before leaving selection to tinygrad. CPU execution is useful
 for reference tests and small models; optimized inference uses the GPU kernels.

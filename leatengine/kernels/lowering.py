@@ -1,0 +1,114 @@
+"""How tinygrad schedules and lowers kernels, made faster for a model's graphs.
+
+A graph calls the same few kernels layer after layer, and tinygrad canonicalizes each call's body
+anew: `canonicalize_once` does each body once. tinygrad also lowers every kernel at every start,
+keeping only the compiled binaries on disk: `keep_programs` keeps the lowered programs there too.
+On the 3090, Llama 3.1 8B's warm-up took 28 s, 21 with each body canonicalized once, and 13 at a
+later start with its programs kept.
+"""
+
+import functools
+import hashlib
+import pathlib
+import weakref
+from typing import Any
+
+import tinygrad
+from tinygrad import Device, UOp
+from tinygrad.helpers import diskcache_get, diskcache_put
+
+from leatengine.kernels import clang
+
+TABLE = "leatengine_programs"  # of tinygrad's disk cache
+
+# each kernel body tinygrad has canonicalized, and its canonical form: None where it is its own,
+# as a value that is its key would keep the key alive
+_CANONICAL: weakref.WeakKeyDictionary[UOp, UOp | None] = weakref.WeakKeyDictionary()
+
+
+def install() -> None:
+    canonicalize_once()
+    keep_programs()
+
+
+def canonicalize_once() -> None:
+    """Makes tinygrad canonicalize each kernel's body once rather than at each call of it: Llama
+    3.1 8B's warm-up canonicalized 89 bodies 3565 times, 7 of its 28 s. The canonical body, its
+    local buffers numbered for the schedule cache, is the body's alone."""
+    import tinygrad.schedule as schedule
+
+    canonicalize = schedule.canonicalize_call_body
+    if hasattr(canonicalize, "__wrapped__"):  # already
+        return
+
+    @functools.wraps(canonicalize)
+    def once(call: UOp) -> UOp:
+        if (body := call.body) not in _CANONICAL:
+            canonical = canonicalize(call).body
+            _CANONICAL[body] = None if canonical is body else canonical
+        canonical = _CANONICAL[body]
+        return call if canonical is None else call.replace(src=(canonical, *call.src[1:]))
+
+    schedule.canonicalize_call_body = once  # type: ignore[assignment]
+
+
+def keep_programs() -> None:
+    """Makes tinygrad keep the programs it lowers in its disk cache, as it keeps their binaries, and
+    read them there before it lowers one: Llama 3.1 8B's 161 take 5 MB, and loaded, a later start's
+    warm-up takes 13 s rather than 20. A program's row is by the key of tinygrad's own cache of
+    them, its device's compiler and the source of tinygrad and of the AMD renderer, so that a change
+    to either lowers anew; CACHELEVEL=0 or CCACHE=0 turn it off, as they do tinygrad's."""
+    import tinygrad.codegen as codegen
+    import tinygrad.engine.realize as realize
+
+    if not isinstance(codegen.to_program_cache, _Programs):
+        programs = _Programs(codegen.to_program_cache)
+        codegen.to_program_cache = realize.to_program_cache = programs
+
+
+class _Programs(dict[tuple, UOp]):
+    """tinygrad's lowered programs by its to_program_key, read from its disk cache where none is
+    in memory, and written there as tinygrad lowers them."""
+
+    def __contains__(self, key: object) -> bool:
+        return dict.__contains__(self, key) or self._load(key)
+
+    def get(self, key: tuple, default: Any = None) -> Any:
+        return dict.get(self, key, default) if key in self else default  # `in` reads the disk
+
+    def __setitem__(self, key: tuple, program: UOp) -> None:
+        if dict.get(self, key) is not program and (name := _name(key)) is not None:
+            diskcache_put(TABLE, name, program)
+        dict.__setitem__(self, key, program)
+
+    def _load(self, key: Any) -> bool:
+        if (name := _name(key)) is None:
+            return False
+        try:
+            program = diskcache_get(TABLE, name)
+        except Exception:  # a row that no longer unpickles: lowered anew, and written over
+            return False
+        if program is not None:
+            dict.__setitem__(self, key, program)
+        return program is not None
+
+
+def _name(key: tuple) -> str | None:
+    # a program's row: of to_program_key's AST key, renderer type, target and configuration, the
+    # device's compiler's key, or None where tinygrad caches no binaries, and the sources
+    ast, renderer, target, *config = key
+    if (compiler := Device[target.device].compiler.cachekey) is None:
+        return None
+    parts = (ast.hex(), f"{renderer.__module__}.{renderer.__qualname__}", repr(target),
+             repr(config), compiler, _sources())  # fmt: skip
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+@functools.cache
+def _sources() -> str:
+    # a digest of what lowers and compiles a kernel: tinygrad's source, and the AMD renderer's
+    digest, root = hashlib.sha256(), pathlib.Path(tinygrad.__file__).parent
+    for path in sorted(root.rglob("*.py")):
+        digest.update(str(path.relative_to(root)).encode() + path.read_bytes())
+    digest.update(pathlib.Path(clang.__file__).read_bytes())
+    return digest.hexdigest()
