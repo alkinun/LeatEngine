@@ -686,11 +686,15 @@ def test_start_needs_a_free_slot(tiny_model):
 # LFM2.5 24B A2B, whose short convolutions multiply three projections' outputs, is far more
 # sensitive to rounding: 0.051 and 89.9% on both paths over 8 chunks, where llama.cpp's CPU backend
 # scores 0.039 and 90.7% against its CUDA one, and leatengine 0.047 and 90.4% against its CPU one,
-# its perplexity no higher.
+# its perplexity no higher. GLM-4.7-Flash, of multi-head latent attention, scores 0.0076 and 96.1%
+# on the prompt's path and 0.011 and 96.6% on the decode path over 7 chunks, where llama.cpp's CPU
+# backend scores 0.0088 against its CUDA one; its 8th chunk is one the model scores badly on every
+# backend, a perplexity of thousands, and wherever it rounds differently.
 LIMITS = {
     "llama": (0.0015, 0.975), "qwen2": (0.0045, 0.97), "qwen3": (0.0035, 0.97),
     "qwen3moe": (0.007, 0.97), "qwen35": (0.003, 0.975), "qwen35moe": (0.01, 0.965),
     "Mistral Small": (0.003, 0.975), "mellum": (0.012, 0.95), "lfm2moe": (0.065, 0.88),
+    "deepseek2": (0.016, 0.95),
 }  # fmt: skip
 
 
