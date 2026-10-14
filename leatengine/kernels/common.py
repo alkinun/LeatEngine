@@ -16,6 +16,7 @@ from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import AxisType, Ops
 
 from leatengine import grids
+from leatengine.kernels.clang import ClangRenderer
 from leatengine.quant import FP4_VALUES, IQ4_VALUES, GGMLType, QTensor
 
 WARP = 32
@@ -64,15 +65,18 @@ def one_sequence(x: Tensor) -> bool:
 
 @functools.cache
 def _rdna(device: str) -> int:
-    # the RDNA generation's major gfx version, 11 or 12, of an AMD GPU tinygrad renders C for;
-    # else 0
+    # the RDNA generation's major gfx version, 11 or 12, of an AMD GPU; else 0. tinygrad passes
+    # over the clang renderer the kernels need where clang is missing, for another
     if not device.endswith("AMD"):
         return 0
-    from tinygrad.renderer.cstyle import HIPRenderer
-
     dev: Any = Device[device]
+    if not isinstance(dev.renderer, ClangRenderer):
+        raise RuntimeError(
+            f"{device} renders for {type(dev.renderer).__name__}: LeatEngine's AMD kernels need "
+            "clang with its AMDGPU target"
+        )
     major = getattr(dev, "target", (0,))[0]
-    return major if isinstance(dev.renderer, HIPRenderer) and major in (11, 12) else 0
+    return major if major in (11, 12) else 0
 
 
 def either(cuda: str, amd: str) -> str:

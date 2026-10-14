@@ -46,8 +46,9 @@ time. The logits comparison skips architectures without an agreement limit in
 
 ## Emulated AMD tests
 
-Install clang with its AMDGPU target and lld. Obtain tinygrad's source at the same pinned
-commit: the emulator lives in its tests and is not included in the installed package.
+Install clang with its AMDGPU target, which compiles the kernels as on a real GPU. Obtain
+tinygrad's source at the same pinned commit: the emulator lives in its tests and is not included
+in the installed package.
 
 ```bash
 git clone https://github.com/tinygrad/tinygrad.git /tmp/leatengine-tinygrad
@@ -56,8 +57,8 @@ PYTHONPATH=/tmp/leatengine-tinygrad DEV=MOCK+AMD uv run pytest -m gpu -n auto \
   --cov --cov-report= --durations=20
 ```
 
-The test harness installs a clang compiler adapter and isolates compilation caches per worker.
-This checks RDNA 3 kernel behavior in emulation; physical Strix Halo validation is separate. The
+The tests turn off unaligned memory access, which the emulator lacks, and isolate compilation
+caches per worker. This checks RDNA 3 kernel behavior in emulation; physical Strix Halo validation is separate. The
 emulator skips decode attention over heads wider than 512 dimensions, which it computes wrongly;
 the [Strix Halo guide](strix-halo.md) covers that check.
 

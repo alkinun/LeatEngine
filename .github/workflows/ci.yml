@@ -64,8 +64,8 @@ jobs:
 
   kernels:
     # the GPU tests, the warp-level kernels' and every tiny model through them, on tinygrad's
-    # emulated RDNA 3 GPU, as tests/hip.py sets up: their HIP C compiled by the runner's clang,
-    # and the emulator from tinygrad's source tree, at the commit pyproject.toml pins
+    # emulated RDNA 3 GPU, as tests/conftest.py sets up: their HIP C compiled by the runner's
+    # clang, as on a GPU, and the emulator from tinygrad's source tree, at the pinned commit
     runs-on: ubuntu-latest
     timeout-minutes: 150
     strategy:
@@ -78,7 +78,7 @@ jobs:
             selection: --ignore=tests/test_kernels.py
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update -q && sudo apt-get install -y -q clang lld
+      - run: sudo apt-get update -q && sudo apt-get install -y -q clang
       - run: |
           commit=$(grep -oP 'tinygrad\.git@\K[0-9a-f]{40}' pyproject.toml)
           git clone --quiet --filter=blob:none https://github.com/tinygrad/tinygrad.git "$RUNNER_TEMP/tinygrad"

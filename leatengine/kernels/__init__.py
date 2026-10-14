@@ -3,9 +3,11 @@
 The warp-level kernels, which carry decoding, run on NVIDIA GPUs (DEV=NV or CUDA) and on AMD's RDNA
 GPUs (DEV=AMD), as Strix Halo's; those on tensor cores, matmul's and FlashAttention's, on NVIDIA's
 mma.sync and RDNA 3's WMMA. Each family the model's ops dispatch to has a `supports_*` check beside
-the op itself: leatengine.ops chooses between them and the reference ops.
+the op itself: leatengine.ops chooses between them and the reference ops. AMD's kernels compile
+with the system's clang, without ROCm: see leatengine.kernels.clang.
 """
 
+from leatengine.kernels import clang
 from leatengine.kernels.argmax import argmax, supports_argmax
 from leatengine.kernels.attention import (
     attention,
@@ -38,6 +40,9 @@ from leatengine.kernels.matmul import (
 from leatengine.kernels.matvec import MATVEC_TOKENS, matvecs, supports_matvec, swiglu
 from leatengine.kernels.norms import add_normed, supports_add_normed
 from leatengine.kernels.quantize import quantize_q8
+
+# AMD devices made from here on compile with clang
+clang.install()
 
 # the bound variables kernels bind inside a graph, by name: TinyJit replays a graph with the
 # values its arguments carry, and these ride along there

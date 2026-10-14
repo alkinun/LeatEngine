@@ -15,12 +15,14 @@ if worker := os.environ.get("PYTEST_XDIST_WORKER"):
     cache = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser() / "tinygrad"
     os.environ.setdefault("CACHEDB", str(cache / f"cache-{worker}.db"))
 if os.environ["DEV"].split(":")[0] == "MOCK+AMD":
-    # tinygrad's emulated RDNA 3 GPU, whose kernels the system's clang compiles: see tests/hip.py.
-    # Compiles run in this process, where the compiler is replaced, not in a pool of workers.
+    # tinygrad's emulated RDNA 3 GPU, from the tests of tinygrad's source tree at the pinned commit,
+    # which PYTHONPATH must hold. It does not allow unaligned access, as GPUs do: clang would merge
+    # the halfword loads of blocks only halfword aligned into wide ones. Compiles run in this
+    # process, which has the flag: tinygrad's compile workers make their renderers anew.
     os.environ.setdefault("PARALLEL", "0")
-    from tests import hip
+    from leatengine.kernels import clang
 
-    hip.install()
+    clang.FLAGS = ("-Xclang", "-target-feature", "-Xclang", "-unaligned-access-mode")
 
 
 @pytest.fixture(autouse=True)

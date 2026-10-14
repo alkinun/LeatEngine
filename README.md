@@ -14,7 +14,8 @@ tinygrad's RDNA 3 emulator, and the engine is measured against llama.cpp on an R
 
 Linux, Python 3.12+, Git, and [uv](https://docs.astral.sh/uv/) are required for these commands.
 GPU execution also requires the backend's driver and compiler: NVIDIA's open kernel driver
-and NVRTC, or AMD's KFD device and ROCm comgr. See the [Strix Halo guide](docs/strix-halo.md).
+and NVRTC, or AMD's KFD device and clang with its AMDGPU target, as most distributions ship it.
+ROCm is not needed. See the [Strix Halo guide](docs/strix-halo.md).
 
 ```bash
 uv tool install --python 3.14 'git+https://github.com/alkinun/LeatEngine.git'

@@ -25,8 +25,8 @@ kernel passes on NVIDIA, and on the emulator when compiled within 128 VGPRs.
 ## Prepare the host
 
 Use Linux with firmware and an amdgpu driver that support the device. Install uv, Git, and
-the ROCm comgr compiler required by tinygrad's current AMD path. Ensure the user can access
-`/dev/kfd` and the relevant render device; device permissions depend on the distribution.
+clang with its AMDGPU target, which compiles the kernels; ROCm is not needed. Ensure the user can
+access `/dev/kfd` and the relevant render device; device permissions depend on the distribution.
 
 Record the distribution, kernel, firmware/BIOS, compiler, memory configuration, and power mode.
 Inspect available GPU memory before selecting models or contexts. Firmware UMA allocation and
@@ -56,6 +56,5 @@ For llama.cpp comparisons, record the exact commit and build options for each ba
 Vulkan or HIP. Keep model files, quantization, prompt lengths, and generation settings comparable;
 report differences rather than mixing them into one headline number.
 
-The emulator's clang compiler adapter is test tooling. Promoting a clang path to the runtime,
-changing memory defaults, or tuning kernels comes after physical correctness and performance
+Changing memory defaults or tuning kernels comes after physical correctness and performance
 measurements. Publish reports with the exact LeatEngine commit and host configuration.
