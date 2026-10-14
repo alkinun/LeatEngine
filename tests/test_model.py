@@ -699,10 +699,13 @@ def test_start_needs_a_free_slot(tiny_model):
 # Muse Glimmer's 0.0021 and 98.4% or more. GLM-4.7-Flash scores 0.032 to 0.040 and 95% over 7
 # chunks, where llama.cpp 1b70350 and 2e88c49c9 differ from each other by 0.039; leatengine scores
 # 0.011 against the older build. Over the 4 chunks here, the two builds differ by 0.063 and agree
-# on 93.5% of top tokens, and leatengine scores 0.051 and 0.066 against the newer one.
+# on 93.5% of top tokens, and leatengine scores 0.051 and 0.066 against the newer one. Unsloth's
+# 3-bit quantizations of Qwen3 30B A3B, of Q3_K and of IQ3_XXS and IQ3_S, score 0.0048 to 0.0060
+# and 96.5 to 97% over 8 chunks, where llama.cpp's CPU backend scores 0.0087 to 0.0098 and 96.0%
+# against its CUDA one.
 LIMITS = {
     "llama": (0.0015, 0.975), "qwen2": (0.0045, 0.97), "qwen3": (0.0035, 0.97),
-    "qwen3moe": (0.007, 0.97), "qwen35": (0.003, 0.975), "qwen35moe": (0.01, 0.965),
+    "qwen3moe": (0.007, 0.96), "qwen35": (0.003, 0.975), "qwen35moe": (0.01, 0.965),
     "Mistral Small": (0.003, 0.975), "mellum": (0.012, 0.95), "lfm2moe": (0.065, 0.88),
     "deepseek2": (0.08, 0.92), "muse-glimmer": (0.004, 0.975),
 }  # fmt: skip

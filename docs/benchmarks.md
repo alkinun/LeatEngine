@@ -6,9 +6,11 @@ results are still pending; see the [Strix Halo guide](strix-halo.md).
 
 ## RTX 3090 results
 
-Measured with the engine at commit `d17c2d2` on an RTX 3090 (24 GB; driver 610.43.03, CUDA 13.3,
-Linux 7.1, Python 3.14), one sequence, Q4_K_M GGUFs from Hugging Face. Every row compares against
-the same llama.cpp CUDA build, commit `1b70350`, the first tested build that runs Muse Glimmer.
+Measured on an RTX 3090 (24 GB; driver 610.43.03, CUDA 13.3, Linux 7.1, Python 3.14), one
+sequence, with GGUFs from Hugging Face: Q4_K_M files with the engine at commit `d17c2d2`, and
+Unsloth's low-bit quantizations of Qwen3 30B A3B, which exercise the low-bit kernels, at
+`ec840a0`. Every row compares against the same llama.cpp CUDA build, commit `1b70350`, the first
+tested build that runs Muse Glimmer.
 
 ### Speed
 
@@ -24,6 +26,8 @@ LeatEngine's numbers include sampling on the GPU and reading each token back to 
 | LFM2.5 24B A2B | lfm2moe | 6013 | 5238 | 283.7 | 293.6 |
 | GLM-4.7-Flash (30B A3B) | deepseek2 | 3756 | 2455 | 150.9 | 138.4 |
 | Muse Glimmer 30B | muse-glimmer | 1626 | 1392 | 45.1 | 47.0 |
+| Qwen3 30B A3B UD-Q3_K_XL | qwen3moe | 4409 | 4523 | 177.6 | 238.6 |
+| Qwen3 30B A3B UD-IQ3_XXS | qwen3moe | 4811 | 4529 | 193.2 | 232.7 |
 
 ### Agreement with llama.cpp
 
@@ -41,6 +45,8 @@ decode path runs the scored half one token at a time, as generation does. Lower 
 | LFM2.5 24B A2B | 16.494 | 16.592 | 0.057, 88.6% | 0.056, 89.5% |
 | GLM-4.7-Flash, first 7 chunks | 7.153 | 6.896 | 0.032, 95.0% | 0.040, 95.0% |
 | Muse Glimmer 30B | 6.585 | 6.597 | 0.0021, 98.9% | 0.0021, 98.4% |
+| Qwen3 30B A3B UD-Q3_K_XL | 8.778 | 8.734 | 0.0048, 96.7% | 0.0056, 96.5% |
+| Qwen3 30B A3B UD-IQ3_XXS | 9.005 | 9.014 | 0.0060, 97.0% | 0.0049, 96.9% |
 
 Both engines round differently, so some divergence is expected; how much depends on the model.
 For scale, llama.cpp also diverges from itself:
@@ -53,6 +59,9 @@ For scale, llama.cpp also diverges from itself:
   and the older `2e88c49c9` differ from each other by a KL of 0.039 on the 7 chunks (perplexity
   7.15 and 6.95). LeatEngine scores 0.011 against `2e88c49c9`, and its layers match an independent
   float64 implementation of the model.
+- **Low-bit quantizations** pick their top token among closer candidates. On the 3-bit files,
+  llama.cpp's CPU backend scores a KL of 0.0087 and 0.0098 (96.0% top-1) against its CUDA backend,
+  further from it than LeatEngine.
 
 ## Historical results from the original Leat
 
