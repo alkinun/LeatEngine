@@ -424,9 +424,10 @@ def iq_grids(device: str) -> Tensor:
 
 
 def byte_signs(value: UOp, bits: UOp) -> UOp:
-    # the 4 bytes of a word, each under 128, negated where the low 4 bits of `bits` have its bit
-    # set, as signed bytes: the multiplication moves bit i to bit 8i, 0xFF spreads it over its
-    # byte, and flipping a byte and adding 1 negates it
+    # the 4 bytes of a word, each from 1 to 127 as the IQ grids' values are, negated where the low
+    # 4 bits of `bits` have its bit set, as signed bytes: the multiplication moves bit i to bit 8i,
+    # 0xFF spreads it over its byte, and flipping a byte and adding 1 negates it, without a carry
+    # into the next as only a 0 would make
     flips = (((bits & 15) * 0x00204081) & 0x01010101).cast(dtypes.uint32)
     return ((value ^ (flips * 0xFF)) + flips).bitcast(dtypes.int32)
 
