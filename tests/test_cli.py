@@ -3,6 +3,7 @@ import os
 import struct
 import threading
 
+import gguf
 import jinja2
 import numpy as np
 import pytest
@@ -190,6 +191,10 @@ def test_serve_directories(tiny_model, tmp_path, monkeypatch, capsys):
     (models := tmp_path / "models").mkdir()
     (models / "mtp-tiny.gguf").symlink_to(tiny_model[0])
     (models / "tiny.gguf").symlink_to(tiny_model[0])
+    other = gguf.GGUFWriter(models / "dflash-tiny.gguf", arch="dflash")  # another engine's drafter
+    other.write_header_to_file()
+    other.write_kv_data_to_file()
+    other.close()
     loaded, failing, keys, samplings, served = [], [], [], [], []
 
     class Fake:
@@ -226,8 +231,9 @@ def test_serve_directories(tiny_model, tmp_path, monkeypatch, capsys):
         main(["serve", str(models), "--host", "0.0.0.0", "--keys", str(tmp_path / "keys.json")])
     main(["keys", "add", "alkin", "--file", str(tmp_path / "keys.json")])
     main(["serve", str(models), "--host", "0.0.0.0", "--keys", str(tmp_path / "keys.json")])
-    out = capsys.readouterr().out
-    assert loaded == ["tiny"] and "the API at http://127.0.0.1:8080/v1, compiling..." in out
+    printed = capsys.readouterr()
+    assert loaded == ["tiny"] and "the API at http://127.0.0.1:8080/v1, compiling..." in printed.out
+    assert "skipping dflash-tiny.gguf: its architecture, 'dflash', is not supported" in printed.err
     assert [f.name for f in served[-1]] == ["tiny.gguf"]
     assert keys[-1].path == tmp_path / "keys.json"
     main(["serve", str(models), "--host", "::1"])  # this machine's alone: no keys needed

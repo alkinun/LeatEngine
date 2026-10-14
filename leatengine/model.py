@@ -54,6 +54,11 @@ _POST_NORM_EPS = {"muse-glimmer": 1e-8}
 _GLU = {"gemma3": "gelu", "gemma4": "gelu", "gemma-embedding2": "gelu", "gpt-oss": "oai"}
 
 
+def supported(arch: str) -> bool:
+    """Whether models of a GGUF's general.architecture run here."""
+    return arch in _ROPE_HALVES
+
+
 @dataclass(frozen=True)
 class Rope:
     """How a layer rotates its queries and keys: RoPE of base `theta` over the first `dims`

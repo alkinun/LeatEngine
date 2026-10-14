@@ -8,6 +8,7 @@ import contextlib
 import ipaddress
 import json
 import os
+import sys
 import threading
 import time
 from dataclasses import asdict
@@ -314,7 +315,7 @@ def _serve(args: argparse.Namespace) -> None:
     from leatengine.server import Server
     from leatengine.vision import projector
 
-    models = [f for p in args.models for f in (sorted(p.glob("*.gguf")) if p.is_dir() else [p])]
+    models = [f for p in args.models for f in (_found(p) if p.is_dir() else [p])]
     # each model's vision encoder and MTP layer, not models
     models = [f for f in models if not projector(f) and not mtp(f)]
     if not models:
@@ -350,6 +351,27 @@ def _serve(args: argparse.Namespace) -> None:
             server.serve_forever()
         if failed:
             raise failed[0]
+
+
+def _found(directory: Path) -> list[Path]:
+    # the GGUFs of a directory of models that run here, saying which do not, as drafters of other
+    # engines' kinds beside a model
+    from leatengine.gguf import GGUF
+    from leatengine.model import supported
+
+    found = []
+    for path in sorted(directory.glob("*.gguf")):
+        try:
+            arch = GGUF.open(path).metadata.get("general.architecture", "")
+        except (OSError, ValueError) as e:  # not a GGUF after all, or truncated
+            print(f"skipping {path.name}: {e}", file=sys.stderr)
+            continue
+        if supported(arch):
+            found.append(path)
+        else:
+            print(f"skipping {path.name}: its architecture, {arch!r}, is not supported",
+                  file=sys.stderr)  # fmt: skip
+    return found
 
 
 def _loopback(host: str) -> bool:
