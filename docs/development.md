@@ -22,6 +22,11 @@ GGUF/numerical references, HTTP-client tests, and quality checks. tinygrad is pi
 `9d7054488aee0e455e226514ba4b8b2f32329c29`; changing it is a deliberate compatibility update.
 Retain the lockfile for reproducible development installs.
 
+tinygrad keeps compiled kernels in `~/.cache/tinygrad/cache.db`, and LeatEngine keeps the lowered
+programs there too (`leatengine.kernels.lowering`), so that a model's later starts skip lowering.
+`CACHELEVEL=0` turns both off, as for timing a first start; the tests give each pytest-xdist
+worker a database of its own.
+
 The default tests use generated tiny GGUFs and CPU execution. GPU and real-model tests are
 opt-in. `LEATENGINE_KERNELS=ref` disables custom kernels for numerical comparisons.
 
