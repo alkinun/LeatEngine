@@ -4,7 +4,8 @@ The warp-level kernels, which carry decoding, run on NVIDIA GPUs (DEV=NV or CUDA
 GPUs (DEV=AMD), as Strix Halo's; those on tensor cores, matmul's and FlashAttention's, on NVIDIA's
 mma.sync and RDNA 3's WMMA. Each family the model's ops dispatch to has a `supports_*` check beside
 the op itself: leatengine.ops chooses between them and the reference ops. AMD's kernels compile
-with the system's clang, without ROCm: see leatengine.kernels.clang.
+with the system's clang, without ROCm: see leatengine.kernels.clang. A model's graphs capture
+faster, and later starts skip lowering their kernels: see leatengine.kernels.lowering.
 """
 
 from leatengine.kernels import clang, lowering
