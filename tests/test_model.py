@@ -545,7 +545,10 @@ def test_lowered_programs_kept(monkeypatch):
     dict.pop(programs, key)
     with Context(CCACHE=0):  # as tinygrad keeps no binaries, no programs either
         assert key not in programs
-    monkeypatch.setattr(lowering, "_sources", lambda: "another tinygrad")
+    fingerprint = lowering._fingerprint()
+    monkeypatch.setenv("ALIGNED", "0")  # a switch tinygrad's C renderers read, which programs hold
+    assert lowering._fingerprint.__wrapped__() != fingerprint
+    monkeypatch.setattr(lowering, "_fingerprint", lambda: "another tinygrad")
     assert key not in programs and programs.get(key) is None
 
 
