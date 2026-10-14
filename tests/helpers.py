@@ -29,6 +29,9 @@ F16_FIELDS = {
     GGMLType.IQ4_NL: (0,),
     GGMLType.IQ4_XS: (0,),
     GGMLType.MXFP4: (),
+    **dict.fromkeys(
+        (GGMLType[t] for t in ("IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S")), (0,)
+    ),
 }
 
 

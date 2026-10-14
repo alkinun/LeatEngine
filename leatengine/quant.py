@@ -10,6 +10,8 @@ from enum import IntEnum
 from tinygrad import Tensor, dtypes
 from tinygrad.dtype import DType
 
+from leatengine import grids
+
 
 class GGMLType(IntEnum):
     F32 = 0
@@ -223,11 +225,106 @@ def _q6_k(b: Tensor) -> Tensor:
     return (_f16(b[:, 208:210]).reshape(n, 1, 1, 1, 1) * sc * q).reshape(n, 256)
 
 
+def _grid(name: str, index: Tensor) -> Tensor:
+    # the values of the grid entries `index` picks, (..., width), as f32
+    values = grids.grid(name)
+    width = 8 if name.startswith("IQ2") else 4
+    table = Tensor(list(values), dtype=dtypes.uint8, device=index.device).reshape(-1, width)
+    return table[index.cast(dtypes.int32)].cast(dtypes.float32)
+
+
+def _signs(bits: Tensor, parity: bool = False) -> Tensor:
+    # bytes of sign bits to (..., 8) of 1 or -1, bit j for value j; with parity, bytes of 7 bits
+    # whose eighth makes the count even, as ggml's ksigns_iq2xs
+    signs = _fields(bits.cast(dtypes.uint8), 1)
+    if parity:
+        eighth = (signs[..., :7].sum(-1, keepdim=True) & 1).cast(dtypes.uint8)
+        signs = signs[..., :7].cat(eighth, dim=-1)
+    return 1 - 2 * signs.cast(dtypes.float32)
+
+
+def _words(b: Tensor) -> Tensor:
+    # bytes (..., 4k) as (..., k) little-endian uint32
+    q = b.cast(dtypes.uint32).reshape(*b.shape[:-1], -1, 4)
+    return q[..., 0] | (q[..., 1] << 8) | (q[..., 2] << 16) | (q[..., 3] << 24)
+
+
+def _halfwords(b: Tensor) -> Tensor:
+    q = b.cast(dtypes.uint32).reshape(*b.shape[:-1], -1, 2)
+    return q[..., 0] | (q[..., 1] << 8)
+
+
+def _sub_signs(aux: Tensor) -> Tensor:
+    # IQ2_XXS's and IQ3_XXS's word per 32 values: 4 runs of 7 sign bits, each for 8 values;
+    # (..., 4, 8) of 1 or -1
+    shifts = Tensor([0, 7, 14, 21], dtype=dtypes.uint32, device=aux.device)
+    return _signs((aux.unsqueeze(-1) >> shifts) & 127, parity=True)
+
+
+def _iq2_xxs(b: Tensor) -> Tensor:
+    # d:f16, then 8 sub-blocks of 32 of 8 bytes: 4 indices into the grid, each of 8 values, and a
+    # word of their signs and a scale s, its top 4 bits, d * (0.5 + s) / 4
+    n = b.shape[0]
+    qs = b[:, 2:].reshape(n, 8, 8)
+    aux = _words(qs[:, :, 4:])[..., 0]
+    db = (_f16(b[:, :2]) * (0.5 + (aux >> 28).cast(dtypes.float32)) * 0.25).reshape(n, 8, 1, 1)
+    return (db * _grid("IQ2_XXS", qs[:, :, :4]) * _sub_signs(aux)).reshape(n, 256)
+
+
+def _iq2_xs(b: Tensor) -> Tensor:
+    # d:f16, qs:u16[32], scales:u8[8]; each 8 values a halfword of a 9-bit index into the grid
+    # and 7 sign bits, each 16 a scale s of 4 bits, d * (0.5 + s) / 4
+    n = b.shape[0]
+    qs = _halfwords(b[:, 2:66])
+    s = _fields(b[:, 66:74], 4).reshape(n, 16).cast(dtypes.float32)
+    db = (_f16(b[:, :2]) * (0.5 + s) * 0.25).reshape(n, 16, 1)
+    values = _grid("IQ2_XS", qs & 511) * _signs(qs >> 9, parity=True)
+    return (db * values.reshape(n, 16, 16)).reshape(n, 256)
+
+
+def _iq2_s(b: Tensor) -> Tensor:
+    # d:f16, qs:u8[32], signs:u8[32], qh:u8[8], scales:u8[8]; each 8 values a 10-bit index into
+    # the grid, a byte of qs and bits 2(i % 4) of qh[i / 4], and a byte of sign bits; scales as
+    # IQ2_XS's
+    n = b.shape[0]
+    high = _fields(b[:, 66:74], 2).reshape(n, 32).cast(dtypes.uint32)
+    index = b[:, 2:34].cast(dtypes.uint32) | (high << 8)
+    s = _fields(b[:, 74:82], 4).reshape(n, 16).cast(dtypes.float32)
+    db = (_f16(b[:, :2]) * (0.5 + s) * 0.25).reshape(n, 16, 1)
+    values = _grid("IQ2_S", index) * _signs(b[:, 34:66])
+    return (db * values.reshape(n, 16, 16)).reshape(n, 256)
+
+
+def _iq3_xxs(b: Tensor) -> Tensor:
+    # d:f16, qs:u8[64] of indices into the grid, each of 4 values, then a word per 32 values of
+    # IQ2_XXS's signs and scale, here d * (0.5 + s) / 2
+    n = b.shape[0]
+    aux = _words(b[:, 66:98])
+    db = (_f16(b[:, :2]) * (0.5 + (aux >> 28).cast(dtypes.float32)) * 0.5).reshape(n, 8, 1, 1)
+    values = _grid("IQ3_XXS", b[:, 2:66]).reshape(n, 8, 4, 8)
+    return (db * values * _sub_signs(aux)).reshape(n, 256)
+
+
+def _iq3_s(b: Tensor) -> Tensor:
+    # d:f16, qs:u8[64], qh:u8[8], signs:u8[32], scales:u8[4]; each 4 values a 9-bit index into
+    # the grid, a byte of qs and bit i % 8 of qh[i / 8], and each 8 a byte of signs; each 32 a
+    # scale s of 4 bits, d * (1 + 2s)
+    n = b.shape[0]
+    high = _fields(b[:, 66:74], 1).reshape(n, 64).cast(dtypes.uint32)
+    index = b[:, 2:66].cast(dtypes.uint32) | (high << 8)
+    s = _fields(b[:, 106:110], 4).reshape(n, 8).cast(dtypes.float32)
+    db = (_f16(b[:, :2]) * (1 + 2 * s)).reshape(n, 8, 1)
+    values = _grid("IQ3_S", index).reshape(n, 32, 8) * _signs(b[:, 74:106])
+    return (db * values.reshape(n, 8, 32)).reshape(n, 256)
+
+
 DEQUANT = {
     GGMLType.Q4_0: _q4_0, GGMLType.Q4_1: _q4_1, GGMLType.Q5_0: _q5_0, GGMLType.Q5_1: _q5_1,
     GGMLType.Q8_0: _q8_0, GGMLType.Q2_K: _q2_k, GGMLType.Q3_K: _q3_k, GGMLType.Q4_K: _q4_k,
     GGMLType.Q5_K: _q5_k, GGMLType.Q6_K: _q6_k, GGMLType.IQ4_NL: _iq4_nl,
-    GGMLType.IQ4_XS: _iq4_xs, GGMLType.MXFP4: _mxfp4,
+    GGMLType.IQ4_XS: _iq4_xs, GGMLType.MXFP4: _mxfp4, GGMLType.IQ2_XXS: _iq2_xxs,
+    GGMLType.IQ2_XS: _iq2_xs, GGMLType.IQ2_S: _iq2_s, GGMLType.IQ3_XXS: _iq3_xxs,
+    GGMLType.IQ3_S: _iq3_s,
 }  # fmt: skip
 
 

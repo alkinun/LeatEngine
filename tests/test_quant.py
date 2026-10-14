@@ -29,5 +29,5 @@ def test_dequant_native(ggml_type):
 
 
 def test_dequant_unsupported():
-    with pytest.raises(NotImplementedError, match="IQ2_XXS"):
-        QTensor(Tensor.zeros(1, 66), GGMLType.IQ2_XXS, (256,)).dequant()
+    with pytest.raises(NotImplementedError, match="IQ1_S"):
+        QTensor(Tensor.zeros(1, 50), GGMLType.IQ1_S, (256,)).dequant()
