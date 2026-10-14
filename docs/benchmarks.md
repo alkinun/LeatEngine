@@ -1,61 +1,71 @@
 # Benchmarks
 
-## Measure this checkout
+This page has three parts: results measured on this checkout on an RTX 3090, historical results
+from the original Leat project, and how to measure a checkout yourself. Physical Strix Halo
+results are still pending; see the [Strix Halo guide](strix-halo.md).
 
-```bash
-uv run leatengine bench MODEL.gguf -p 512 -n 128 -r 3 --json
-uv run leatengine bench MODEL.gguf -s 4 --json
-uv run leatengine bench MODEL.gguf --chat --draft DRAFTER.gguf --json
-uv run leatengine perplexity MODEL.gguf --text wiki.test.raw --ctx 512 --json
-DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp /path/to/llama.cpp/build/bin
-```
+## RTX 3090 results
 
-Use `--recommended` with `bench --chat` to measure recommended sampling rather than greedy
-replies. `perplexity --kl-base FILE` compares with a logits file produced by llama.cpp.
-The validation script runs GPU tests, benchmarks, draft comparisons, and an HTTP streaming
-smoke check. `--quick` reduces repetitions and omits batched/draft measurements; `--no-tests`
-skips GPU tests. Reports and temporary server logs are written under ignored `reports/`.
+Measured with the engine at commit `d17c2d2` on an RTX 3090 (24 GB; driver 610.43.03, CUDA 13.3,
+Linux 7.1, Python 3.14), one sequence, Q4_K_M GGUFs from Hugging Face. Every row compares against
+the same llama.cpp CUDA build, commit `1b70350`, the first tested build that runs Muse Glimmer.
 
-Record the engine commit, tinygrad commit, model file/quantization, driver/compiler, hardware,
-context, prompt and output lengths, sampling, sequence count, and warmup conditions. Compare
-like-for-like runs and retain raw results. The script records failures in its report; inspect
-those results rather than treating its process exit status as a qualification verdict.
-Its built-in batched comparison uses different prompt lengths for the two engines, so it is
-exploratory and must not be presented as a controlled performance comparison.
+### Speed
 
-## Measured on this checkout: new architectures on the RTX 3090
+Tokens per second: prefill of a 512-token prompt (pp512) and decode of 128 tokens (tg128), from
+`leatengine bench MODEL -p 512 -n 128 -r 3` and `llama-bench -m MODEL -p 512 -n 128 -r 3`.
+LeatEngine's numbers include sampling on the GPU and reading each token back to the host.
 
-Measured on an RTX 3090 (driver 610.43.03, CUDA 13.3, Linux 7.1) against llama.cpp CUDA builds
-(`2e88c49c9`, and `1b70350` for Muse Glimmer, which the older one lacks), one sequence, Q4_K_M
-files from Hugging Face. Speeds are
-`leatengine bench -p 512 -n 128 -r 2` against `llama-bench -p 512 -n 128 -r 2`, in tokens per
-second. Quality is `leatengine perplexity --kl-base` against llama.cpp's logits of the first 8
-chunks of 512 tokens of wikitext-2's test set: mean KL divergence and top-token agreement. For
-scale, the last column gives llama.cpp's own CPU backend against its CUDA one, on 2 chunks.
+| Model | Architecture | llama.cpp pp512 | LeatEngine pp512 | llama.cpp tg128 | LeatEngine tg128 |
+|---|---|---:|---:|---:|---:|
+| Llama 3.1 8B Instruct | llama | 5369 | 4784 | 147.2 | 150.1 |
+| Qwen3 8B | qwen3 | 5098 | 4671 | 141.3 | 146.7 |
+| Mellum 2.1 12B A2.5B Thinking | mellum | 8070 | 8349 | 291.6 | 312.6 |
+| LFM2.5 24B A2B | lfm2moe | 6013 | 5238 | 283.7 | 293.6 |
+| GLM-4.7-Flash (30B A3B) | deepseek2 | 3756 | 2455 | 150.9 | 138.4 |
+| Muse Glimmer 30B | muse-glimmer | 1626 | 1392 | 45.1 | 47.0 |
 
-| | llama.cpp pp512 | leatengine pp512 | llama.cpp tg128 | leatengine tg128 | KL, top-1 | llama.cpp CPU vs CUDA |
-|---|---:|---:|---:|---:|---:|---:|
-| Mellum 2.1 12B A2.5B Thinking | 7790 | 8126 | 294 | 311 | 0.0078, 95.8% | 0.0095 |
-| LFM2.5 24B A2B | 5998 | 5135 | 280 | 292 | 0.051, 89.9% | 0.039, 90.7% |
-| GLM-4.7-Flash, 7 chunks | 3733 | 2419 | 151 | 137 | 0.011, 96.2% | 0.0088 |
-| Muse Glimmer 30B | 1631 | 1384 | 45.1 | 46.9 | 0.0021, 98.9% | |
+### Agreement with llama.cpp
 
-LFM2.5's short convolutions multiply three outputs of one projection, which makes it unusually
-sensitive to rounding on every backend; its prefill trails llama.cpp in the int8 matrix kernels'
-handling of its small per-expert batches. GLM-4.7-Flash's 8th chunk scores a perplexity in the
-thousands on every backend, where they diverge, so its row covers the first 7.
+`llama-perplexity` saves llama.cpp's logits for the first 8 chunks of 512 tokens of wikitext-2's
+test set (`--kl-divergence-base`), and `leatengine perplexity --kl-base` scores the same tokens.
+The table gives both engines' perplexity, and LeatEngine's mean KL divergence from llama.cpp and
+how often both pick the same most likely token. The prompt path runs each chunk as a prompt; the
+decode path runs the scored half one token at a time, as generation does. Lower KL is closer.
 
-## Inherited RTX 3090 results
+| Model | llama.cpp perplexity | LeatEngine perplexity | KL, top-1: prompt path | KL, top-1: decode path |
+|---|---:|---:|---:|---:|
+| Llama 3.1 8B Instruct | 7.994 | 7.983 | 0.0011, 98.3% | 0.0011, 98.1% |
+| Qwen3 8B | 10.214 | 10.171 | 0.0028, 97.2% | 0.0027, 97.3% |
+| Mellum 2.1 12B A2.5B Thinking | 11.825 | 11.801 | 0.0080, 95.9% | 0.0082, 95.9% |
+| LFM2.5 24B A2B | 16.494 | 16.592 | 0.057, 88.6% | 0.056, 89.5% |
+| GLM-4.7-Flash, first 7 chunks | 7.153 | 6.896 | 0.032, 95.0% | 0.040, 95.0% |
+| Muse Glimmer 30B | 6.585 | 6.597 | 0.0021, 98.9% | 0.0021, 98.4% |
 
-The table below is historical evidence copied from the original
-[Leat README at eb5682ac62134425d2ac7d8add6c8b466f12a18b](https://github.com/alkinun/leat/blob/eb5682ac62134425d2ac7d8add6c8b466f12a18b/README.md#measurements).
-It was not rerun as part of the extraction. Columns labelled `leat` refer to that original
-implementation. These are NVIDIA results, not Strix Halo results, and the original source
-does not record a complete machine configuration for reproducing every row.
+Both engines round differently, so some divergence is expected; how much depends on the model.
+For scale, llama.cpp also diverges from itself:
 
-RTX 3090, one sequence, in tokens per second; Q4_K_M files but for gpt-oss's, MXFP4. llama.cpp is b11372 with CUDA, and b9691 for Qwen3.6. leat's numbers include sampling on the device and reading the token back: after the prompt for pp512, after every token for tg128.
+- **LFM2.5** is unusually sensitive to rounding: its short convolutions multiply three outputs of
+  one projection. llama.cpp's own CPU backend scores a KL of 0.039 (90.7% top-1) against its
+  CUDA backend on these chunks.
+- **GLM-4.7-Flash** is compared on the first 7 chunks: on the 8th the model reaches a perplexity
+  in the thousands on every backend, and the backends diverge widely there. llama.cpp `1b70350`
+  and the older `2e88c49c9` differ from each other by a KL of 0.039 on the 7 chunks (perplexity
+  7.15 and 6.95). LeatEngine scores 0.011 against `2e88c49c9`, and its layers match an independent
+  float64 implementation of the model.
 
-| | llama.cpp pp512 | leat pp512 | llama.cpp tg128 | leat tg128 |
+## Historical results from the original Leat
+
+These measurements come from the original
+[Leat README at eb5682ac62134425d2ac7d8add6c8b466f12a18b](https://github.com/alkinun/leat/blob/eb5682ac62134425d2ac7d8add6c8b466f12a18b/README.md#measurements)
+and were not rerun for this repository: the `leat` columns are that implementation, not this
+checkout. They are NVIDIA results, and the source does not record the full machine
+configuration. Llama 3.1 8B and Qwen3 8B also appear above, measured on this checkout.
+
+RTX 3090, one sequence, tokens per second. Q4_K_M files except gpt-oss, which is MXFP4.
+llama.cpp is b11372 with CUDA (b9691 for Qwen3.6).
+
+| Model | llama.cpp pp512 | leat pp512 | llama.cpp tg128 | leat tg128 |
 |---|---:|---:|---:|---:|
 | Llama 3.2 3B Instruct | 10907 | 10185 | 274.4 | 283.1 |
 | Llama 3.1 8B Instruct | 5422 | 4829 | 147.7 | 152.9 |
@@ -71,3 +81,29 @@ RTX 3090, one sequence, in tokens per second; Q4_K_M files but for gpt-oss's, MX
 | Gemma 4 26B A4B it | 4823 | 4919 | 158.2 | 190.6 |
 | Phi-4-mini Instruct | 10382 | 8593 | 237.4 | 239.6 |
 | gpt-oss 20B | 6101 | 5846 | 213.2 | 230.0 |
+
+## Measuring a checkout
+
+```bash
+uv run leatengine bench MODEL.gguf -p 512 -n 128 -r 3 --json
+uv run leatengine bench MODEL.gguf -s 4 --json
+uv run leatengine bench MODEL.gguf --chat --draft DRAFTER.gguf --json
+uv run leatengine perplexity MODEL.gguf --text wiki.test.raw --ctx 512 --json
+uv run leatengine perplexity MODEL.gguf --kl-base BASE.kld --json
+DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp /path/to/llama.cpp/build/bin
+```
+
+- `bench -s N` decodes N sequences at once; `bench --chat` decodes replies to chat prompts,
+  greedily or with `--recommended` sampling, as a drafter guesses them in use.
+- `perplexity --kl-base` compares with a file written by `llama-perplexity --kl-divergence-base`;
+  add `--decode` for the decode path and `--chunks N` to score fewer chunks.
+- `scripts/validate_hardware.py` runs the GPU tests, speed against llama.cpp, draft comparisons
+  and a streamed HTTP request, and writes a report under the ignored `reports/` directory.
+  `--quick` runs fewer repetitions and skips the batched and draft runs; `--no-tests` skips the
+  GPU tests. Its process exit status is not a verdict: read the failures in its report. Its
+  batched comparison uses different prompt lengths for the two engines, so treat it as
+  exploratory rather than a controlled comparison.
+
+Record the engine and tinygrad commits, the llama.cpp commit and build options, the model file
+and quantization, the hardware, driver and compiler, the context, prompt and output lengths,
+sampling, the number of sequences, and warmup. Compare like with like and keep the raw results.

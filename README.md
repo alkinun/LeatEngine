@@ -6,10 +6,9 @@ A minimal GGUF inference engine built on [tinygrad](https://github.com/tinygrad/
 with a terminal CLI and an OpenAI-compatible HTTP API. Strix Halo is the primary hardware
 target; NVIDIA kernels and CPU reference execution are also retained.
 
-**Early development:** physical Strix Halo validation is pending. AMD kernels have been tested
-on tinygrad's RDNA 3 emulator. Historical RTX 3090 results come from the original project,
-not a new hardware qualification of this repository. See [hardware status](docs/strix-halo.md)
-and [benchmarks](docs/benchmarks.md).
+**Early development:** physical Strix Halo validation is pending. AMD kernels are tested on
+tinygrad's RDNA 3 emulator, and the engine is measured against llama.cpp on an RTX 3090. See
+[hardware status](docs/strix-halo.md) and [benchmarks](docs/benchmarks.md).
 
 ## Install
 
@@ -68,13 +67,31 @@ leatengine serve /path/to/model.gguf --host 0.0.0.0 --keys
 The key is shown once. Clients send it as `Authorization: Bearer KEY`. The server provides HTTP;
 use an appropriate TLS proxy when encrypted transport is needed. See [API and configuration](docs/api.md).
 
+## Supported models
+
+LeatEngine runs GGUF files by their `general.architecture`. Support depends on the architecture
+and tensors in the file, not on the model's name.
+
+| GGUF architecture | Example models |
+|---|---|
+| `llama` | Llama 3.x, Mistral 7B, Mistral Small 3 (with vision) |
+| `qwen2`, `qwen3`, `qwen3moe` | Qwen2.5, Qwen3, Qwen3 30B A3B, Qwen3-Embedding |
+| `qwen35`, `qwen35moe` | Qwen3.5 and Qwen3.6, with vision and their MTP drafters |
+| `gemma3`, `gemma4` | Gemma 3 and Gemma 4, with vision and Gemma 4's assistant drafter |
+| `gemma-embedding2` | EmbeddingGemma 2 |
+| `gpt-oss` | gpt-oss 20B |
+| `phi3` | Phi-3, Phi-4-mini |
+| `mellum` | Mellum 2.1 12B A2.5B |
+| `muse-glimmer` | Muse Glimmer 30B (text only) |
+| `lfm2moe` | LFM2.5 24B A2B |
+| `deepseek2` | GLM-4.7-Flash (multi-head latent attention) |
+
+The GPU kernels take Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS and MXFP4 weights for
+prefill and decode, and Q4_1 and Q5_1 for decode. Other weights, F32, F16, BF16, Q2_K and Q3_K,
+and the prefill of Q4_1 and Q5_1, run on tinygrad's reference ops, which are slower.
+
 ## Capabilities
 
-- GGUF models and quantized weights; supported architecture families include Llama/Mistral,
-  Qwen2, Qwen3, Qwen3 MoE, Qwen3.5 dense/MoE, Gemma3, Gemma4, Gemma Embedding2, gpt-oss, Phi3,
-  Mellum, Muse Glimmer (text), LFM2 MoE, and DeepSeek V2-style multi-head latent attention as
-  GLM-4.7-Flash uses it.
-  Compatibility depends on the architecture and tensors in the file, not just its model name.
 - Continuous batching, chunked prefill, prefix reuse, and sliding-window KV caches.
 - Speculative decoding with supported MTP layers or assistant drafters.
 - Vision through supported `mmproj` GGUFs; embeddings through `serve --embed MODEL.gguf`.

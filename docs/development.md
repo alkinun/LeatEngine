@@ -36,8 +36,13 @@ DEV=NV LEATENGINE_MODEL=/models/model.gguf \
   LLAMA_CPP=/path/to/llama.cpp/build/bin WIKITEXT=/path/to/wiki.test.raw uv run pytest
 ```
 
-Use one test process on a real GPU so models do not compete for its memory. Model-specific
-tests may require suitable tool-capable weights and a llama.cpp reference build.
+Use one test process on a real GPU so models do not compete for its memory. The real-model
+tests compare tokenization and logits with the llama.cpp build in `LLAMA_CPP`, which must support
+the model's architecture (Muse Glimmer needs llama.cpp `1b70350` or newer), and check tool calls,
+which need a tool-capable model. A module-scoped server keeps one copy of the model loaded while
+other tests load another: with a model over half the GPU's memory, run the test files one at a
+time. The logits comparison skips architectures without an agreement limit in
+`tests/test_model.py`, whose comments record the measurements behind each limit.
 
 ## Emulated AMD tests
 
@@ -52,7 +57,9 @@ PYTHONPATH=/tmp/leatengine-tinygrad DEV=MOCK+AMD uv run pytest -m gpu -n auto \
 ```
 
 The test harness installs a clang compiler adapter and isolates compilation caches per worker.
-This checks RDNA 3 kernel behavior in emulation; physical Strix Halo validation is separate.
+This checks RDNA 3 kernel behavior in emulation; physical Strix Halo validation is separate. The
+emulator skips decode attention over heads wider than 512 dimensions, which it computes wrongly;
+the [Strix Halo guide](strix-halo.md) covers that check.
 
 ## Continuous integration
 

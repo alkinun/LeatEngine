@@ -10,17 +10,17 @@ This document is a qualification procedure, not a claim of measured support or p
 |---|---|
 | CPU reference | Generated-model correctness tests |
 | AMD | Kernel and tiny-model tests on tinygrad's RDNA 3 emulator |
-| NVIDIA | Inherited RTX 3090 measurements in the benchmark document |
+| NVIDIA | GPU tests and real-model comparisons with llama.cpp on an RTX 3090 ([benchmarks](benchmarks.md)) |
 | Physical Strix Halo | Pending |
 
 The current kernels select their RDNA 3 path for architecture major 11. Whether this gives
 correct, efficient execution on `gfx1151` must be confirmed on the physical machine.
 
-Decode attention over heads wider than 512 dimensions, as GLM-4.7-Flash's multi-head latent
-attention uses (576), is skipped on the emulator: its compiled kernel uses more than 128 VGPRs,
-and the emulator misreads 16-bit operands in those registers. The same kernel passes on NVIDIA,
-and in the emulator when compiled within 128 VGPRs; `pytest -m gpu -k attention_groups` on the
-physical machine checks it.
+One check can only run there: decode attention over heads wider than 512 dimensions, the 576 of
+GLM-4.7-Flash's multi-head latent attention. Its kernel uses more than 128 VGPRs, and the
+emulator misreads 16-bit operands in those registers, so the emulator skips those cases. The same
+kernel passes on NVIDIA, and on the emulator when compiled within 128 VGPRs.
+`DEV=AMD uv run pytest -m gpu -k attention_groups` runs them on the physical machine.
 
 ## Prepare the host
 
