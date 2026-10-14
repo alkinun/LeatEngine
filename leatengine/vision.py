@@ -368,6 +368,10 @@ class Gemma4(Vision):
         tokens = [self.open, *[key] * (grid[0] * grid[1]), self.close]
         return Image(key, tokens, grid, pixels, positions)
 
+    @property
+    def typical(self) -> int:
+        return math.isqrt(self.tokens) ** 2  # the largest square of cells that fits: 256 of 280
+
 
 class Pixtral(Vision):
     """Mistral Small 3's: the image scaled, its aspect kept, to at most image_size a side and

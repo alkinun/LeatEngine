@@ -208,6 +208,15 @@ def test_encode_on_matrix_cores(tiny, tiny_mmproj):
     assert (cosine / np.linalg.norm(expected, axis=-1) > 0.999).all()
 
 
+@pytest.mark.parametrize("kind", FAMILIES)
+def test_typical_is_a_square_image(tiny, projectors, monkeypatch, kind):
+    # the embeddings a large square image takes, which the server tells clients: Gemma 4's
+    # budget, if not a square, holds a smaller square of cells
+    monkeypatch.setattr(vision, "IMAGE_TOKENS", 5)
+    v = engine(tiny, projectors(kind), kind)
+    assert v.vision is not None and v.vision.typical == v.image(png(64, 64)).size
+
+
 def test_image_bytes(tiny, tiny_mmproj):
     # an image's key is its bytes'; transparency lies over white, and EXIF turns it upright
     v = engine(tiny, tiny_mmproj)
