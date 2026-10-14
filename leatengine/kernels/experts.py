@@ -315,9 +315,7 @@ def per_head(x: Tensor, w: QTensor) -> Tensor:
         and on_matrix_cores(x)
         and matmul_fits(w.type, rows, cols)
     ):
-        # of the most tokens there may be: tinygrad fails to schedule a bound count's reshape
-        most = int(x.max_shape[1])
-        xt = tiled(x.pad_to(x.max_shape).reshape(1, most, heads * cols))
+        xt = tiled(x.reshape(1, tokens, heads * cols))
         count = int(xt.shape[0])
         # each pair's head, a buffer of data: of tinygrad's arange, a reduction, or a copy not yet
         # made, it fails to schedule the listing of a bound count of pairs
