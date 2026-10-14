@@ -7,6 +7,7 @@ GPUs run waves of 32 lanes, which are warps.
 import functools
 import math
 import re
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -373,6 +374,33 @@ def carry_all(t: Tensor, values: list[int | UOp]) -> tuple[Tensor, tuple[int | U
         t, value = carry(t, value)
         unbound.append(value)
     return t, tuple(unbound)
+
+
+# each kernel body tinygrad has canonicalized, and its canonical form: None where it is its own,
+# as a value that is its key would keep the key alive
+_CANONICAL: weakref.WeakKeyDictionary[UOp, UOp | None] = weakref.WeakKeyDictionary()
+
+
+def canonicalize_once() -> None:
+    """Makes tinygrad canonicalize each kernel's body once rather than at each call of it: a graph
+    calls the same few kernels layer after layer, and Llama 3.1 8B's warm-up canonicalized 89
+    bodies 3565 times, 7 of its 28 s on the 3090. The canonical body, its local buffers numbered
+    for the schedule cache, is the body's alone."""
+    import tinygrad.schedule as schedule
+
+    canonicalize = schedule.canonicalize_call_body
+    if hasattr(canonicalize, "__wrapped__"):  # already
+        return
+
+    @functools.wraps(canonicalize)
+    def once(call: UOp) -> UOp:
+        if (body := call.body) not in _CANONICAL:
+            canonical = canonicalize(call).body
+            _CANONICAL[body] = None if canonical is body else canonical
+        canonical = _CANONICAL[body]
+        return call if canonical is None else call.replace(src=(canonical, *call.src[1:]))
+
+    schedule.canonicalize_call_body = once  # type: ignore[assignment]
 
 
 def _grid_words() -> tuple[dict[GGMLType, int], list[int]]:

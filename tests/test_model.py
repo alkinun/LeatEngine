@@ -4,6 +4,7 @@ import subprocess
 import numpy as np
 import pytest
 from tinygrad import Tensor, UOp, dtypes
+from tinygrad.dtype import AddrSpace
 
 from leatengine import bench, ops
 from leatengine.engine import FEW_TOKENS, KEEP_BACK, Engine, graph
@@ -508,6 +509,24 @@ def test_graph_binds_kernel_variables():
     groups = VARIABLES["groups"].unbind()[0]
     replayed = graph(lambda x: (x + Tensor.arange(8).float()[: groups.bind(4)].sum()).realize())
     assert [replayed(Tensor([1.0])).item() for _ in range(3)] == [7.0] * 3
+
+
+def test_kernel_bodies_canonicalized_once():
+    # tinygrad canonicalizes a call's body when it schedules it, numbering its local buffers: the
+    # calls of one body share the form tinygrad's own function gives, worked out once
+    import tinygrad.schedule as schedule
+
+    from leatengine.kernels.common import _CANONICAL
+
+    local = UOp.alloc((4,), dtypes.float32, addrspace=AddrSpace.LOCAL)
+    body = UOp.sink(local.index(UOp.const(0, dtypes.int32)).store(UOp.const(1.0, dtypes.float32)))
+    calls = [body.call(UOp.variable(name, 0, 9)) for name in "ab"]
+    canonical = [schedule.canonicalize_call_body(c) for c in calls]
+    own = [schedule.canonicalize_call_body.__wrapped__(c) for c in calls]
+    assert all(c is o for c, o in zip(canonical, own, strict=True)) and body in _CANONICAL
+    assert canonical[0].body is canonical[1].body is not body
+    plain = UOp.sink(UOp.const(1.0, dtypes.float32)).call(UOp.variable("a", 0, 9))
+    assert schedule.canonicalize_call_body(plain) is plain and _CANONICAL[plain.body] is None
 
 
 def test_one_generation_at_a_time(tiny_model):
