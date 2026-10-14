@@ -744,7 +744,13 @@ def test_start_needs_a_free_slot(tiny_model):
 # on 93.5% of top tokens, and leatengine scores 0.051 and 0.066 against the newer one. Unsloth's
 # 3-bit quantizations of Qwen3 30B A3B, of Q3_K and of IQ3_XXS and IQ3_S, score 0.0048 to 0.0060
 # and 96.5 to 97% over 8 chunks, where llama.cpp's CPU backend scores 0.0087 to 0.0098 and 96.0%
-# against its CUDA one.
+# against its CUDA one. 2-bit files pick their top token among closer candidates still, and get
+# twice their architecture's KL: UD-IQ2_XXS, of IQ2_XXS, IQ2_XS and IQ2_S, scores 0.0052 to 0.0054
+# and 96.3 to 96.8% over 8 chunks, where llama.cpp's CPU backend scores 0.0105 and 95.2% against
+# its CUDA one; UD-Q2_K_XL scores 0.0086 and 97% over 8 chunks and 0.011 over the 4 here, more
+# than half of it at one token: a digit llama.cpp's CUDA backend gives 94%, which its CPU backend
+# and leatengine all but rule out, at a KL of 5.7 and 6.7 from it.
+TWO_BIT = {10, 19, 20, 21, 28, 29}  # general.file_type: Q2_K, IQ2_XXS, IQ2_XS, Q2_K_S, IQ2_S, IQ2_M
 LIMITS = {
     "llama": (0.0015, 0.975), "qwen2": (0.0045, 0.97), "qwen3": (0.0035, 0.97),
     "qwen3moe": (0.007, 0.96), "qwen35": (0.003, 0.975), "qwen35moe": (0.01, 0.965),
@@ -768,6 +774,8 @@ def test_matches_llama_cpp(model_path, llama_cpp, wikitext, tmp_path, decode):
     quality = bench.kl_divergence(engine, base, decode=decode)
     del engine  # a failure's traceback would hold the model on the GPU through the next tests
     kl, top1 = limits
+    if metadata.get("general.file_type") in TWO_BIT:
+        kl *= 2
     assert quality.kl_mean is not None and quality.kl_mean < kl
     assert quality.top1 is not None and quality.top1 > top1
 
