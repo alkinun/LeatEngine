@@ -688,7 +688,8 @@ def test_start_needs_a_free_slot(tiny_model):
 # scores 0.039 and 90.7% against its CUDA one, and leatengine 0.047 and 90.4% against its CPU one,
 # its perplexity no higher. GLM-4.7-Flash, of multi-head latent attention, scores 0.0076 and 96.1%
 # on the prompt's path and 0.011 and 96.6% on the decode path over 7 chunks, where llama.cpp's CPU
-# backend scores 0.0088 against its CUDA one; its 8th chunk is one the model scores badly on every
+# backend scores 0.0088 against its CUDA one; with each head's projections on the int8 kernels too,
+# 0.011 and 0.012. Its 8th chunk is one the model scores badly on every
 # backend, a perplexity of thousands, and wherever it rounds differently. Muse Glimmer 30B, dense,
 # scores 0.0021 and 98.9% on the prompt's path and 98.4% on the decode path over 8 chunks.
 LIMITS = {

@@ -37,15 +37,13 @@ scale, the last column gives llama.cpp's own CPU backend against its CUDA one, o
 |---|---:|---:|---:|---:|---:|---:|
 | Mellum 2.1 12B A2.5B Thinking | 7790 | 8126 | 294 | 311 | 0.0078, 95.8% | 0.0095 |
 | LFM2.5 24B A2B | 5998 | 5135 | 280 | 292 | 0.051, 89.9% | 0.039, 90.7% |
-| GLM-4.7-Flash, 7 chunks | 3733 | 1088 | 151 | 98 | 0.0076, 96.1% | 0.0088 |
+| GLM-4.7-Flash, 7 chunks | 3733 | 2419 | 151 | 137 | 0.011, 96.2% | 0.0088 |
 | Muse Glimmer 30B | 1631 | 1384 | 45.1 | 46.9 | 0.0021, 98.9% | |
 
 LFM2.5's short convolutions multiply three outputs of one projection, which makes it unusually
 sensitive to rounding on every backend; its prefill trails llama.cpp in the int8 matrix kernels'
 handling of its small per-expert batches. GLM-4.7-Flash's 8th chunk scores a perplexity in the
-thousands on every backend, where they diverge, so its row covers the first 7; its multi-head
-latent attention takes plain tinygrad ops for each head's projections into and out of the
-compressed dimensions, which its speed shows.
+thousands on every backend, where they diverge, so its row covers the first 7.
 
 ## Inherited RTX 3090 results
 

@@ -265,14 +265,19 @@ def test_route_sigmoid(normalize, scale):
 # multi-head latent attention's projections of each head, GLM-4.7-Flash's: queries into the
 # compressed dimensions, and the compressed values out of them; a few tokens, and a bound number
 @pytest.mark.parametrize("rows, cols", [(512, 192), (256, 512)])
-@pytest.mark.parametrize("tokens", [1, 5, UOp.variable("tokens", 1, 16).bind(9)])
+@pytest.mark.parametrize(
+    "tokens", [1, 5, UOp.variable("tokens", 1, 16).bind(9), 40, UOp.variable("t", 1, 64).bind(33)]
+)
 def test_per_head(rows, cols, tokens):
     rng = np.random.default_rng(rows + cols)
     heads = 20
     w, blocks = random_experts(Q8_0, heads, rows, cols, rng)
+    assert kernels.supports_per_head(Tensor.empty(1, tokens, heads, cols), w)
     n = tokens if isinstance(tokens, int) else tokens.unbind()[1]
-    x = rng.standard_normal((1, 16, heads, cols)).astype(np.float32)
-    got = kernels.per_head(Tensor(x)[:, :tokens], w).pad_to((1, 16, heads, rows)).numpy()[0, :n]
+    most = 64
+    x = rng.standard_normal((1, most, heads, cols)).astype(np.float32)
+    out = kernels.per_head(Tensor(x)[:, :tokens], w)
+    got = out.pad_to(out.max_shape).numpy()[0, :n]
     for h in range(heads):
         expected = reference_matmul(x[0, :n, h], blocks[h], Q8_0)
         assert_close(got[:, h], expected, 1e-4)

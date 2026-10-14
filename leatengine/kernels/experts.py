@@ -297,18 +297,36 @@ def _experts_down_kernel(
 
 
 def supports_per_head(x: Tensor, w: QTensor) -> bool:
-    # the matrix-vector kernels' units of 64 weights, of one sequence's rows
+    # the matrix-vector kernels' units of 64 weights, of a batch of one sequence's (1, T, H, cols)
     _, rows, cols = w.shape
-    return on_gpu(x) and one_sequence(x) and w.type in DOTS and cols % 64 == 0 and rows % 64 == 0
+    one = isinstance(x.shape[0], int) and x.shape[0] == 1
+    return on_gpu(x) and one and w.type in DOTS and cols % 64 == 0 and rows % 64 == 0
 
 
 def per_head(x: Tensor, w: QTensor) -> Tensor:
     """Each head's rows x (1, T, H, cols) times its own matrix of a stack w (H, rows, cols), as
     multi-head latent attention takes its heads into and out of its compressed dimensions:
-    (1, T, H, rows). Each (token, head) row is a pair of the experts' down-projection kernel,
-    routed to its head's matrix with a weight of 1."""
-    _, tokens, heads, cols = x.shape
-    rows, count = int(w.shape[1]), int(x.max_shape[1]) * heads
+    (1, T, H, rows). Each (token, head) row is a pair routed to its head's matrix, as a token's
+    to an expert: for a few tokens, through the experts' down-projection kernel with a weight
+    of 1, and for more, on tensor cores, each head's pairs listed as an expert's."""
+    tokens, heads, cols, rows = x.shape[1], int(x.shape[2]), int(x.shape[3]), int(w.shape[1])
+    if (
+        int(x.max_shape[1]) > MATVEC_TOKENS
+        and on_matrix_cores(x)
+        and matmul_fits(w.type, rows, cols)
+    ):
+        # of the most tokens there may be: tinygrad fails to schedule a bound count's reshape
+        most = int(x.max_shape[1])
+        xt = tiled(x.pad_to(x.max_shape).reshape(1, most, heads * cols))
+        count = int(xt.shape[0])
+        # each pair's head, a buffer of data: of tinygrad's arange, a reduction, or a copy not yet
+        # made, it fails to schedule the listing of a bound count of pairs
+        ids = Tensor(list(range(heads)) * count, dtype=dtypes.int32, device=x.device).realize()
+        order, listed = _bucket(ids, heads, count, tokens * heads)
+        q8 = quantize_q8(xt.reshape(count * heads, cols), rows=tokens * heads)
+        out = routed_products(q8, tokens, (w,), order, listed, heads, False)
+        return out.reshape(count, heads, rows)[:tokens].reshape(1, tokens, heads, rows)
+    count = int(x.max_shape[1]) * heads
     pairs = x.reshape(tokens * heads, cols).float().pad_to((count, cols)).contiguous()
     xq, xd, xs = quantize_q8(pairs, rows=tokens * heads)
     ids = Tensor.arange(heads, dtype=dtypes.int32).to(x.device).repeat(count // heads)
