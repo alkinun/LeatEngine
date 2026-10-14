@@ -379,6 +379,7 @@ def _iq_dot(
     return dot
 
 
+# each type's dot products, of the weights, the IQ grids, xq, xd and xs for rows of `cols`
 DOTS: dict[GGMLType, Callable[[UOp, UOp, UOp, UOp, UOp, int], Dot]] = {
     GGMLType.Q4_K: functools.partial(_k_dot, high=False),
     GGMLType.Q5_K: functools.partial(_k_dot, high=True),
