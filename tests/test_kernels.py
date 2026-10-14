@@ -17,12 +17,13 @@ from tests.helpers import cuts, glu, random_blocks
 pytestmark = [pytest.mark.gpu]
 MATRIX_CORES = os.environ.get("DEV", "").split(":")[0] in ("NV", "CUDA", "AMD", "MOCK+AMD")
 matrix_cores = pytest.mark.skipif(not MATRIX_CORES, reason="tensor-core kernels need a GPU of them")
-Q4_K, Q5_K, Q6_K, Q5_0, Q8_0, MXFP4 = (
-    GGMLType[t] for t in ("Q4_K", "Q5_K", "Q6_K", "Q5_0", "Q8_0", "MXFP4")
+Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q5_0, Q8_0, MXFP4 = (
+    GGMLType[t] for t in ("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q5_0", "Q8_0", "MXFP4")
 )
 # the matrix-vector kernels' other types
 OTHER = [GGMLType[t] for t in ("Q4_0", "Q4_1", "Q5_1", "IQ4_NL", "IQ4_XS", "Q2_K", "Q3_K")]
-TILED = [GGMLType[t] for t in ("Q4_0", "IQ4_NL", "IQ4_XS")]  # of those, the tensor cores' too
+# of those, the tensor cores' too
+TILED = [GGMLType[t] for t in ("Q4_0", "IQ4_NL", "IQ4_XS", "Q2_K", "Q3_K")]
 
 
 def quantize_q8(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -323,13 +324,14 @@ def expected_mixture(normed: np.ndarray, scores: np.ndarray, used: int, expert) 
     "tokens", [1, 3, 70, UOp.variable("tokens", 1, 128).bind(37), 128, SHORT[1]]
 )
 @pytest.mark.parametrize("favored", [0, 3])
-def test_mixture(tokens, favored):
+@pytest.mark.parametrize("types", [(Q4_K, Q6_K), (Q2_K, Q3_K)])  # gate and up's, and down's
+def test_mixture(tokens, favored, types):
     rng = np.random.default_rng(15)
     experts, used, dim, hidden = 32, 4, 512, 768
     (gate, gate_blocks), (up, up_blocks) = (
-        random_experts(Q4_K, experts, hidden, dim, rng) for _ in "gu"
+        random_experts(types[0], experts, hidden, dim, rng) for _ in "gu"
     )
-    down, down_blocks = random_experts(Q6_K, experts, dim, hidden, rng)
+    down, down_blocks = random_experts(types[1], experts, dim, hidden, rng)
     x = (rng.standard_normal((1, 128, dim)) * 3).astype(np.float32)
     scores = rng.standard_normal((1, 128, experts)).astype(np.float32)
     scores[..., :favored] += 4
@@ -341,8 +343,8 @@ def test_mixture(tokens, favored):
     got = got.pad_to((1, 128, dim)).numpy()[0, :n]
 
     def expert(e, row):
-        g, u = (reference_matmul(row, b[e], Q4_K) for b in (gate_blocks, up_blocks))
-        return reference_matmul(glu("silu", g, u).astype(np.float32), down_blocks[e], Q6_K)
+        g, u = (reference_matmul(row, b[e], types[0]) for b in (gate_blocks, up_blocks))
+        return reference_matmul(glu("silu", g, u).astype(np.float32), down_blocks[e], types[1])
 
     normed = rms_norm(x[0, :n], weight, 1e-5)
     assert_close(got, x[0, :n] + expected_mixture(normed, scores[0, :n], used, expert), 2e-3)

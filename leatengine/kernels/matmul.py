@@ -30,6 +30,7 @@ from leatengine.kernels.common import (
     at_least,
     carry,
     compute_units,
+    dp4a,
     e8m0_half,
     f16,
     fifth_bits,
@@ -226,8 +227,9 @@ class _Stack:
 # A weight type's part of the kernel: its shared buffers, `fetch` of a step's words into
 # registers and `put` of them into the buffers, `word` w of 8 of a row's group s, as int8, and
 # `scaled`, a sum so far plus a row's int32 products of group s with a token, of its 32 weights or,
-# for `halves`, each 16, given the token's d and d * sum(q): written so that the compiler fuses the
-# additions into multiply-adds.
+# for `halves`, each 16, given the token's d and sums d * sum(q): of the group's 32 values and, for
+# `half_sums`, of its first 16 too. Written so that the compiler fuses the additions into
+# multiply-adds.
 
 
 class _Q4KTile:
@@ -235,7 +237,7 @@ class _Q4KTile:
     and mins, which get_scale_min_k4 takes from the block's 12 scale bytes."""
 
     max_rows, block = 256, 256  # rows per tile at most, for shared memory; weights per block
-    halves = False
+    halves = half_sums = False
 
     def __init__(self, rows: int, tid: UOp, cols: int):
         self.rows, self.tid = rows, tid
@@ -284,11 +286,13 @@ class _Q4KTile:
 
     @staticmethod
     def scaled(
-        bufs: list[UOp], s: UOp, row: UOp, c: list[UOp], xd: UOp, xs: UOp, acc: UOp
+        bufs: list[UOp], s: UOp, row: UOp, c: list[UOp], xd: UOp, xs: list[UOp], acc: UOp
     ) -> UOp:  # fmt: skip
         # c * d * scale - dmin * min * xs, of a K-quant with mins
         scales = bufs[1]
-        return acc + c[0].float() * (scales[0, s, row].load() * xd) - scales[1, s, row].load() * xs
+        return (
+            acc + c[0].float() * (scales[0, s, row].load() * xd) - scales[1, s, row].load() * xs[0]
+        )
 
 
 class _Q5KTile(_Q4KTile):
@@ -337,7 +341,7 @@ class _Q6KTile:
     with the row instead keeps a fragment's 8 rows in different banks."""
 
     max_rows, block = 256, 256
-    halves = True  # a scale per 16 weights
+    halves, half_sums = True, False  # a scale per 16 weights
 
     def __init__(self, rows: int, tid: UOp, cols: int):
         self.rows, self.tid = rows, tid
@@ -378,7 +382,7 @@ class _Q6KTile:
 
     @staticmethod
     def scaled(
-        bufs: list[UOp], s: UOp, row: UOp, c: list[UOp], xd: UOp, xs: UOp, acc: UOp
+        bufs: list[UOp], s: UOp, row: UOp, c: list[UOp], xd: UOp, xs: list[UOp], acc: UOp
     ) -> UOp:  # fmt: skip
         # each half's products by its scale, combined in int32
         _, scales, d = bufs
@@ -387,12 +391,93 @@ class _Q6KTile:
         return acc + (c[0] * sc[0] + c[1] * sc[1]).float() * (d[row].load() * xd)
 
 
+class _Q3KTile(_Q6KTile):
+    """Q3_K weights, half a block per step, unpacked to int8 as in matvec's _low_k_dot: Q6_K's
+    layout, with the half's 8 scales, less 32, packed as Q6_K's are."""
+
+    def fetch(self, stack: _Stack, step: UOp) -> list[UOp]:
+        # for each of the thread's (row, word) pairs, the words of 2-bit values and of high bits
+        # behind it; then the 12 scale bytes and d of its row
+        words, block, half = [], step // 2 * 55, 16 * (step % 2)
+        for i in range(8):
+            row, m = (i * self.rows + self.tid) // 8, (i * self.rows + self.tid) % 8
+            values, high = block + 16 + half + 2 * m, block + 2 * m
+            words += [stack.word16(row, values), stack.word16(row, high)]
+        words += [stack.word16(self.tid, block + 48 + 2 * j) for j in range(3)]
+        return words + [stack.load(self.tid, block + 54).cast(dtypes.uint32)]
+
+    def put(self, bufs: list[UOp], step: UOp, words: list[UOp]) -> list[UOp]:
+        quants, scales, d = bufs
+        n = (4 * (step % 2)).cast(dtypes.uint32)  # the half's first bit of high bits and of scales
+        stores = []
+        for i in range(8):
+            row, m = (i * self.rows + self.tid) // 8, (i * self.rows + self.tid) % 8
+            values, high = words[2 * i : 2 * i + 2]
+            for k in range(4):
+                q = ((values >> (2 * k)) & 0x03030303) | (((high >> (n + k)) & 0x01010101) << 2)
+                stores.append(quants[row, _swizzle(row, 8 * k + m)].store(minus(q, 4)))
+        # scales 8n + t: nibble n of byte t of the first 8, bits 2(2n + t // 4) of byte 8 + t % 4
+        lows, highs = words[16:18], words[18]
+        for j in range(2):
+            six = ((lows[j] >> n) & 0x0F0F0F0F) | (((highs >> (n + 2 * j)) & 0x03030303) << 4)
+            stores.append(scales[j, self.tid].store(minus(six, 32).bitcast(dtypes.uint32)))
+        return stores + [d[self.tid].store(f16(words[-1]))]
+
+
+class _Q2KTile(_Q6KTile):
+    """Q2_K weights, half a block per step: its values, unsigned, in Q6_K's layout, its 8 bytes of
+    a scale and a min each, and d and dmin. The mins take the sums of each 16 activations."""
+
+    half_sums = True
+
+    def __init__(self, rows: int, tid: UOp, cols: int):
+        self.rows, self.tid = rows, tid
+        self.quants = UOp.alloc((rows, 32), dtypes.int32, addrspace=AddrSpace.LOCAL)
+        self.scales = UOp.alloc((2, rows), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+        self.d = UOp.alloc((2, rows), dtypes.float32, addrspace=AddrSpace.LOCAL)
+
+    def fetch(self, stack: _Stack, step: UOp) -> list[UOp]:
+        # the thread's words of the step's values; then the half's 8 scale bytes and d and dmin
+        # of its row
+        words, block = [], step // 2 * 21
+        for i in range(8):
+            row, m = (i * self.rows + self.tid) // 8, (i * self.rows + self.tid) % 8
+            words.append(stack.load(row, block + 4 + 8 * (step % 2) + m))
+        words += [stack.load(self.tid, block + 2 * (step % 2) + j) for j in range(2)]
+        return words + [stack.load(self.tid, block + 20)]
+
+    def put(self, bufs: list[UOp], step: UOp, words: list[UOp]) -> list[UOp]:
+        quants, scales, d = bufs
+        stores = []
+        for i in range(8):
+            row, m = (i * self.rows + self.tid) // 8, (i * self.rows + self.tid) % 8
+            for k in range(4):
+                q = ((words[i] >> (2 * k)) & 0x03030303).bitcast(dtypes.int32)
+                stores.append(quants[row, _swizzle(row, 8 * k + m)].store(q))
+        stores += [scales[j, self.tid].store(words[8 + j]) for j in range(2)]
+        dm = words[-1]
+        return stores + [d[0, self.tid].store(f16(dm)), d[1, self.tid].store(f16(dm >> 16))]
+
+    @staticmethod
+    def scaled(
+        bufs: list[UOp], s: UOp, row: UOp, c: list[UOp], xd: UOp, xs: list[UOp], acc: UOp
+    ) -> UOp:  # fmt: skip
+        # each half's products by its scale, less dmin times each half's min by its sum
+        _, scales, d = bufs
+        packed = scales[s // 2, row].load()  # the bytes of groups 2s and 2s + 1
+        both = [(packed >> (16 * (s % 2) + 8 * h).cast(dtypes.uint32)) for h in range(2)]
+        sc, mn = [(b & 15).cast(dtypes.int32) for b in both], [(b >> 4) & 15 for b in both]
+        products = (c[0] * sc[0] + c[1] * sc[1]).float() * (d[0, row].load() * xd)
+        mins = mn[0].float() * xs[1] + mn[1].float() * (xs[0] - xs[1])
+        return acc + products - d[1, row].load() * mins
+
+
 class _Q80Tile:
     """Q8_0 weights, 4 blocks per step: 32 words of int8 per row, swizzled as for Q6_K, and the 4
     blocks' d. Rows of whole blocks but not whole steps read zeros past their end."""
 
     max_rows, block, words = 256, 32, 17  # weights and halfwords per block
-    halves = False
+    halves = half_sums = False
 
     def __init__(self, rows: int, tid: UOp, cols: int):
         self.rows, self.tid = rows, tid
@@ -447,7 +532,7 @@ class _Q80Tile:
 
     @staticmethod
     def scaled(
-        bufs: list[UOp], s: UOp, row: UOp, c: list[UOp], xd: UOp, xs: UOp, acc: UOp
+        bufs: list[UOp], s: UOp, row: UOp, c: list[UOp], xd: UOp, xs: list[UOp], acc: UOp
     ) -> UOp:  # fmt: skip
         return acc + c[0].float() * (bufs[1][s, row].load() * xd)
 
@@ -592,9 +677,10 @@ class _MXFP4Tile(_Q80Tile):
 
 
 _TILES: dict[GGMLType, type[_Q4KTile] | type[_Q6KTile] | type[_Q80Tile]] = {
-    GGMLType.Q4_K: _Q4KTile, GGMLType.Q5_K: _Q5KTile, GGMLType.Q6_K: _Q6KTile,
-    GGMLType.Q5_0: _Q50Tile, GGMLType.Q8_0: _Q80Tile, GGMLType.MXFP4: _MXFP4Tile,
-    GGMLType.Q4_0: _Q40Tile, GGMLType.IQ4_NL: _IQ4NLTile, GGMLType.IQ4_XS: _IQ4XSTile,
+    GGMLType.Q2_K: _Q2KTile, GGMLType.Q3_K: _Q3KTile, GGMLType.Q4_K: _Q4KTile,
+    GGMLType.Q5_K: _Q5KTile, GGMLType.Q6_K: _Q6KTile, GGMLType.Q5_0: _Q50Tile,
+    GGMLType.Q8_0: _Q80Tile, GGMLType.MXFP4: _MXFP4Tile, GGMLType.Q4_0: _Q40Tile,
+    GGMLType.IQ4_NL: _IQ4NLTile, GGMLType.IQ4_XS: _IQ4XSTile,
 }  # fmt: skip
 
 
@@ -714,9 +800,11 @@ def _matmul_kernel(
     weights = _TILES[ggml_type](rows, tid, cols)
     # the first rows of the warp's two subtiles of 16 rows, within the tile
     firsts = [warp * 16 + mi * out_rows if gated else warp * WARP_ROWS + mi * 16 for mi in (0, 1)]
-    # the tile's tokens for a step: 32 words each, and the d and d * sum(q) of 4 groups
+    # the tile's tokens for a step: 32 words each, and the d and sums of 4 groups, as `scaled`
+    # takes them
+    sums = 2 if weights.half_sums else 1
     act = UOp.alloc((tile_tokens, 32 + 4), dtypes.int32, addrspace=AddrSpace.LOCAL)
-    act_scales = UOp.alloc((2, 4, tile_tokens), dtypes.float32, addrspace=AddrSpace.LOCAL)
+    act_scales = UOp.alloc((1 + sums, 4, tile_tokens), dtypes.float32, addrspace=AddrSpace.LOCAL)
 
     pairs = [_split(i, 32) for i in turns(32 * tile_tokens, threads, tid)]
     groups = [_split(i, tile_tokens) for i in turns(4 * tile_tokens, threads, tid)]
@@ -732,19 +820,31 @@ def _matmul_kernel(
             at = source(token0, tok) * (cols // GROUP) + step * 4 + grp
             at = at.valid(step * 4 + grp < cols // GROUP) if ragged else at
             words += [xd[at].load().bitcast(dtypes.uint32), xs[at].load().bitcast(dtypes.uint32)]
+            if weights.half_sums:  # and the group's first 4 words, which put sums
+                first = source(token0, tok) * (cols // 4) + (step * 4 + grp) * 8
+                for w in range(4):
+                    at = first + w
+                    at = at.valid(step * 4 + grp < cols // GROUP) if ragged else at
+                    words.append(xq[at].load().bitcast(dtypes.uint32))
         return words
 
     def put(bufs: list[UOp], step: UOp, words: list[UOp]) -> list[UOp]:  # and to shared memory
         *mine, act, act_scales = bufs
-        theirs = len(words) - len(pairs) - 2 * len(groups)
+        per = 6 if weights.half_sums else 2  # words fetched per group
+        theirs = len(words) - len(pairs) - per * len(groups)
         stores = weights.put(mine, step, words[:theirs])
         quants, scales = words[theirs : theirs + len(pairs)], words[theirs + len(pairs) :]
         for (tok, word), value in zip(pairs, quants, strict=True):
             stores.append(act[tok, word].store(value.bitcast(dtypes.int32)))
         for k, (grp, tok) in enumerate(groups):
-            for j in (0, 1):
-                value = scales[2 * k + j].bitcast(dtypes.float32)
-                stores.append(act_scales[j, grp, tok].store(value))
+            xd, *rest = scales[per * k : per * (k + 1)]
+            values = [xd.bitcast(dtypes.float32), rest[0].bitcast(dtypes.float32)]
+            if weights.half_sums:
+                low = UOp.const(0, dtypes.int32)
+                for word in rest[1:]:
+                    low = dp4a(UOp.const(0x01010101, dtypes.int32), word.bitcast(dtypes.int32), low)
+                values.append(values[0] * low.float())
+            stores += [act_scales[j, grp, tok].store(v) for j, v in enumerate(values)]
         return stores
 
     # The first step before the loop; in each step, the fetch of the next is staged in registers
@@ -782,9 +882,9 @@ def _matmul_kernel(
             c = frags.dot(a, b, weights.halves)
             for e in range(per_lane):
                 row, token = first + frags.row(e), tok + frags.token(e)
-                xd, xs = (act_scales[k, s, token].load() for k in (0, 1))
-                total = prev[len(vals)].load()
-                vals.append(weights.scaled(mine, s, row, [h[e] for h in c], xd, xs, total))
+                token_d, *token_sums = (act_scales[k, s, token].load() for k in range(1 + sums))
+                total, products = prev[len(vals)].load(), [h[e] for h in c]
+                vals.append(weights.scaled(mine, s, row, products, token_d, token_sums, total))
     computed = acc.store(UOp.stack(*vals)).end(s)
     # every warp is done with this step's tiles before they are overwritten
     done = UOp(Ops.BARRIER, src=(computed,))
