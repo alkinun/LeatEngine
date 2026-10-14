@@ -296,6 +296,32 @@ def _experts_down_kernel(
     return rows_kernel(out, used * units, name, [mixed], combine, tokens * rows, order=order)
 
 
+def supports_per_head(x: Tensor, w: QTensor) -> bool:
+    # the matrix-vector kernels' units of 64 weights, of one sequence's rows
+    _, rows, cols = w.shape
+    return on_gpu(x) and one_sequence(x) and w.type in DOTS and cols % 64 == 0 and rows % 64 == 0
+
+
+def per_head(x: Tensor, w: QTensor) -> Tensor:
+    """Each head's rows x (1, T, H, cols) times its own matrix of a stack w (H, rows, cols), as
+    multi-head latent attention takes its heads into and out of its compressed dimensions:
+    (1, T, H, rows). Each (token, head) row is a pair of the experts' down-projection kernel,
+    routed to its head's matrix with a weight of 1."""
+    _, tokens, heads, cols = x.shape
+    rows, count = int(w.shape[1]), int(x.max_shape[1]) * heads
+    pairs = x.reshape(tokens * heads, cols).float().pad_to((count, cols)).contiguous()
+    xq, xd, xs = quantize_q8(pairs, rows=tokens * heads)
+    ids = Tensor.arange(heads, dtype=dtypes.int32).to(x.device).repeat(count // heads)
+    weights = Tensor.ones(count, dtype=dtypes.float32, device=x.device).contiguous()
+    out = Tensor.empty(count * rows, dtype=dtypes.float32, device=x.device)
+    xq, bound = carry(xq, tokens * heads)
+    meta = (w.type, cols, rows, 1, False, False, False)
+    fxn = functools.partial(_experts_down_kernel, tokens=bound, meta=meta)
+    out = Tensor.custom_kernel(out, storage_words(w), xq, xd, xs, ids.contiguous(), weights,
+                               fxn=fxn)[0]  # fmt: skip
+    return out.reshape(count // heads, heads, rows)[:tokens].reshape(1, tokens, heads, rows)
+
+
 def _together(groups: int | UOp, rows: int) -> Callable[[UOp], UOp] | None:
     # the row each warp takes of `groups` groups of `rows` rows each, the first TOGETHER rows of
     # every group, then the next TOGETHER: where several groups read rows of the same expert, as

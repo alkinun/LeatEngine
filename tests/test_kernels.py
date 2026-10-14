@@ -262,6 +262,22 @@ def test_route_sigmoid(normalize, scale):
     np.testing.assert_allclose(ref_weights.numpy(), expected, rtol=1e-5)
 
 
+# multi-head latent attention's projections of each head, GLM-4.7-Flash's: queries into the
+# compressed dimensions, and the compressed values out of them; a few tokens, and a bound number
+@pytest.mark.parametrize("rows, cols", [(512, 192), (256, 512)])
+@pytest.mark.parametrize("tokens", [1, 5, UOp.variable("tokens", 1, 16).bind(9)])
+def test_per_head(rows, cols, tokens):
+    rng = np.random.default_rng(rows + cols)
+    heads = 20
+    w, blocks = random_experts(Q8_0, heads, rows, cols, rng)
+    n = tokens if isinstance(tokens, int) else tokens.unbind()[1]
+    x = rng.standard_normal((1, 16, heads, cols)).astype(np.float32)
+    got = kernels.per_head(Tensor(x)[:, :tokens], w).pad_to((1, 16, heads, rows)).numpy()[0, :n]
+    for h in range(heads):
+        expected = reference_matmul(x[0, :n, h], blocks[h], Q8_0)
+        assert_close(got[:, h], expected, 1e-4)
+
+
 def test_route_distinct():
     # distinct experts, though a token scores fewer than it takes: the rest, of -inf or NaN, with
     # no weight

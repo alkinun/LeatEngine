@@ -639,8 +639,7 @@ class Transformer:
         q = q.reshape(B, T, c.n_heads, mla.nope + mla.rope)
         q_nope, q_rope = q[..., : mla.nope], q[..., mla.nope :]
         # each head's dimensions that RoPE leaves, taken into the compressed ones: (B, T, H, kv)
-        k_b = w["attn_k_b"].dequant()  # (H, kv_rank, nope)
-        absorbed = (q_nope.transpose(1, 2) @ k_b.transpose(1, 2)).transpose(1, 2)
+        absorbed = ops.per_head(q_nope, w["attn_k_b"])  # attn_k_b (H, kv_rank, nope)
         compressed = ops.rms_norm(kv[..., : mla.kv_rank], s["attn_kv_a_norm"], eps)
         k = kv[..., mla.kv_rank :].cat(compressed, dim=-1).reshape(B, T, 1, -1)
         q = q_rope.cat(absorbed, dim=-1)
@@ -657,9 +656,8 @@ class Transformer:
         assert mla is not None
         B, T, _ = out.shape
         compressed = out.reshape(B, T, c.n_heads, -1)[..., mla.rope :]
-        v_b = self.layers[i]["attn_v_b"].dequant()  # (H, v_dim, kv_rank)
-        values = compressed.transpose(1, 2) @ v_b.transpose(1, 2)  # (B, H, T, v_dim)
-        return values.transpose(1, 2).reshape(B, T, c.n_heads * mla.v_dim)
+        values = ops.per_head(compressed, self.layers[i]["attn_v_b"])  # (H, v_dim, kv_rank)
+        return values.reshape(B, T, c.n_heads * mla.v_dim)
 
     def _cache(self, i: int) -> Tensor:
         cache = self.cache[i]

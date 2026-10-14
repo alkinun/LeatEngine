@@ -18,7 +18,15 @@ from leatengine.kernels.attention import (
 from leatengine.kernels.common import GROUP, on_matrix_cores
 from leatengine.kernels.cutoff import cutoff, supports_cutoff
 from leatengine.kernels.delta import delta_net, supports_delta_net
-from leatengine.kernels.experts import mixture, route, scores, supports_mixture, supports_scores
+from leatengine.kernels.experts import (
+    mixture,
+    per_head,
+    route,
+    scores,
+    supports_mixture,
+    supports_per_head,
+    supports_scores,
+)
 from leatengine.kernels.matmul import (
     FEW_TOKENS,
     STEP,
@@ -38,8 +46,8 @@ VARIABLES = {"groups": STEP_GROUPS.bind(STEP // GROUP)}
 __all__ = [
     "FEW_TOKENS", "GROUP", "MATVEC_TOKENS", "VARIABLES", "add_normed", "argmax", "attention",
     "cutoff", "delta_net", "feed_forward", "flash_attention", "matmuls", "matvecs", "mixture",
-    "on_matrix_cores", "quantize_q8", "rotate", "route", "scores", "supports_add_normed",
-    "supports_argmax", "supports_attention", "supports_cutoff", "supports_delta_net",
-    "supports_flash_attention", "supports_matmul", "supports_matvec", "supports_mixture",
-    "supports_rotate", "supports_scores", "swiglu",
+    "on_matrix_cores", "per_head", "quantize_q8", "rotate", "route", "scores",
+    "supports_add_normed", "supports_argmax", "supports_attention", "supports_cutoff",
+    "supports_delta_net", "supports_flash_attention", "supports_matmul", "supports_matvec",
+    "supports_mixture", "supports_per_head", "supports_rotate", "supports_scores", "swiglu",
 ]  # fmt: skip

@@ -139,6 +139,14 @@ def _routed(scores: Tensor, used: int, routing: Routing) -> tuple[Tensor, Tensor
     return experts, weights if routing.scale == 1 else weights * routing.scale
 
 
+def per_head(x: Tensor, w: QTensor) -> Tensor:
+    # each head's rows x (B, T, H, cols) times its own matrix of the stack w (H, rows, cols):
+    # (B, T, H, rows), as multi-head latent attention's projections of each head
+    if _fast() and kernels.supports_per_head(x, w):
+        return kernels.per_head(x, w)
+    return (x.transpose(1, 2) @ w.dequant().transpose(1, 2)).transpose(1, 2)
+
+
 def _every_expert(
     n: Tensor, each: Tensor, gate: QTensor, up: QTensor | None, down: QTensor, kind: str,
     biases: tuple[Tensor, Tensor, Tensor] | None,
