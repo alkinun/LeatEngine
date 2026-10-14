@@ -106,12 +106,12 @@ DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp /path/to/
   greedily or with `--recommended` sampling, as a drafter guesses them in use.
 - `perplexity --kl-base` compares with a file written by `llama-perplexity --kl-divergence-base`;
   add `--decode` for the decode path and `--chunks N` to score fewer chunks.
-- `scripts/validate_hardware.py` runs the GPU tests, speed against llama.cpp, draft comparisons
-  and a streamed HTTP request, and writes a report under the ignored `reports/` directory.
-  `--quick` runs fewer repetitions and skips the batched and draft runs; `--no-tests` skips the
-  GPU tests. Its process exit status is not a verdict: read the failures in its report. Its
-  batched comparison uses different prompt lengths for the two engines, so treat it as
-  exploratory rather than a controlled comparison.
+- `scripts/validate_hardware.py` runs the GPU tests, speed against llama.cpp, chat replies with
+  and without a drafter, and a streamed HTTP request, and writes a report under the ignored
+  `reports/` directory. Its batched columns time 4 sequences decoding 128 tokens each after
+  1-token prompts, on both engines. `--quick` runs one repetition and skips the batched and chat
+  runs; `--no-tests` skips the GPU tests. Its process exit status is not a verdict: read the
+  failures in its report.
 
 Record the engine and tinygrad commits, the llama.cpp commit and build options, the model file
 and quantization, the hardware, driver and compiler, the context, prompt and output lengths,

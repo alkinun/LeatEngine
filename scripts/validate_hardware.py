@@ -1,6 +1,6 @@
 """Checks a machine end to end in one command, on a new inference host: the GPU tests, speed
 against llama.cpp on the same files, speculative decoding over chat prompts, and the server
-answering a streamed chat. Writes a Markdown report to reports/ and prints it.
+answering a streamed chat. Writes a Markdown report to reports/, or --out, and prints it.
 
     uv run python scripts/validate_hardware.py MODEL.gguf|DIR ... [--llama-cpp llama.cpp/build/bin]
 
@@ -38,7 +38,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("models", nargs="+", type=Path, help="GGUF files, or directories of them")
     parser.add_argument("--llama-cpp", type=Path, help="llama.cpp's build/bin, to compare against")
-    parser.add_argument("--quick", action="store_true", help="fewer and shorter runs")
+    parser.add_argument("--quick", action="store_true", help="one repetition, no batch or chat")
     parser.add_argument("--no-tests", action="store_true", help="skip the GPU tests")
     parser.add_argument("--out", type=Path, default=ROOT / "reports", help="report directory")
     args = parser.parse_args()
@@ -71,7 +71,7 @@ def main() -> None:
                 row["chat 2"] = _leatengine(env, *chat, "-s", "2")
         report.model(row)
     if models:
-        report.server(_server(env, models[0]))
+        report.server(_server(env, models[0], args.out))
     path = report.write(args.out)
     print(report.text())
     print(f"\nwritten to {path}", file=sys.stderr)
@@ -249,15 +249,15 @@ def _llama_batched(bin_dir: Path, model: Path) -> dict:
     return {"decode": float(rows[0][8])}  # the column S_TG t/s
 
 
-def _server(env: dict, model: Path) -> dict:
+def _server(env: dict, model: Path, out: Path) -> dict:
     # serve on a free port, wait until the model is loaded, then request a streamed chat reply
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     start = time.perf_counter()
     args = [sys.executable, "-m", "leatengine", "serve", str(model), "--port", str(port)]
-    (ROOT / "reports").mkdir(exist_ok=True)
-    log = open(ROOT / "reports" / ".server.log", "w")  # noqa: SIM115
+    out.mkdir(parents=True, exist_ok=True)
+    log = open(out / ".server.log", "w")  # noqa: SIM115
     server = subprocess.Popen(args, env=env, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
     url, result = f"http://127.0.0.1:{port}", {"ok": False}
     try:
