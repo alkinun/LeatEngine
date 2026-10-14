@@ -24,7 +24,7 @@ Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q5_0, Q8_0, MXFP4 = (
 IQ = [GGMLType[t] for t in ("IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S")]
 OTHER = [GGMLType[t] for t in ("Q4_0", "Q4_1", "Q5_1", "IQ4_NL", "IQ4_XS", "Q2_K", "Q3_K")] + IQ
 # of those, the tensor cores' too
-TILED = [GGMLType[t] for t in ("Q4_0", "IQ4_NL", "IQ4_XS", "Q2_K", "Q3_K")]
+TILED = [GGMLType[t] for t in ("Q4_0", "IQ4_NL", "IQ4_XS", "Q2_K", "Q3_K")] + IQ
 
 
 def quantize_q8(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -325,7 +325,8 @@ def expected_mixture(normed: np.ndarray, scores: np.ndarray, used: int, expert) 
     "tokens", [1, 3, 70, UOp.variable("tokens", 1, 128).bind(37), 128, SHORT[1]]
 )
 @pytest.mark.parametrize("favored", [0, 3])
-@pytest.mark.parametrize("types", [(Q4_K, Q6_K), (Q2_K, Q3_K)])  # gate and up's, and down's
+# gate and up's types, and down's
+@pytest.mark.parametrize("types", [(Q4_K, Q6_K), (Q2_K, Q3_K), (GGMLType.IQ2_XXS, GGMLType.IQ3_S)])
 def test_mixture(tokens, favored, types):
     rng = np.random.default_rng(15)
     experts, used, dim, hidden = 32, 4, 512, 768

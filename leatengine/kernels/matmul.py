@@ -36,6 +36,7 @@ from leatengine.kernels.common import (
     fifth_bits,
     funnel,
     glu,
+    iq_grids,
     lane_range,
     minus,
     on_matrix_cores,
@@ -47,6 +48,7 @@ from leatengine.kernels.common import (
     table16,
     turns,
 )
+from leatengine.kernels.iq import IQ_FORMATS
 from leatengine.kernels.quantize import quantize_q8
 from leatengine.quant import GGMLType, QTensor
 
@@ -239,7 +241,7 @@ class _Q4KTile:
     max_rows, block = 256, 256  # rows per tile at most, for shared memory; weights per block
     halves = half_sums = False
 
-    def __init__(self, rows: int, tid: UOp, cols: int):
+    def __init__(self, rows: int, tid: UOp, cols: int, grid: UOp):
         self.rows, self.tid = rows, tid
         self.quants = UOp.alloc((rows, 16 + 4), dtypes.uint32, addrspace=AddrSpace.LOCAL)
         self.scales = UOp.alloc((2, 4, rows), dtypes.float32, addrspace=AddrSpace.LOCAL)
@@ -301,7 +303,7 @@ class _Q5KTile(_Q4KTile):
 
     max_rows = 128
 
-    def __init__(self, rows: int, tid: UOp, cols: int):
+    def __init__(self, rows: int, tid: UOp, cols: int, grid: UOp):
         self.rows, self.tid = rows, tid
         self.quants = UOp.alloc((rows, 32), dtypes.int32, addrspace=AddrSpace.LOCAL)
         self.scales = UOp.alloc((2, 4, rows), dtypes.float32, addrspace=AddrSpace.LOCAL)
@@ -343,7 +345,7 @@ class _Q6KTile:
     max_rows, block = 256, 256
     halves, half_sums = True, False  # a scale per 16 weights
 
-    def __init__(self, rows: int, tid: UOp, cols: int):
+    def __init__(self, rows: int, tid: UOp, cols: int, grid: UOp):
         self.rows, self.tid = rows, tid
         self.quants = UOp.alloc((rows, 32), dtypes.int32, addrspace=AddrSpace.LOCAL)
         self.scales = UOp.alloc((2, rows), dtypes.uint32, addrspace=AddrSpace.LOCAL)
@@ -430,7 +432,7 @@ class _Q2KTile(_Q6KTile):
 
     half_sums = True
 
-    def __init__(self, rows: int, tid: UOp, cols: int):
+    def __init__(self, rows: int, tid: UOp, cols: int, grid: UOp):
         self.rows, self.tid = rows, tid
         self.quants = UOp.alloc((rows, 32), dtypes.int32, addrspace=AddrSpace.LOCAL)
         self.scales = UOp.alloc((2, rows), dtypes.uint32, addrspace=AddrSpace.LOCAL)
@@ -472,6 +474,58 @@ class _Q2KTile(_Q6KTile):
         return acc + products - d[1, row].load() * mins
 
 
+class _IQTile(_Q6KTile):
+    """IQ weights, half a block per step, each sub-block of 32 unpacked to int8 by iq's decoding,
+    in Q6_K's layout: per row, a word per sub-block of its two scales 2s + 1, one per 16 weights,
+    as halfwords, and d times the format's factor."""
+
+    kind: GGMLType  # each format's subclass's
+
+    def __init__(self, rows: int, tid: UOp, cols: int, grid: UOp):
+        self.rows, self.tid, self.grid, self.format = rows, tid, grid, IQ_FORMATS[self.kind]
+        self.quants = UOp.alloc((rows, 32), dtypes.int32, addrspace=AddrSpace.LOCAL)
+        self.scales = UOp.alloc((4, rows), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+        self.d = UOp.alloc((rows,), dtypes.float32, addrspace=AddrSpace.LOCAL)
+
+    def item(self, i: int) -> tuple[UOp, UOp]:
+        # the thread's i-th (row, sub-block j) of a step's
+        item = i * self.rows + self.tid
+        return item // 4, item % 4
+
+    def fetch(self, stack: _Stack, step: UOp) -> list[UOp]:
+        # each of the thread's sub-blocks' raw words, then the d of its row
+        words, block = [], step // 2 * self.format.halfwords
+        for i in range(4):
+            row, j = self.item(i)
+
+            def half(at: UOp, row: UOp = row) -> UOp:
+                return stack.load(row, at).cast(dtypes.uint32)
+
+            words += self.format.raw(half, block, 4 * (step % 2) + j)
+        return words + [stack.load(self.tid, block).cast(dtypes.uint32)]
+
+    def put(self, bufs: list[UOp], step: UOp, words: list[UOp]) -> list[UOp]:
+        quants, scales, d = bufs
+        per, stores = (len(words) - 1) // 4, []
+        for i in range(4):
+            row, j = self.item(i)
+            raw = words[per * i : per * (i + 1)]
+            values, s = self.format.decode(self.grid, raw, 4 * (step % 2) + j)
+            for m, value in enumerate(values):
+                stores.append(quants[row, _swizzle(row, 8 * j + m)].store(value))
+            stores.append(scales[j, row].store((2 * s[0] + 1) | ((2 * s[-1] + 1) << 16)))
+        return stores + [d[self.tid].store(f16(words[-1]) * self.format.factor)]
+
+    @staticmethod
+    def scaled(
+        bufs: list[UOp], s: UOp, row: UOp, c: list[UOp], xd: UOp, xs: list[UOp], acc: UOp
+    ) -> UOp:  # fmt: skip
+        _, scales, d = bufs
+        packed = scales[s, row].load()
+        sc = [((packed >> (16 * h)) & 0xFFFF).cast(dtypes.int32) for h in range(2)]
+        return acc + (c[0] * sc[0] + c[1] * sc[1]).float() * (d[row].load() * xd)
+
+
 class _Q80Tile:
     """Q8_0 weights, 4 blocks per step: 32 words of int8 per row, swizzled as for Q6_K, and the 4
     blocks' d. Rows of whole blocks but not whole steps read zeros past their end."""
@@ -479,7 +533,7 @@ class _Q80Tile:
     max_rows, block, words = 256, 32, 17  # weights and halfwords per block
     halves = half_sums = False
 
-    def __init__(self, rows: int, tid: UOp, cols: int):
+    def __init__(self, rows: int, tid: UOp, cols: int, grid: UOp):
         self.rows, self.tid = rows, tid
         self.blocks, self.ragged = cols // 32, cols % STEP != 0
         self.quants = UOp.alloc((rows, 32), dtypes.int32, addrspace=AddrSpace.LOCAL)
@@ -681,6 +735,7 @@ _TILES: dict[GGMLType, type[_Q4KTile] | type[_Q6KTile] | type[_Q80Tile]] = {
     GGMLType.Q5_K: _Q5KTile, GGMLType.Q6_K: _Q6KTile, GGMLType.Q5_0: _Q50Tile,
     GGMLType.Q8_0: _Q80Tile, GGMLType.MXFP4: _MXFP4Tile, GGMLType.Q4_0: _Q40Tile,
     GGMLType.IQ4_NL: _IQ4NLTile, GGMLType.IQ4_XS: _IQ4XSTile,
+    **{t: type(f"_{t.name}Tile", (_IQTile,), {"kind": t}) for t in IQ_FORMATS},
 }  # fmt: skip
 
 
@@ -722,9 +777,10 @@ def _matmul_kernel(
     schedule: tuple[int, int] = (0, 1), wmma: bool = False,
     step_groups: int | UOp = STEP // GROUP,
 ) -> UOp:  # fmt: skip
-    # srcs: the stacked matrices, of `heights` rows, then xq, xd, xs, a residual if given and the
-    # parts buffer if scheduled. Tiles hold `rows` rows by tile_tokens tokens, which warps multiply
-    # by WMMA's fragments if wmma, else by mma.sync's, a step's `step_groups` groups in turn.
+    # srcs: the stacked matrices, of `heights` rows, the IQ grids, then xq, xd, xs, a residual if
+    # given and the parts buffer if scheduled. Tiles hold `rows` rows by tile_tokens tokens, which
+    # warps multiply by WMMA's fragments if wmma, else by mma.sync's, a step's `step_groups` groups
+    # in turn.
     # Gated, the matrices are gate and up, a tile holds rows of both, each warp the same 16 of
     # either, and out is glu(kind)(gate, up), as common.glu has it; fused, gate and up are one
     # stack of experts, as _Stack has it.
@@ -737,7 +793,7 @@ def _matmul_kernel(
     # slot) pairs routed to each, of `used` slots per token, followed in srcs by each matrix's
     # biases (experts * rows) if any; a block takes tile_tokens pairs of an expert's list,
     # reading activation row pair // used, by token, or else pair, and writing output row pair.
-    ws, (xq, xd, xs, *rest) = srcs[: len(heights)], srcs[len(heights) :]
+    ws, (grid, xq, xd, xs, *rest) = srcs[: len(heights)], srcs[len(heights) :]
     count, n = int(out.shape[-2]), heights[0] if gated else sum(heights)
     sources = count // routed[0] if routed is not None and routed[1] else count
     cols, threads = 4 * int(xq.shape[0]) // sources, rows
@@ -797,7 +853,7 @@ def _matmul_kernel(
         def target(token0: UOp, tok: UOp | int, row: UOp) -> UOp:
             return out.flatten()[(pair(token0, tok) * n + row).valid(token0 + tok < listed)]
 
-    weights = _TILES[ggml_type](rows, tid, cols)
+    weights = _TILES[ggml_type](rows, tid, cols, grid)
     # the first rows of the warp's two subtiles of 16 rows, within the tile
     firsts = [warp * 16 + mi * out_rows if gated else warp * WARP_ROWS + mi * 16 for mi in (0, 1)]
     # the tile's tokens for a step: 32 words each, and the d and sums of 4 groups, as `scaled`
@@ -1092,7 +1148,8 @@ def _products(
             heights=tuple(heights), gated=gated, kind=kind, tile_tokens=tile_tokens,
             schedule=schedule, wmma=on_rdna3(xq), step_groups=step_groups,
         )  # fmt: skip
-        words, res = map(storage_words, stack), () if residual is None else (tiled(residual),)
+        words = (*map(storage_words, stack), iq_grids(xq.device))
+        res = () if residual is None else (tiled(residual),)
         if schedule[0] == 0:
             out = Tensor.custom_kernel(out, *words, xq, xd, xs, *res, fxn=fxn)[0]
         else:  # and the chunks' sums of the tiles left after whole waves
@@ -1133,7 +1190,7 @@ def routed_products(
         heights=(rows,) * len(ws), gated=len(ws) == 2, routed=(used, by_token),
         fused=fused, kind=kind, wmma=on_rdna3(xq), step_groups=step_groups,
     )  # fmt: skip
-    words = map(storage_words, ws)
+    words = (*map(storage_words, ws), iq_grids(xq.device))
     extra = biases or ()
     return Tensor.custom_kernel(out, *words, xq, *q8[1:], order, counts, *extra, fxn=fxn)[0]
 
