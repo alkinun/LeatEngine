@@ -953,8 +953,11 @@ def _matmul_kernel(
         # whole tile's outputs, or a left tile's sums of a chunk to their part
         stores = []
         if ends is not None:
-            whole, tile, chunk = items.decode(item)
+            _, tile, chunk = items.decode(item)
             part = (tile - items.waves * items.blocks) * items.chunks + chunk
+            # opaque: tinygrad would simplify every store's index again under the bound this puts
+            # on the item, which took seconds of compiling for nothing a store runs faster for
+            whole = opaque(item) < items.whole
         for mi in range(1 if gated and ends is None else SUBTILES_M):
             for ni in range(subtiles_n):
                 for e in range(per_lane):
