@@ -280,6 +280,9 @@ def test_glm_tool_call_arguments():
     ]
     malformed = "<tool_call>weather<arg_key>city</arg_key>Paris</tool_call>"
     assert parse_tool_calls(malformed, tools) == (malformed, [])
+    # nor is Qwen's JSON that falls short of a call one of GLM's, named by its text
+    qwen = 'hi <tool_call>{"name":"f"}</tool_call>'
+    assert parse_tool_calls(qwen, tools) == (qwen, [])
 
 
 def test_python_tool_calls():
@@ -295,7 +298,8 @@ def test_python_tool_calls():
     assert calls == [{"name": "weather", "arguments": days},
                      {"name": "tools.search", "arguments": query}]  # fmt: skip
     for bad in ("[weather('Paris')]", "[weather(city=open('x'))]", "[weather(**kw)]", "[1 +",
-                "[f()(x=1)]", "[weather(city=-'a')]"):  # fmt: skip
+                "[f()(x=1)]", "[weather(city=-'a')]", "[f(a={[1]: 2})]", "[f(a=1j)]",
+                "[f(a=b'x')]"):  # fmt: skip
         reply = f"<|tool_call_start|>{bad}<|tool_call_end|>"
         assert parse_tool_calls(reply, WEATHER) == (reply, [])
     assert tool_call_start("Checking.<|tool_call_st") == len("Checking.")

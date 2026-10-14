@@ -255,7 +255,8 @@ class Server(ThreadingHTTPServer):
 
     def load(self, name: str) -> None:
         """Loads a model in place of the loaded one, once the completions before have finished,
-        and compiles its graphs; returns when it is ready. Loading the loaded model does nothing."""
+        and compiles its graphs; returns when it is ready. Loading the loaded model loads nothing,
+        though completions asked meanwhile wait for it, rendered again if they were rendered."""
         if name not in self.models:
             raise ValueError(f"there is no model {name!r}")
         # queued under the lock ask() queues a completion under: one rendered by the template of
@@ -266,6 +267,11 @@ class Server(ThreadingHTTPServer):
             self.requests.put(load := _Load(name))
         if (error := load.done.get()) is not None:
             raise RuntimeError(f"loading {name} failed: {error!r}") from error
+
+    def loading_now(self) -> bool:
+        """Whether a load has been asked for and is not yet done."""
+        with self._loads_lock:
+            return bool(self._loads)
 
     def ask(self, completion: _Completion, rendered: "_Loaded | None") -> bool:
         """Queues a completion rendered by the template of the model `rendered`, if no load has
@@ -679,7 +685,7 @@ class _Handler(BaseHTTPRequestHandler):
         # the error printed; a client that hung up, while a model loaded say, is answered nothing
         try:
             route(*args)
-        except OSError:
+        except ConnectionError:
             pass
         except Exception:
             if self.status is None:
@@ -794,6 +800,8 @@ class _Handler(BaseHTTPRequestHandler):
         while True:
             server.ready.wait()  # for the model loading, if one is, whose template renders it
             loaded = server.loaded
+            if loaded is None and server.loading_now():  # a load began since: wait for it
+                continue
             try:
                 completion = _completion(body, server, loaded)
             except (ValueError, TypeError, jinja2.TemplateError) as e:

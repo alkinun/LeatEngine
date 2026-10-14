@@ -39,8 +39,11 @@ _ROPE_HALVES = {
 }  # fmt: skip
 QWEN35 = ("qwen35", "qwen35moe")  # Qwen3.5's and Qwen3.6's architectures: dense, and of experts
 GEMMA4 = ("gemma4", "gemma-embedding2")  # Gemma 4's, and EmbeddingGemma 2's of its layers
-# expert_gating_func of the sigmoid, as llama.cpp's LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID
-_SIGMOID_GATING = 2
+# expert_gating_func of llama.cpp's LLAMA_EXPERT_GATING_FUNC_TYPE: none given, softmax, sigmoid
+_NO_GATING, _SOFTMAX_GATING, _SIGMOID_GATING = 0, 1, 2
+# the architectures whose GGUFs say how their router's scores weigh the experts, as llama.cpp reads
+# it of them; the others' are a softmax of the chosen ones' scores
+_GATING_GIVEN = ("deepseek2", "lfm2moe")
 # the period of attention.sliding_window_pattern where a GGUF has none, as llama.cpp's
 _SLIDING_EVERY = {"gemma3": 6, "gpt-oss": 2, "mellum": 4, "muse-glimmer": 4}
 # the architectures whose sliding-window layers turn by the RoPE base of the others where the GGUF
@@ -204,6 +207,7 @@ class Config:
         ropes = [
             _rope(m, arch, s, d if s else rotated) for s, d in zip(sliding, head_dims, strict=True)
         ]
+        gating, normalized = _gating(m, arch, len(metadata["tokenizer.ggml.tokens"]))
         mla = None
         if "attention.kv_lora_rank" in m:  # DeepSeek V2's multi-head latent attention
             if m.get("rope.scaling.type") == "yarn" or m.get("expert_group_used_count", 1) > 1:
@@ -254,8 +258,8 @@ class Config:
             experts=m.get("expert_count", 0),
             experts_used=m.get("expert_used_count", 0),
             dense_lead=m.get("leading_dense_block_count", 0),
-            sigmoid_gating=m.get("expert_gating_func") == _SIGMOID_GATING,
-            expert_weights_norm=m.get("expert_weights_norm", True),
+            sigmoid_gating=gating == _SIGMOID_GATING,
+            expert_weights_norm=normalized,
             expert_weights_scale=m.get("expert_weights_scale", 0.0) or 1.0,
             glu=_GLU.get(arch, "silu"),
             embed_scale=math.sqrt(dim) if arch in ("gemma3", *GEMMA4) else 1.0,
@@ -287,6 +291,25 @@ class Config:
         """Whether the model reads a tensor: all but those of layers past its own, as Qwen3.5's
         layer for predicting further tokens."""
         return not name.startswith("blk.") or int(name.split(".")[1]) < self.n_layers
+
+
+def _gating(m: dict[str, Any], arch: str, vocab: int) -> tuple[int, bool]:
+    # how a mixture of experts' router weighs them, as llama.cpp's: the gating function, and
+    # whether the chosen experts' weights are normalized to sum to 1. Of DeepSeek V2's GGUFs, which
+    # may leave the function out, GLM-4.7-Flash's is the sigmoid, as llama.cpp tells them by their
+    # sizes; and unnormalized unless they say so. LFM2's are normalized whatever they say. A
+    # softmax's weights are of the chosen experts' scores alone, normalized: the rest is refused.
+    if arch not in _GATING_GIVEN:
+        return _SOFTMAX_GATING, True
+    gating = m.get("expert_gating_func", _NO_GATING)
+    if gating == _NO_GATING:
+        glm = m.get("block_count") in (47, 48) and vocab == 154880
+        gating = _SIGMOID_GATING if glm else _SOFTMAX_GATING
+    normalized = arch == "lfm2moe" or m.get("expert_weights_norm", False)
+    unnormalized_softmax = gating == _SOFTMAX_GATING and not normalized
+    if gating not in (_SOFTMAX_GATING, _SIGMOID_GATING) or unnormalized_softmax:
+        raise NotImplementedError(f"experts weighed by gating function {gating}, normalized or not")
+    return gating, normalized
 
 
 def _rope(m: dict[str, Any], arch: str, sliding: bool, dims: int) -> Rope:

@@ -375,9 +375,9 @@ def storage_words(w: QTensor) -> Tensor:
 @dataclass(frozen=True)
 class Routing:
     """How a mixture of experts weighs the experts its router scores: by the softmax of the chosen
-    ones' scores; or by the sigmoid of each score, the experts chosen by it plus a `bias`
-    (experts,) if given, as DeepSeek V3's, and normalized to sum to 1 if `normalize`; either way
-    then times `scale`."""
+    ones' scores, which sum to 1; or by the sigmoid of each score, the experts chosen by it plus a
+    `bias` (experts,) if given, as DeepSeek V3's, and normalized to sum to 1 if `normalize`;
+    either way then times `scale`. Config refuses a softmax unnormalized."""
 
     sigmoid: bool = False
     bias: Tensor | None = None

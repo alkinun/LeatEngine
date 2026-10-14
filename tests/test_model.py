@@ -98,12 +98,13 @@ def test_bad_models(tiny_model):
         config("mamba")
 
 
-def config(arch: str, values: dict | None = None) -> Config:
+def config(arch: str, values: dict | None = None, vocab: int = 0) -> Config:
     # the Config of the least metadata an architecture takes, and `values`, without the prefix
     least = {"block_count": 4, "embedding_length": 256, "attention.head_count": 4,
              "context_length": 64, "attention.layer_norm_rms_epsilon": 1e-5}  # fmt: skip
     metadata = {f"{arch}.{k}": v for k, v in (least | (values or {})).items()}
-    return Config.from_gguf(metadata | {"general.architecture": arch, "tokenizer.ggml.tokens": []})
+    tokens = {"tokenizer.ggml.tokens": [""] * vocab}
+    return Config.from_gguf(metadata | {"general.architecture": arch} | tokens)
 
 
 def test_config():
@@ -192,13 +193,24 @@ def test_mla_config():
     # its YaRN and its groups of experts, as DeepSeek V3's, are refused rather than run wrong
     mla = {"attention.kv_lora_rank": 512, "attention.q_lora_rank": 768,
            "attention.key_length": 576, "attention.key_length_mla": 256,
-           "attention.value_length_mla": 256, "rope.dimension_count": 64}  # fmt: skip
+           "attention.value_length_mla": 256, "rope.dimension_count": 64,
+           "expert_gating_func": 2}  # fmt: skip
     c = config("deepseek2", mla)
     assert c.mla is not None and (c.mla.nope, c.mla.rope, c.mla.v_dim) == (192, 64, 256)
     assert c.scales == (1 / 16,) * 4 and c.head_dims == (576,) * 4 and not c.rope_halves
     for unsupported in (YARN, {"expert_group_used_count": 4}):
         with pytest.raises(NotImplementedError, match="multi-head latent attention"):
             config("deepseek2", mla | unsupported)
+    # its experts weighed as llama.cpp's: GLM-4.7-Flash's of a GGUF that leaves the gating function
+    # out by the sigmoid, as llama.cpp tells it by its sizes, unnormalized unless the GGUF says so;
+    # an unnormalized softmax, or another function, refused
+    gated_by_size = {k: v for k, v in mla.items() if k != "expert_gating_func"}
+    glm = config("deepseek2", gated_by_size | {"block_count": 47}, vocab=154880)
+    assert glm.sigmoid_gating and not glm.expert_weights_norm
+    assert not config("deepseek2", mla | {"expert_gating_func": 2}).expert_weights_norm
+    for refused in ({"expert_weights_norm": False}, {"expert_gating_func": 3}):
+        with pytest.raises(NotImplementedError, match="gating function"):
+            config("deepseek2", mla | {"expert_gating_func": 1} | refused)
 
 
 @pytest.mark.usefixtures("reference_ops")

@@ -371,7 +371,7 @@ def _xml_call(text: str, functions: dict[str, Any]) -> dict[str, Any] | None:
 
 # GLM-4.7's calls inside <tool_call>: a function's name, then each key and its value
 _GLM_ARGUMENT = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.S)
-_GLM_CALL = re.compile(rf"\s*([^<\s]+)\s*((?:{_GLM_ARGUMENT.pattern}\s*)*)", re.S)
+_GLM_CALL = re.compile(rf"\s*([\w.\-]+)\s*((?:{_GLM_ARGUMENT.pattern}\s*)*)", re.S)
 
 
 def _glm_call(text: str, functions: dict[str, Any]) -> dict[str, Any] | None:
@@ -450,16 +450,29 @@ def _dotted(node: ast.expr) -> str | None:
 _NAMED = {"true": True, "false": False, "null": None, "True": True, "False": False, "None": None}
 
 
+_SCALARS = (
+    str,
+    int,
+    float,
+    bool,
+    type(None),
+)  # what a literal of JSON may be, but a list or object
+
+
 def _literal(node: ast.expr) -> Any:
-    # a literal's value, of Python's syntax or JSON's; ValueError for anything else
-    if isinstance(node, ast.Constant):
+    # a literal's value, of Python's syntax or JSON's, of what JSON holds: ValueError for anything
+    # else, as a complex number, bytes, or a key that is a list
+    if isinstance(node, ast.Constant) and isinstance(node.value, _SCALARS):
         return node.value
     if isinstance(node, ast.Name) and node.id in _NAMED:
         return _NAMED[node.id]
     if isinstance(node, ast.List | ast.Tuple):
         return [_literal(e) for e in node.elts]
     if isinstance(node, ast.Dict) and all(k is not None for k in node.keys):
-        return {_literal(k): _literal(v) for k, v in zip(node.keys, node.values, strict=True)}  # type: ignore[arg-type]
+        keys = [_literal(k) for k in node.keys if k is not None]
+        if not all(isinstance(k, _SCALARS) for k in keys):
+            raise ValueError("an object's keys must be text or numbers")
+        return dict(zip(keys, (_literal(v) for v in node.values), strict=True))
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub | ast.UAdd):
         value = _literal(node.operand)
         if isinstance(value, int | float) and not isinstance(value, bool):
