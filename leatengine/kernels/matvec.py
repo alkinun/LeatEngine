@@ -163,6 +163,60 @@ def _q6_k_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
     return dot
 
 
+def _low_k_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int, kind: GGMLType) -> Dot:
+    # Q2_K and Q3_K blocks of 256 weights: each half n of 128 is 4 rows of 32, value l of row k
+    # bits 2k of byte l of the half's 32 bytes, with a scale per 16 values. Q2_K, 21 words: 16
+    # bytes of 4-bit scales and mins, the 64 bytes of values, then d and dmin as f16; a weight is
+    # d * (s & 15) * q - dmin * (s >> 4). Q3_K, 55 halfwords: 32 bytes of high bits, the values,
+    # 12 bytes of 6-bit scales and d as f16; bit 4n + k of byte l of the high bits is bit 2 of
+    # value l of row k, minus 4, and a weight is d * (s - 32) * q. A unit is 16 bytes of a half,
+    # all 4 rows of them: 64 weights, a word of each row's 4 by a word of its activations.
+    q3 = kind == GGMLType.Q3_K
+
+    def dot(row: UOp, unit: UOp, x: UOp | int) -> UOp:
+        block, n, u = unit // 4, unit % 4 // 2, unit % 2
+        n32 = n.cast(dtypes.uint32)
+        g = x * (cols // 32) + block * 8 + 4 * n  # activation group of row 0
+        groups = [load_words(xq, (g + k) * 8 + 4 * u, 4) for k in range(4)]
+        dots = [UOp.const(0, dtypes.int32)] * 4
+        if q3:
+            base = (row * (cols // 256) + block) * 55
+            words = [word16(w, base + 16 + 16 * n + 8 * u + 2 * m) for m in range(4)]
+            highs = [word16(w, base + 8 * u + 2 * m) for m in range(4)]
+        else:
+            base = (row * (cols // 256) + block) * 21
+            words = [w[base + 4 + 8 * n + 4 * u + m].load() for m in range(4)]
+        for m, word in enumerate(words):
+            for k in range(4):
+                q = (word >> (2 * k)) & 0x03030303
+                if q3:
+                    high = (highs[m] >> (4 * n32 + k)) & 0x01010101
+                    q = minus(q | (high << 2), 4)
+                dots[k] = dp4a(q.bitcast(dtypes.int32), groups[k][m], dots[k])
+        total, mins = UOp.const(0.0, dtypes.float32), UOp.const(0.0, dtypes.float32)
+        for k in range(4):
+            at = (8 * (2 * (k % 2) + u)).cast(dtypes.uint32)  # scale 2k + u's byte in its word
+            xd_k = xd[g + k].load()
+            if q3:  # nibble n of byte 2k + u, then bits 2(2n + k // 2) of byte 8 + 2(k % 2) + u
+                low = (word16(w, base + 48 + 2 * (k // 2)) >> (at + 4 * n32)) & 15
+                high = (word16(w, base + 52) >> (at + 2 * (2 * n32 + k // 2))) & 3
+                scale = (low | (high << 4)).cast(dtypes.int32) - 32
+                total = total + scale.float() * (xd_k * dots[k].float())
+            else:  # scale 8n + 2k + u; the min takes the sum of the row's activations
+                s = (w[base + 2 * n + k // 2].load() >> at) & 0xFF
+                sums = UOp.const(0, dtypes.int32)
+                for m in range(4):
+                    sums = dp4a(UOp.const(0x01010101, dtypes.int32), groups[k][m], sums)
+                total = total + (s & 15).float() * (xd_k * dots[k].float())
+                mins = mins + (s >> 4).float() * (xd_k * sums.float())
+        if q3:
+            return f16(w[base + 54].load().cast(dtypes.uint32)) * total
+        dm = w[base + 20].load()
+        return f16(dm) * total - f16(dm >> 16) * mins
+
+    return dot
+
+
 def _q8_0_dot(w: UOp, xq: UOp, xd: UOp, xs: UOp, cols: int) -> Dot:
     # Q8_0 block, 17 halfwords: d as f16, then 32 int8 weights, the activation groups' size; a
     # unit is two blocks
@@ -297,6 +351,8 @@ DOTS: dict[GGMLType, Callable[[UOp, UOp, UOp, UOp, int], Dot]] = {
     GGMLType.Q4_K: functools.partial(_k_dot, high=False),
     GGMLType.Q5_K: functools.partial(_k_dot, high=True),
     GGMLType.Q6_K: _q6_k_dot, GGMLType.Q5_0: _q5_0_dot, GGMLType.Q8_0: _q8_0_dot,
+    GGMLType.Q2_K: functools.partial(_low_k_dot, kind=GGMLType.Q2_K),
+    GGMLType.Q3_K: functools.partial(_low_k_dot, kind=GGMLType.Q3_K),
     GGMLType.MXFP4: _mxfp4_dot, GGMLType.IQ4_XS: _iq4_xs_dot,
     **{t: functools.partial(_q4_dot, kind=t)
        for t in (GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_1, GGMLType.IQ4_NL)},

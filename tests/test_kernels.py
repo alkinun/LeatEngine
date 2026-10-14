@@ -21,7 +21,7 @@ Q4_K, Q5_K, Q6_K, Q5_0, Q8_0, MXFP4 = (
     GGMLType[t] for t in ("Q4_K", "Q5_K", "Q6_K", "Q5_0", "Q8_0", "MXFP4")
 )
 # the matrix-vector kernels' other types
-LEGACY = [GGMLType[t] for t in ("Q4_0", "Q4_1", "Q5_1", "IQ4_NL", "IQ4_XS")]
+OTHER = [GGMLType[t] for t in ("Q4_0", "Q4_1", "Q5_1", "IQ4_NL", "IQ4_XS", "Q2_K", "Q3_K")]
 TILED = [GGMLType[t] for t in ("Q4_0", "IQ4_NL", "IQ4_XS")]  # of those, the tensor cores' too
 
 
@@ -103,7 +103,7 @@ def test_norm_quantize_q8(width):
 
 
 # rows of 768 weights leave lanes idle, and of 2816 some in a second turn
-@pytest.mark.parametrize("ggml_type", [Q4_K, Q5_K, Q6_K, Q5_0, Q8_0, MXFP4, *LEGACY])
+@pytest.mark.parametrize("ggml_type", [Q4_K, Q5_K, Q6_K, Q5_0, Q8_0, MXFP4, *OTHER])
 @pytest.mark.parametrize("shape", [(64, 4096), (8, 14336), (16, 768), (24, 2816)])
 def test_matvec(ggml_type, shape):
     rng = np.random.default_rng(1)
@@ -115,7 +115,7 @@ def test_matvec(ggml_type, shape):
     assert_close(got[0], reference_matmul(x[0], blocks, ggml_type), 1e-4)
 
 
-@pytest.mark.parametrize("ggml_type", [Q4_K, Q5_K, Q6_K, Q5_0, Q8_0, MXFP4, *LEGACY])
+@pytest.mark.parametrize("ggml_type", [Q4_K, Q5_K, Q6_K, Q5_0, Q8_0, MXFP4, *OTHER])
 @pytest.mark.parametrize("tokens", [3, MATVEC_TOKENS])
 @pytest.mark.parametrize("rows", [24, 26])  # whole warps' rows, or a last warp's of fewer
 def test_matvec_tokens(ggml_type, tokens, rows):

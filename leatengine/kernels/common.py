@@ -25,7 +25,8 @@ SHARED = 49152  # bytes of shared memory a block may use without opting in to mo
 
 # the word type kernels read each storage type as: some blocks are only halfword aligned
 WORD_TYPE = {
-    GGMLType.Q4_K: dtypes.uint32, GGMLType.Q5_K: dtypes.uint32, GGMLType.Q6_K: dtypes.uint16,
+    GGMLType.Q2_K: dtypes.uint32, GGMLType.Q3_K: dtypes.uint16, GGMLType.Q4_K: dtypes.uint32,
+    GGMLType.Q5_K: dtypes.uint32, GGMLType.Q6_K: dtypes.uint16,
     GGMLType.Q5_0: dtypes.uint16, GGMLType.Q8_0: dtypes.uint16, GGMLType.MXFP4: dtypes.uint32,
     GGMLType.Q4_0: dtypes.uint16, GGMLType.Q4_1: dtypes.uint16, GGMLType.Q5_1: dtypes.uint16,
     GGMLType.IQ4_NL: dtypes.uint16, GGMLType.IQ4_XS: dtypes.uint32,
