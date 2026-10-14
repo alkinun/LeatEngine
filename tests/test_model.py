@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
+from tinygrad.helpers import Context
 
 from leatengine import bench, ops
 from leatengine.engine import FEW_TOKENS, KEEP_BACK, Engine, graph
@@ -542,6 +543,8 @@ def test_lowered_programs_kept(monkeypatch):
     program = dict.pop(programs, key)
     assert key in programs and programs[key].key == program.key
     dict.pop(programs, key)
+    with Context(CCACHE=0):  # as tinygrad keeps no binaries, no programs either
+        assert key not in programs
     monkeypatch.setattr(lowering, "_sources", lambda: "another tinygrad")
     assert key not in programs and programs.get(key) is None
 

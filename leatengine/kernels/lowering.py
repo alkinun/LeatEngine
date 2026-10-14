@@ -14,8 +14,8 @@ import weakref
 from typing import Any
 
 import tinygrad
-from tinygrad import Device, UOp
-from tinygrad.helpers import diskcache_get, diskcache_put
+from tinygrad import UOp
+from tinygrad.helpers import CCACHE, diskcache_get, diskcache_put
 
 from leatengine.kernels import clang
 
@@ -56,8 +56,9 @@ def keep_programs() -> None:
     """Makes tinygrad keep the programs it lowers in its disk cache, as it keeps their binaries, and
     read them there before it lowers one: Llama 3.1 8B's 161 take 5 MB, and loaded, a later start's
     warm-up takes 13 s rather than 20. A program's row is by the key of tinygrad's own cache of
-    them, its device's compiler and the source of tinygrad and of the AMD renderer, so that a change
-    to either lowers anew; CACHELEVEL=0 or CCACHE=0 turn it off, as they do tinygrad's."""
+    them and what else makes a program, the source of tinygrad and of the AMD renderer and clang's
+    flags, so that a change to either lowers anew; CACHELEVEL=0 or CCACHE=0 turn it off, as they do
+    tinygrad's."""
     import tinygrad.codegen as codegen
     import tinygrad.engine.realize as realize
 
@@ -94,13 +95,13 @@ class _Programs(dict[tuple, UOp]):
 
 
 def _name(key: tuple) -> str | None:
-    # a program's row: of to_program_key's AST key, renderer type, target and configuration, the
-    # device's compiler's key, or None where tinygrad caches no binaries, and the sources
-    ast, renderer, target, *config = key
-    if (compiler := Device[target.device].compiler.cachekey) is None:
+    # a program's row, of to_program_key's AST key, renderer type, target, an architecture's, and
+    # configuration, and of the sources and clang's flags; None where tinygrad keeps no binaries
+    if not CCACHE:
         return None
+    ast, renderer, target, *config = key
     parts = (ast.hex(), f"{renderer.__module__}.{renderer.__qualname__}", repr(target),
-             repr(config), compiler, _sources())  # fmt: skip
+             repr(config), repr(clang.FLAGS), _sources())  # fmt: skip
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
 
