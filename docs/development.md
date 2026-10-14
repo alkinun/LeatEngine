@@ -1,8 +1,8 @@
 # Development
 
-The runtime is one flat `leatengine` package. Model/weight handling, inference, kernels,
-chat formatting, serving, and benchmarking remain separate modules. Keep application
-features in clients that communicate over HTTP.
+The runtime is the `leatengine` package, its GPU kernels in `leatengine.kernels`. Model and
+weight handling, inference, chat formatting, serving, and benchmarking are separate modules.
+Keep application features in clients that communicate over HTTP.
 
 ## Environment and checks
 
@@ -67,10 +67,10 @@ dimensions, which it computes wrongly; the [Strix Halo guide](strix-halo.md) cov
 - Combined CPU/emulator coverage of at least 80%.
 - Wheel and source-distribution installation checks.
 
-CPU and emulated GPU jobs rebalance queued tests between workers with `--dist worksteal`,
-so long model cases do not leave the remaining tests queued behind one busy worker.
-AMD primitive kernels and the remaining GPU integration tests run in separate CI jobs;
-both contribute to the combined coverage gate.
+CPU and emulated GPU jobs rebalance queued tests between workers with `--dist worksteal`, so
+long model cases do not leave the remaining tests queued behind one busy worker. AMD primitive
+kernels and the remaining GPU integration tests run in separate CI jobs; both contribute to the
+combined coverage gate.
 
 The packaging check builds both artifacts and installs each into a fresh environment. It runs
 outside the source checkout, checks both CLI entry points and package boundaries, and serves
@@ -91,19 +91,7 @@ The wheel contains only the runtime package and distribution metadata. The sourc
 also includes tests, scripts, and documentation. Installation needs access to the pinned
 tinygrad Git source; PyPI publication and offline bundles are separate work.
 
-## Extraction baseline
+## Provenance
 
-The original 14 selected test modules collected 1,013 cases, including one application-only
-CLI case removed here. The remaining 1,012 cases cover the inherited engine. Naming and packaging
-checks may add cases; GPU/model prerequisites still determine which execute in each environment.
-
-The source provenance is recorded in the README. Maintain the MIT notice and distinguish
-inherited measurements from results obtained on a specific LeatEngine commit.
-
-The isolated installation check exposed two inherited uses of NumPy for reading generated
-token IDs. They now use tinygrad's list conversion, so decoding and speculation work with
-the three declared runtime dependencies. Model computations and the tinygrad pin are unchanged.
-
-The source snapshot's Python 3.12 CI also exposed a request-queue comparison bug: removing a
-queued completion could read its not-yet-populated finish state. Completion requests now compare
-by identity; the existing background-scheduling test verifies admission order on both CI versions.
+The README records the source this repository was extracted from. Keep its MIT notice, and tell
+inherited measurements apart from results measured on a LeatEngine commit.

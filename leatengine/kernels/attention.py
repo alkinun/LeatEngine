@@ -663,16 +663,15 @@ def _rotate_kernel(
     rotated: int, halves: bool, biased: bool, v_norm: bool, eps: float, ring: bool = False,
 ) -> UOp:  # fmt: skip
     # A warp per token and head of q, then of k and its v. Token t is in slot slots[t] at
-    # positions[t], or for a single slot and position, in that slot at that position plus t.
-    # extra holds RoPE's cos and sin (positions, rotated / 2), or each slot's (slots, positions,
-    # rotated / 2), if any dimensions rotate, then each
-    # of q's, k's and v's bias if biased, and q's and k's norm weights if any. Each of q, k and v
-    # gets its bias; each head of q and k is then normed with its weight, and of v without, if
-    # v_norm; the first `rotated` dimensions of q and k are rotated, q into out as (heads, tokens,
-    # dim), the layout attention reads, and k into the cache with v. Lanes take pairs of
-    # dimensions: those that rotate together, i and i + rotated / 2 or adjacent ones, each pair i
-    # turning by angle cos[pos, i], sin[pos, i], and the others' adjacent pairs as they are. A
-    # ring holds position pos at pos mod its positions.
+    # positions[t], or for a single slot and position, in that slot at that position plus t. extra
+    # holds RoPE's cos and sin (positions, rotated / 2), or each slot's (slots, positions,
+    # rotated / 2), if any dimensions rotate, then each of q's, k's and v's bias if biased, and q's
+    # and k's norm weights if any. Each of q, k and v gets its bias; each head of q and k is then
+    # normed with its weight, and of v without, if v_norm; the first `rotated` dimensions of q and k
+    # are rotated, q into out as (heads, tokens, dim), the layout attention reads, and k into the
+    # cache with v. Lanes take pairs of dimensions: those that rotate together, i and
+    # i + rotated / 2 or adjacent ones, each pair i turning by angle cos[pos, i], sin[pos, i], and
+    # the others' adjacent pairs as they are. A ring holds position pos at pos mod its positions.
     (cos, sin), extra = (extra[:2], extra[2:]) if rotated else ((None, None), extra)
     biases, norms = (extra[:3], extra[3:]) if biased else ((), extra)
     _, cache_slots, kv_heads, cache_positions, dim = (int(d) for d in cache.shape)
@@ -764,13 +763,12 @@ def rotate(
     halves: bool, biases: tuple[Tensor, Tensor, Tensor] | None,
     norms: tuple[Tensor, Tensor] | None, v_norm: bool, eps: float, ring: bool = False,
 ) -> tuple[Tensor, Tensor]:  # fmt: skip
-    """For tokens' q (1, T, H, D), k and v (1, T, KV_H, D): adds their biases, if given; norms
-    each head of q and k with its weight, if given, and of v without, if v_norm; rotates the first
-    R dimensions of q and k by RoPE's tables (positions, R/2), or each slot's (slots, positions,
-    R/2), for rope ((cos, sin), R) if given;
-    and stores k and v in the cache. Token t is at positions[t] of slot slots[t], or for a single
-    slot and position, at that position plus t of that slot, or of a `ring`, at its position mod
-    the cache's positions. Returns q (1, H, T, D) and the cache."""
+    """For tokens' q (1, T, H, D), k and v (1, T, KV_H, D): adds their biases, if given; norms each
+    head of q and k with its weight, if given, and of v without, if v_norm; rotates the first R
+    dimensions of q and k by RoPE's tables (positions, R/2), or each slot's (slots, positions, R/2),
+    for rope ((cos, sin), R) if given; and stores k and v in the cache. Token t is at positions[t]
+    of slot slots[t], or for a single slot and position, at that position plus t of that slot, or of
+    a `ring`, at its position mod the cache's positions. Returns q (1, H, T, D) and the cache."""
     _, tokens, heads, dim = (int(x) for x in q.shape)
     out = Tensor.empty(tokens * heads * dim, dtype=dtypes.float32, device=q.device)
     q, k, v = (t.reshape(-1).float().contiguous() for t in (q, k, v))

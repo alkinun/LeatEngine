@@ -138,10 +138,9 @@ def write_tiny_model(path: Path, arch: str = "llama") -> dict[str, np.ndarray]:
 
 def _writer(path: Path, arch: str, specials: tuple[str, ...] = ()):
     # a GGUF writer with the tiny tokenizer, its last tokens `specials`, control tokens, its
-    # weights, and add(name, shape, type, scale), which
-    # writes a random tensor and keeps it decoded: a norm weight by default, an F32 vector uniform
-    # from 1 to `scale`, 1.5; other F32 tensors, biases too, normal times `scale`; and else blocks
-    # whose f16 fields are up to `scale`
+    # weights, and add(name, shape, type, scale), which writes a random tensor and keeps it decoded:
+    # a norm weight by default, an F32 vector uniform from 1 to `scale`, 1.5; other F32 tensors,
+    # biases too, normal times `scale`; and else blocks whose f16 fields are up to `scale`
     rng = np.random.default_rng(0)
     w = gguf.GGUFWriter(path, arch=arch)
     w.add_uint32(f"{arch}.context_length", CONTEXT)
