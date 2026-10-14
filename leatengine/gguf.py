@@ -21,7 +21,7 @@ from leatengine.quant import BLOCK, NATIVE, GGMLType, QTensor
 # metadata value type -> struct format; 8 is a string, 9 an array
 _SCALAR = dict(enumerate("BbHhIif?")) | {10: "Q", 11: "q", 12: "d"}
 _STRING, _ARRAY = 8, 9
-CHUNK = 1 << 30  # bytes of adjacent tensors `load` reads into one buffer, but a larger tensor's
+CHUNK = 1 << 30  # bytes of adjacent tensors `load` reads into one buffer; a larger one has its own
 
 
 @dataclass(frozen=True)

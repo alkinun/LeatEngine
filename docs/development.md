@@ -58,9 +58,9 @@ PYTHONPATH=/tmp/leatengine-tinygrad DEV=MOCK+AMD uv run pytest -m gpu -n auto \
 ```
 
 The tests turn off unaligned memory access, which the emulator lacks, and isolate compilation
-caches per worker. This checks RDNA 3 kernel behavior in emulation; physical Strix Halo validation is separate. The
-emulator skips decode attention over heads wider than 512 dimensions, which it computes wrongly;
-the [Strix Halo guide](strix-halo.md) covers that check.
+caches per worker. This checks RDNA 3 kernel behavior in emulation; physical Strix Halo
+validation is separate. The emulator skips decode attention over heads wider than 512
+dimensions, which it computes wrongly; the [Strix Halo guide](strix-halo.md) covers that check.
 
 ## Continuous integration
 
