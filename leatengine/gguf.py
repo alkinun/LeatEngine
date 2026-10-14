@@ -3,21 +3,25 @@
 Spec: https://github.com/ggml-org/ggml/blob/master/docs/gguf.md
 """
 
+import ctypes
+import io
 import math
 import mmap
+import os
 import struct
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from tinygrad import Tensor
+from tinygrad import Device, Tensor, dtypes
 
 from leatengine.quant import BLOCK, NATIVE, GGMLType, QTensor
 
 # metadata value type -> struct format; 8 is a string, 9 an array
 _SCALAR = dict(enumerate("BbHhIif?")) | {10: "Q", 11: "q", 12: "d"}
 _STRING, _ARRAY = 8, 9
+CHUNK = 1 << 30  # bytes of adjacent tensors `load` reads into one buffer, but a larger tensor's
 
 
 @dataclass(frozen=True)
@@ -83,22 +87,68 @@ class GGUF:
     def load(
         self, device: str | None = None, names: Iterable[str] | None = None
     ) -> dict[str, QTensor]:
-        """Copies the data of the tensors named, or of all, to `device` in one transfer and returns
-        a view per tensor."""
+        """Copies the data of the tensors named, or of all, to `device` and returns a view per
+        tensor. Tensors adjacent in the file share a buffer of up to CHUNK bytes, read through
+        one host buffer, from a file that may be read-only, which the page cache then drops: a
+        load takes little host memory beside the model's."""
         tensors = list(self.tensors.values()) if names is None else [self.tensors[n] for n in names]
         if not tensors:
             return {}
-        start = min(t.offset for t in tensors)
-        end = max(t.offset + t.nbytes for t in tensors)
-        data = Tensor(self.path)[start:end].to(device).realize()
-        out = {}
-        for t in tensors:
-            raw = data[t.offset - start : t.offset - start + t.nbytes]
-            if t.type in NATIVE:
-                out[t.name] = QTensor(raw.bitcast(NATIVE[t.type]), t.type, t.shape)
-            else:
-                out[t.name] = QTensor(raw.reshape(-1, BLOCK[t.type][1]), t.type, t.shape)
+        device = Device.canonicalize(device)
+        runs = _runs(tensors, self.metadata.get("general.alignment", 32))
+        host = bytearray(max(_end(run[-1]) - run[0].offset for run in runs))
+        address, out, loaded = ctypes.addressof(ctypes.c_char.from_buffer(host)), {}, 0
+        with open(self.path, "rb", buffering=0) as f:
+            for run in runs:
+                start, size = run[0].offset, _end(run[-1]) - run[0].offset
+                _read(f, start, memoryview(host)[:size])
+                staged = Tensor.from_blob(address, (size,), dtype=dtypes.uint8, device="CPU")
+                try:
+                    data = staged.clone(device).realize()
+                    Device[device].synchronize()  # before the next run overwrites the host buffer
+                except MemoryError as e:
+                    raise MemoryError(
+                        f"{self.path.name}: {device} has no room for {size / 2**30:.2f} GiB more, "
+                        f"of {run[0].name} to {run[-1].name}, with {loaded / 2**30:.2f} GiB "
+                        "loaded; see the Strix Halo guide's notes on GPU memory"
+                    ) from e
+                os.posix_fadvise(f.fileno(), start, size, os.POSIX_FADV_DONTNEED)
+                for t in run:
+                    out[t.name] = _view(data[t.offset - start : t.offset - start + t.nbytes], t)
+                loaded += size
         return out
+
+
+def _end(t: TensorInfo) -> int:
+    return t.offset + t.nbytes
+
+
+def _runs(tensors: list[TensorInfo], alignment: int) -> list[list[TensorInfo]]:
+    # the tensors by offset, in runs of those adjacent in the file but for alignment padding, of
+    # CHUNK bytes at most but for a larger tensor alone
+    runs: list[list[TensorInfo]] = []
+    for t in sorted(tensors, key=lambda t: t.offset):
+        run = runs[-1] if runs else []
+        if run and t.offset - _end(run[-1]) < alignment and _end(t) - run[0].offset <= CHUNK:
+            run.append(t)
+        else:
+            runs.append([t])
+    return runs
+
+
+def _read(f: io.FileIO, at: int, into: memoryview) -> None:
+    f.seek(at)
+    while into:
+        if not (n := f.readinto(into)):
+            raise ValueError(f"{f.name}: ends before byte {at + len(into)}")
+        into = into[n:]
+
+
+def _view(raw: Tensor, t: TensorInfo) -> QTensor:
+    # a tensor's bytes in its storage format
+    if t.type in NATIVE:
+        return QTensor(raw.bitcast(NATIVE[t.type]), t.type, t.shape)
+    return QTensor(raw.reshape(-1, BLOCK[t.type][1]), t.type, t.shape)
 
 
 def _parse(buf: memoryview) -> tuple[dict[str, Any], dict[str, TensorInfo]]:

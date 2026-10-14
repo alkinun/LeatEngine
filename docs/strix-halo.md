@@ -33,6 +33,10 @@ Inspect available GPU memory before selecting models or contexts. Firmware UMA a
 Linux TTM/GTT limits can affect usable memory; verify their behavior on this machine before
 applying tuning. No kernel-memory settings are assumed validated here.
 
+Weights load in buffers of up to 1 GiB of adjacent tensors, which tinygrad requests from the
+driver as VRAM. Whether those requests may exceed the firmware's UMA allocation, drawing on GTT,
+is part of qualification. A load that does not fit stops with the size and tensors that failed.
+
 ```bash
 uv sync --locked --python 3.14
 DEV=AMD uv run python -c "from tinygrad import Device; print(Device['AMD'].arch)"
@@ -47,6 +51,7 @@ speculation with their matching weights before describing them as hardware-verif
 ## Qualification
 
 1. Confirm device detection, allocation, kernel correctness, and stable repeated generation.
+   Load a model close to the memory configuration's limit.
 2. Compare model quality against reference execution and llama.cpp using matching GGUF files.
 3. Measure prefill/decode, first-token latency, and memory at documented contexts and slot counts.
 4. Exercise concurrent requests, cancellation, model switching, vision, and embeddings.

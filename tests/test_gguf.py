@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 from gguf.quants import dequantize
 
+from leatengine import gguf as reader
 from leatengine.gguf import GGUF
 from leatengine.quant import GGMLType
 from tests.helpers import random_blocks
@@ -83,6 +84,41 @@ def test_load(tiny_gguf):
     # or only those named
     assert list(GGUF.open(path).load(names=["q6_k"])) == ["q6_k"]
     assert GGUF.open(path).load(names=[]) == {}
+
+
+def test_load_read_only(tiny_gguf):
+    path, tensors = tiny_gguf
+    path.chmod(0o444)
+    np.testing.assert_array_equal(GGUF.open(path).load()["f32"].dequant().numpy(), tensors["f32"])
+
+
+def test_load_runs(tiny_gguf, monkeypatch):
+    # tensors adjacent in the file share a read and a buffer, up to CHUNK bytes; one not named
+    # splits them
+    path, tensors = tiny_gguf
+    f = GGUF.open(path)
+    infos = [f.tensors[n] for n in ("f32", "f16", "q8_0", "q6_k")]
+
+    def runs(names: list[str]) -> list[list[str]]:
+        return [[t.name for t in run] for run in reader._runs([f.tensors[n] for n in names], 32)]
+
+    assert runs(["q6_k", "f32", "f16", "q8_0"]) == [["f32", "f16", "q8_0", "q6_k"]]
+    assert runs(["f32", "q8_0", "q6_k"]) == [["f32"], ["q8_0", "q6_k"]]
+    monkeypatch.setattr(reader, "CHUNK", infos[2].offset + infos[2].nbytes - infos[0].offset)
+    assert runs(["f32", "f16", "q8_0", "q6_k"]) == [["f32", "f16", "q8_0"], ["q6_k"]]
+    loaded = f.load()
+    expected = dequantize(tensors["q6_k"], gguf.GGMLQuantizationType.Q6_K)
+    np.testing.assert_array_equal(loaded["q6_k"].dequant().numpy().ravel(), expected.ravel())
+    np.testing.assert_array_equal(loaded["f32"].dequant().numpy(), tensors["f32"])
+
+
+def test_load_out_of_memory(tiny_gguf, monkeypatch):
+    def full(self, device):
+        raise MemoryError("Allocation failed")
+
+    monkeypatch.setattr(reader.Tensor, "clone", full)
+    with pytest.raises(MemoryError, match="no room for .* of f32 to q6_k, with 0.00 GiB loaded"):
+        GGUF.open(tiny_gguf[0]).load()
 
 
 def test_not_gguf(tmp_path):
