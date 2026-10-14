@@ -15,7 +15,7 @@ from tests.helpers import cuts, glu, random_blocks
 # the warp-level kernels run on NVIDIA's GPUs and AMD's RDNA, tinygrad's emulated one too, and those
 # on tensor cores on NVIDIA's and RDNA 3's
 pytestmark = [pytest.mark.gpu]
-MATRIX_CORES = os.environ.get("DEV", "").split(":")[0] in ("NV", "CUDA", "AMD", "MOCK+AMD")
+MATRIX_CORES = kernels.on_matrix_cores(Tensor.empty(1))  # not RDNA 4's, whose WMMA differs
 matrix_cores = pytest.mark.skipif(not MATRIX_CORES, reason="tensor-core kernels need a GPU of them")
 Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q5_0, Q8_0, MXFP4 = (
     GGMLType[t] for t in ("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q5_0", "Q8_0", "MXFP4")
@@ -447,8 +447,8 @@ def test_norm_and_residual(tokens):
 
 
 # one token takes the matrix-vector kernels where the matrices are wide enough, else as several
-# tokens do, with gate and up in tiles of 256 rows or, for few rows, 128, or 64 where 128 do not
-# divide them, and 5 in tiles of 16 tokens, of 64 rows for Q6_K: Gemma 4's MLP, of GELU and Q5_0
+# tokens do, with gate and up in tiles of 256 rows, or 192 where those do not divide them, or for
+# few rows, 128, and 5 in tiles of 16 tokens, of 64 rows for Q6_K: Gemma 4's MLP, of GELU and Q5_0
 # rows of 2112, without the residual
 @pytest.mark.parametrize(
     "tokens, hidden, gate_type, down_type, kind",
@@ -1029,8 +1029,8 @@ def test_attention_sinks(tokens, start, window):
     np.testing.assert_allclose(got, expected, rtol=3e-3, atol=3e-3)
 
 
-# gpt-oss: experts with biases of gate, up and down, and the clamped SwiGLU; of MXFP4 for one
-# token and a few on the matrix-vector kernels, of Q8_0 for more on tensor cores too
+# gpt-oss: experts with biases of gate, up and down, and the clamped SwiGLU, of MXFP4 and Q8_0:
+# one token and a few on the matrix-vector kernels, more on the tensor cores
 @pytest.mark.parametrize(
     "ggml_type, tokens",
     [
