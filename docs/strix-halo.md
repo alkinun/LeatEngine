@@ -34,11 +34,21 @@ Linux TTM/GTT limits can affect usable memory; verify their behavior on this mac
 applying tuning. No kernel-memory settings are assumed validated here.
 
 Weights load in buffers of up to 1 GiB of adjacent tensors, which tinygrad requests from the
-driver as VRAM. Whether those requests may exceed the firmware's UMA allocation, drawing on GTT,
-is part of qualification. A load that does not fit stops with the size and tensors that failed.
+driver as VRAM. On an APU whose firmware carve-out is smaller than its GTT, amdgpu serves such
+requests from GTT, so a small carve-out and a large GTT, as AMD's
+[Strix Halo guide](https://rocm.docs.amd.com/en/latest/how-to/system-optimization/strixhalo.html)
+recommends, should let the GPU's buffers take most of memory. This comes from the driver's
+source; confirming it on the machine is part of qualification. A load that does not fit stops
+with the size and tensors that failed.
+
+`leatengine doctor` reports the kernel, access to `/dev/kfd` and the render node, the GPU and its
+firmware, the carve-out, GTT and TTM's limit, and clang; it compiles a kernel for the GPU, runs
+one there, and says in which pool a 1 GiB buffer lands. Its report holds most of what the
+qualification records, and what to change where something will not do.
 
 ```bash
 uv sync --locked --python 3.14
+uv run leatengine doctor
 DEV=AMD uv run python -c "from tinygrad import Device; print(Device['AMD'].arch)"
 DEV=AMD uv run pytest -m gpu
 DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp /path/to/llama.cpp/build/bin
