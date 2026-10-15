@@ -214,8 +214,9 @@ class _Completion:
 
 
 class Server(ThreadingHTTPServer):
-    """Serves GGUF models at http://host:port, the API at /v1 and its metrics at /metrics, until
-    shut down, to the requests that hold one of the `keys`, if given, and to any otherwise. A
+    """Serves GGUF models at http://host:port, the API at /v1, its metrics at /metrics and whether
+    it is ready at /health, until shut down, to the requests that hold one of the `keys`, if
+    given, and to any otherwise, but for /health, which needs none. A
     request's sampling is what it asks for, else the `sampling` an operator sets of the model, if
     given, else what the model's makers recommend, as leatengine.defaults has it.
 
@@ -647,11 +648,13 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self.path = urllib.parse.urlsplit(self.path).path  # without a query, ?v=2 say
-        routes = {"/v1/models": self._models, "/metrics": self._metrics}
+        routes = {"/v1/models": self._models, "/metrics": self._metrics, "/health": self._health}
         with self._counted(self.path in routes):
             if (route := routes.get(self.path)) is None:
                 return self._error(404, f"there is no GET {self.path}")
-            if self._authorized():
+            # whether the server is ready tells nothing a key keeps, and who waits for it, as a
+            # supervisor that started it, may hold none
+            if self.path == "/health" or self._authorized():
                 self._run(route)
 
     def do_POST(self) -> None:
@@ -732,6 +735,15 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _models(self) -> None:
         self._json(200, {"object": "list", "data": [self._model(m) for m in self.server.models]})
+
+    def _health(self) -> None:
+        # ready once a model is loaded, warmed up, and no load waits, as llama.cpp's server
+        # answers it: unready, 503, before, as completions would wait or fail
+        if self.server.loading_now():
+            return self._error(503, "a model is loading")
+        if self.server.loaded is None:
+            return self._error(503, "no model is loaded")
+        self._json(200, {"status": "ok"})
 
     def _metrics(self) -> None:
         # the counters, and the gauges of now: the slots, those busy, the completions waiting,

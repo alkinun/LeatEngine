@@ -167,6 +167,42 @@ def test_completion_waits_for_every_load(tiny_model, tmp_path, monkeypatch):
             loading.join()
 
 
+def health(server: Server) -> tuple[int, dict]:
+    url = f"http://127.0.0.1:{server.server_port}/health"
+    try:
+        with urllib.request.urlopen(url) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def test_health(tiny_model, tmp_path, monkeypatch):
+    # unready, 503, till a model is loaded and warmed up, and ready, 200, then; asked with no key
+    # of a server that has keys, as a supervisor that started it may hold none
+    (keys := Keys(tmp_path / "keys.json")).add("alkin")
+    warming, warm, warm_up = threading.Event(), threading.Event(), Engine.warm_up
+
+    def held(self: Engine) -> None:  # till the test lets it go on
+        warming.set()
+        warm.wait(60)
+        warm_up(self)
+
+    monkeypatch.setattr(Engine, "warm_up", held)
+    with serving(tiny_model[0], max_context=CONTEXT, keys=keys) as server:
+        status, body = health(server)
+        assert (status, body["error"]["message"]) == (503, "no model is loaded")
+        loading = threading.Thread(target=server.load, args=("tiny",))
+        loading.start()
+        try:
+            assert warming.wait(60)
+            status, body = health(server)
+            assert (status, body["error"]["message"]) == (503, "a model is loading")
+        finally:
+            warm.set()
+            loading.join()
+        assert health(server) == (200, {"status": "ok"})
+
+
 def test_api_alone(server):
     # only API routes are served
     with pytest.raises(urllib.error.HTTPError, match="404"):

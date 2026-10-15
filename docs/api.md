@@ -1,8 +1,8 @@
 # HTTP API and configuration
 
 Start with `leatengine serve MODEL.gguf`. The default address is `http://127.0.0.1:8080`.
-The API implements a subset of OpenAI chat completions and embeddings, plus model-management
-and metrics extensions. It serves no HTML, frontend, or browser application.
+The API implements a subset of OpenAI chat completions and embeddings, plus model-management,
+metrics and health extensions. It serves no HTML, frontend, or browser application.
 
 ## Endpoints
 
@@ -13,11 +13,13 @@ and metrics extensions. It serves no HTML, frontend, or browser application.
 | `POST /v1/chat/completions` | Generate one reply, optionally streamed |
 | `POST /v1/embeddings` | Embed text using the separately configured embedding model |
 | `GET /metrics` | Prometheus metrics with the `leatengine_` prefix |
+| `GET /health` | `200` once a chat model is loaded and warmed up, `503` until then |
 
-All routes use the same authentication when keys are enabled. Request bodies are limited to
-64 MiB. Errors use an `error` object with `message`, `type`, `param`, and `code`. A generation
-error after streaming starts arrives as an SSE error event; clients must handle that as well as
-HTTP errors.
+All routes but `/health` use the same authentication when keys are enabled; `/health` needs no
+key, so that a supervisor can wait for the server to be ready, as llama.cpp's server allows.
+Request bodies are limited to 64 MiB. Errors use an `error` object with `message`, `type`,
+`param`, and `code`. A generation error after streaming starts arrives as an SSE error event;
+clients must handle that as well as HTTP errors.
 
 ## Models
 
