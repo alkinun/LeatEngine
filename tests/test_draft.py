@@ -221,7 +221,7 @@ def test_no_room_for_the_drafter(tiny, monkeypatch, capsys):
         return Engine(path, **options)
 
     monkeypatch.setattr("leatengine.server.Engine", engine)
-    with serving(tiny("qwen35")[0], max_context=CONTEXT) as server:
+    with serving(tiny("qwen35")[0], max_context=CONTEXT, prefill_chunk=8) as server:
         server.load("tiny")
         assert server.loaded.engine.drafter is None
         assert "so it decodes without drafting" in capsys.readouterr().err
