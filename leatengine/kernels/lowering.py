@@ -15,8 +15,10 @@ import hashlib
 import multiprocessing
 import os
 import pathlib
+import pickle
 import re
 import weakref
+import zlib
 from typing import Any
 
 import tinygrad
@@ -25,7 +27,8 @@ from tinygrad.helpers import CCACHE, diskcache_get, diskcache_put
 
 from leatengine.kernels import clang
 
-TABLE = "leatengine_programs"  # of tinygrad's disk cache
+# of tinygrad's disk cache: each row a program's pickle, compressed, and its SHA-256 before it
+TABLE = "leatengine_checked_programs"
 # the environment variables tinygrad's source reads, by name
 _READ = re.compile(rb"""(?:getenv|ContextVar)\(\s*["']([A-Z0-9_]+)["']""")
 
@@ -76,11 +79,11 @@ def canonicalize_once() -> None:
 
 def keep_programs() -> None:
     """Makes tinygrad keep the programs it lowers in its disk cache, as it keeps their binaries, and
-    read them there before it lowers one: Llama 3.1 8B's 160 take 5 MB, and loaded, a later start's
-    warm-up takes 12 s rather than 18. A program's row is by the key of tinygrad's own cache of
-    them and what else makes a program: the source of tinygrad and of the AMD renderer, clang's
-    flags, and the environment variables tinygrad reads, so that a change to any lowers anew.
-    CACHELEVEL=0 or CCACHE=0 turn it off, as they do tinygrad's."""
+    read them there before it lowers one: Llama 3.1 8B's 160 take 1.2 MB, compressed, and loaded, a
+    later start's warm-up takes 12 s rather than 18. A program's row is by the key of tinygrad's own
+    cache of them and what else makes a program: the source of tinygrad and of the AMD renderer,
+    clang's flags, and the environment variables tinygrad reads, so that a change to any lowers
+    anew. CACHELEVEL=0 or CCACHE=0 turn it off, as they do tinygrad's."""
     import tinygrad.codegen as codegen
     import tinygrad.engine.realize as realize
 
@@ -101,19 +104,26 @@ class _Programs(dict[tuple, UOp]):
 
     def __setitem__(self, key: tuple, program: UOp) -> None:
         if dict.get(self, key) is not program and (name := _name(key)) is not None:
-            diskcache_put(TABLE, name, program)
+            data = zlib.compress(pickle.dumps(program), 1)
+            diskcache_put(TABLE, name, (hashlib.sha256(data).digest(), data))
         dict.__setitem__(self, key, program)
 
     def _load(self, key: Any) -> bool:
+        # a row damaged on its way to the disk or back, which its digest tells, or that no longer
+        # unpickles, is lowered anew and written over: it would be served at every start
         if (name := _name(key)) is None:
             return False
         try:
-            program = diskcache_get(TABLE, name)
-        except Exception:  # a row that no longer unpickles: lowered anew, and written over
+            if (row := diskcache_get(TABLE, name)) is None:
+                return False
+            digest, data = row
+            if hashlib.sha256(data).digest() != digest:
+                return False
+            program = pickle.loads(zlib.decompress(data))
+        except Exception:
             return False
-        if program is not None:
-            dict.__setitem__(self, key, program)
-        return program is not None
+        dict.__setitem__(self, key, program)
+        return True
 
 
 def _name(key: tuple) -> str | None:

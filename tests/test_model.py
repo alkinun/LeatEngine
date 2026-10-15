@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
-from tinygrad.helpers import Context
+from tinygrad.helpers import Context, diskcache_get, diskcache_put
 
 from leatengine import bench, ops
 from leatengine.engine import FEW_TOKENS, KEEP_BACK, Engine, graph
@@ -545,6 +545,10 @@ def test_lowered_programs_kept(monkeypatch):
     dict.pop(programs, key)
     with Context(CCACHE=0):  # as tinygrad keeps no binaries, no programs either
         assert key not in programs
+    # a row a flipped bit damaged is lowered anew rather than served
+    digest, data = diskcache_get(lowering.TABLE, name := lowering._name(key))
+    diskcache_put(lowering.TABLE, name, (digest, bytes([data[0] ^ 1]) + data[1:]))
+    assert key not in programs
     fingerprint = lowering._fingerprint()
     monkeypatch.setenv("ALIGNED", "0")  # a switch tinygrad's C renderers read, which programs hold
     assert lowering._fingerprint.__wrapped__() != fingerprint
