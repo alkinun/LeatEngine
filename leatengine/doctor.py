@@ -25,6 +25,9 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
+from leatengine import machine
+from leatengine.machine import GPU, number, read
+
 TARGET = "gfx1151"  # Strix Halo's GPU, the one LeatEngine is made for
 # the first Linux with KFD's fixes for gfx1151, as AMD's Strix Halo guide gives it for most
 # distributions; Ubuntu 24.04's HWE and OEM kernels have them from 6.17.0-19 and 6.14.0-1018 on
@@ -34,10 +37,6 @@ GUIDE = "https://rocm.docs.amd.com/en/latest/how-to/system-optimization/strixhal
 # models do not fit: GTT's default is about half
 ENOUGH = 0.6
 RUN_SECONDS = 120  # for the GPU's run, compiles included, before it counts as hung
-# the RDNA 3 and 3.5 APUs, whose GPU memory is the machine's own: Phoenix's, Strix Point's,
-# Strix Halo's and Krackan Point's
-_APUS = ("gfx1103", "gfx1150", "gfx1151", "gfx1152")
-_NODES = "sys/devices/virtual/kfd/kfd/topology/nodes"
 # a kernel for clang, as tinygrad renders one for AMD's GPUs
 _KERNEL = 'extern "C" __attribute__((global)) void doctor(float* x) { x[0] = 1.0f; }'
 
@@ -53,25 +52,14 @@ class Check:
     fix: str = ""
 
 
-@dataclass
-class GPU:
-    """An AMD GPU, as KFD's topology lists it."""
-
-    arch: str  # as gfx1151
-    cus: int
-    render: int  # its render node's minor, of /dev/dri/renderD<render>
-    firmware: str  # its compute and SDMA engines' firmware versions
-    apu: bool  # whether its memory is the machine's own
-
-
 def checks(root: Path = Path("/"), run: bool = True) -> list[Check]:
     """The checks of the system whose files are under `root`; `run` runs a kernel on the GPU when
     nothing before it failed."""
-    ram = _meminfo(root)
+    ram = machine.ram(root)
     found = [_machine(root), _cpu(root, ram), _system(root), _kernel(root), *_environment()]
-    if (profile := _read(root / "sys/firmware/acpi/platform_profile")) is not None:
+    if (profile := read(root / "sys/firmware/acpi/platform_profile")) is not None:
         found.append(Check("power mode", "info", profile))
-    gpus = _gpus(root)
+    gpus = machine.gpus(root)
     gpu = gpus[0] if gpus else None  # tinygrad's AMD:0
     found += [_device_file("/dev/kfd", root / "dev/kfd"), _gpu(gpus)]
     if gpu is not None:
@@ -153,26 +141,19 @@ def probe(render: int | None) -> None:
     dev = Device[device]
     total = Tensor.ones(4096, device=device).sum().item()
     pool = None
-    if render is not None and (before := _used(render)):
+    if render is not None and (before := machine.used(render)):
         buffer = Buffer(device, 1 << 30, preallocate=True)
         dev.synchronize()
-        grew = {name: used - before.get(name, used) for name, used in _used(render).items()}
+        grew = {name: used - before.get(name, used) for name, used in machine.used(render).items()}
         buffer.deallocate()
         pool = max(grew, key=lambda name: grew[name]) if max(grew.values()) >= 1 << 29 else None
     print(json.dumps({"arch": getattr(dev, "arch", device), "sum": total, "pool": pool}))
 
 
-def _used(render: int) -> dict[str, int]:
-    # how much of GTT and of VRAM, the carve-out of an APU, the driver reports in use
-    device = Path(f"/sys/class/drm/renderD{render}/device")
-    used = {pool.upper(): _number(device / f"mem_info_{pool}_used") for pool in ("gtt", "vram")}
-    return {pool: n for pool, n in used.items() if n is not None}
-
-
 def _machine(root: Path) -> Check:
     dmi = root / "sys/class/dmi/id"
-    vendor, product = _read(dmi / "sys_vendor"), _read(dmi / "product_name")
-    bios, date = _read(dmi / "bios_version"), _read(dmi / "bios_date")
+    vendor, product = read(dmi / "sys_vendor"), read(dmi / "product_name")
+    bios, date = read(dmi / "bios_version"), read(dmi / "bios_date")
     found = " ".join(x for x in (vendor, product) if x) or "unknown"
     if bios:
         found += f", BIOS {bios}" + (f" of {date}" if date else "")
@@ -180,20 +161,20 @@ def _machine(root: Path) -> Check:
 
 
 def _cpu(root: Path, ram: int | None) -> Check:
-    model = re.search(r"model name\s*:\s*(.*)", _read(root / "proc/cpuinfo") or "")
+    model = re.search(r"model name\s*:\s*(.*)", read(root / "proc/cpuinfo") or "")
     found = model.group(1).strip() if model else "unknown"
     return Check("cpu", "info", found + (f", {_gib(ram)} of memory" if ram is not None else ""))
 
 
 def _system(root: Path) -> Check:
-    release = _read(root / "etc/os-release") or _read(root / "usr/lib/os-release") or ""
+    release = read(root / "etc/os-release") or read(root / "usr/lib/os-release") or ""
     name = re.search(r'^PRETTY_NAME="?([^"\n]*)"?', release, re.M)
     return Check("system", "info", f"{name.group(1) if name else 'Linux'}, Python "
                                    f"{platform.python_version()}")  # fmt: skip
 
 
 def _kernel(root: Path) -> Check:
-    release = _read(root / "proc/sys/kernel/osrelease") or platform.release()
+    release = read(root / "proc/sys/kernel/osrelease") or platform.release()
     version = tuple(int(n) for n in re.findall(r"\d+", release.split("-")[0])[:3])
     if version >= KERNEL:
         return Check("kernel", "ok", release)
@@ -210,29 +191,6 @@ def _environment() -> list[Check]:
         return []
     return [Check("DEV", "warn", f"{dev}: LeatEngine runs there rather than on the AMD GPU",
                   "unset DEV, or set DEV=AMD")]  # fmt: skip
-
-
-def _gpus(root: Path) -> list[GPU]:
-    # KFD's GPUs, in tinygrad's order: its nodes with a GPU id, by number
-    nodes = root / _NODES
-    if not nodes.is_dir():
-        return []
-    gpus = []
-    for node in sorted((n for n in nodes.iterdir() if n.name.isdigit()), key=lambda n: int(n.name)):
-        if (_read(node / "gpu_id") or "0") == "0":
-            continue
-        props = {}
-        for line in (_read(node / "properties") or "").splitlines():
-            key, _, value = line.partition(" ")
-            with contextlib.suppress(ValueError):
-                props[key] = int(value)
-        v = props.get("gfx_target_version", 0)
-        arch = f"gfx{v // 10000}{v // 100 % 100:x}{v % 100:x}"  # as tinygrad names it
-        cus = props.get("simd_count", 0) // max(props.get("simd_per_cu", 1), 1)
-        firmware = f"MEC {props.get('fw_version', '?')}, SDMA {props.get('sdma_fw_version', '?')}"
-        apu = arch in _APUS or props.get("cpu_cores_count", 0) > 0
-        gpus.append(GPU(arch, cus, props.get("drm_render_minor", 128), firmware, apu))
-    return gpus
 
 
 def _gpu(gpus: list[GPU]) -> Check:
@@ -268,10 +226,10 @@ def _device_file(name: str, path: Path) -> Check:
 def _memory(root: Path, gpu: GPU, ram: int | None) -> list[Check]:
     # where the GPU's buffers come from, and so how much of them there can be. tinygrad asks KFD
     # for VRAM, which amdgpu serves from GTT on an APU whose carve-out is less than its GTT
-    device = root / f"sys/class/drm/renderD{gpu.render}/device"
-    vram, gtt = (_number(device / f"mem_info_{pool}_total") for pool in ("vram", "gtt"))
+    pools = machine.sizes(gpu.render, root)
+    vram, gtt = pools.get("VRAM"), pools.get("GTT")
     limit = []
-    if (pages := _number(root / "sys/module/ttm/parameters/pages_limit")) is not None:
+    if (pages := number(root / "sys/module/ttm/parameters/pages_limit")) is not None:
         size = pages * os.sysconf("SC_PAGE_SIZE")
         limit.append(Check("ttm limit", "info", f"{pages} pages, {_gib(size)}"))
     if vram is None or gtt is None:
@@ -338,24 +296,6 @@ def _tinygrad() -> str:
 def _output(*args: str) -> str:
     done = subprocess.run(args, capture_output=True, text=True, timeout=30, check=True)
     return done.stdout.strip()
-
-
-def _meminfo(root: Path) -> int | None:
-    # the memory Linux has, in bytes, which leaves out the GPU's carve-out
-    total = re.search(r"MemTotal:\s*(\d+)\s*kB", _read(root / "proc/meminfo") or "")
-    return int(total.group(1)) * 1024 if total else None
-
-
-def _read(path: Path) -> str | None:
-    try:
-        return path.read_text().strip()
-    except OSError:
-        return None
-
-
-def _number(path: Path) -> int | None:
-    text = _read(path)
-    return int(text) if text is not None and text.isdigit() else None
 
 
 def _group(path: Path) -> str:

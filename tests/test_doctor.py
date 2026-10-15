@@ -8,21 +8,7 @@ import pytest
 from leatengine import doctor
 from leatengine.cli import main
 from leatengine.doctor import Check
-
-GIB = 2**30
-GPU_NODE = {"cpu_cores_count": 0, "simd_count": 80, "simd_per_cu": 2, "gfx_target_version": 110501,
-            "drm_render_minor": 128, "fw_version": 37, "sdma_fw_version": 14}  # fmt: skip
-
-
-def write(root, files: dict) -> None:
-    for name, text in files.items():
-        path = root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"{text}\n")
-
-
-def properties(props: dict) -> str:
-    return "\n".join(f"{key} {value}" for key, value in props.items())
+from tests.helpers import GIB, GPU_NODE, properties, write
 
 
 @pytest.fixture
