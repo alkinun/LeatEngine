@@ -552,9 +552,30 @@ def test_lowered_programs_kept(monkeypatch):
         m.setattr(lowering, "_fingerprint", lambda: "another tinygrad")
         assert key not in programs and programs.get(key) is None
     # a row a flipped bit damaged is lowered anew rather than served
-    digest, data = diskcache_get(lowering.TABLE, name := lowering._name(key))
-    diskcache_put(lowering.TABLE, name, (digest, bytes([data[0] ^ 1]) + data[1:]))
+    digest, data = diskcache_get(lowering.PROGRAMS, name := lowering._program(key))
+    diskcache_put(lowering.PROGRAMS, name, (digest, bytes([data[0] ^ 1]) + data[1:]))
     assert key not in programs
+
+
+def test_schedules_kept(monkeypatch):
+    # a schedule tinygrad makes goes to its disk cache too, where a process that has not made it
+    # finds it; another tinygrad, or a damaged row, schedules anew
+    import tinygrad.schedule as schedule
+
+    from leatengine.kernels import lowering
+
+    schedules, before = schedule.schedule_cache, set(dict.keys(schedule.schedule_cache))
+    (Tensor.arange(11) * 19 - Tensor.ones(11)).realize()
+    key = next(iter(set(dict.keys(schedules)) - before))
+    made = dict.pop(schedules, key)
+    assert key in schedules and schedules[key].key == made.key
+    dict.pop(schedules, key)
+    with monkeypatch.context() as m:
+        m.setattr(lowering, "_fingerprint", lambda: "another tinygrad")
+        assert key not in schedules and schedules.get(key) is None
+    digest, data = diskcache_get(lowering.SCHEDULES, name := lowering._schedule(key))
+    diskcache_put(lowering.SCHEDULES, name, (digest, bytes([data[0] ^ 1]) + data[1:]))
+    assert key not in schedules
 
 
 def test_one_generation_at_a_time(tiny_model):
