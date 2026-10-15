@@ -3,7 +3,6 @@
 Spec: https://github.com/ggml-org/ggml/blob/master/docs/gguf.md
 """
 
-import ctypes
 import io
 import math
 import mmap
@@ -15,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from tinygrad import Device, Tensor, dtypes
+from tinygrad.device import Buffer
 
 from leatengine.quant import BLOCK, NATIVE, GGMLType, QTensor
 
@@ -96,15 +96,18 @@ class GGUF:
             return {}
         device = Device.canonicalize(device)
         runs = _runs(tensors, self.metadata.get("general.alignment", 32))
-        host = bytearray(max(_end(run[-1]) - run[0].offset for run in runs))
-        address, out, loaded = ctypes.addressof(ctypes.c_char.from_buffer(host)), {}, 0
+        # tinygrad's own memory, which a GPU maps to copy from: once, as the buffer lives on
+        largest = max(_end(run[-1]) - run[0].offset for run in runs)
+        host = Tensor.empty(largest, dtype=dtypes.uint8, device="CPU").realize()
+        assert isinstance(buffer := host.uop.buffer, Buffer)
+        memory = buffer.ensure_allocated().as_memoryview(allow_zero_copy=True)
+        out, loaded = {}, 0
         with open(self.path, "rb", buffering=0) as f:
             for run in runs:
                 start, size = run[0].offset, _end(run[-1]) - run[0].offset
-                _read(f, start, memoryview(host)[:size])
-                staged = Tensor.from_blob(address, (size,), dtype=dtypes.uint8, device="CPU")
+                _read(f, start, memory[:size])
                 try:
-                    data = staged.clone(device).realize()
+                    data = host[:size].clone(device).realize()
                     Device[device].synchronize()  # before the next run overwrites the host buffer
                 except MemoryError as e:
                     raise MemoryError(
