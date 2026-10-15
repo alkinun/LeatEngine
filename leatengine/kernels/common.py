@@ -178,6 +178,17 @@ def rounded(x: UOp, y: UOp) -> UOp:
     return UOp(Ops.CUSTOMI, src=(x, y), arg=(code, dtypes.float32))
 
 
+def q8_scale(amax: UOp) -> UOp:
+    # the scale of int8 values of a group whose largest magnitude is amax, amax / 127, as
+    # llama.cpp's q8_0 and q8_1, the division exact
+    return UOp(Ops.CUSTOMI, src=(amax,), arg=("({}/127.0f)", dtypes.float32))
+
+
+def q8(x: UOp, scale: UOp) -> UOp:
+    # x as an int8 value of its group's scale, round(x / scale), or 0 for a group of zeros, as int32
+    return (scale > 0).where(rounded(x, scale), 0.0).cast(dtypes.int32)
+
+
 def warp_sum(value: UOp, lanes: int = WARP, op: Callable[[UOp, UOp], UOp] = UOp.__add__) -> UOp:
     # over each aligned run of `lanes` lanes
     for mask in (16, 8, 4, 2, 1)[5 - lanes.bit_length() + 1 :]:

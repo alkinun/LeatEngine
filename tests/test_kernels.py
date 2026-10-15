@@ -9,7 +9,7 @@ from tinygrad import Tensor, UOp, dtypes
 from leatengine import kernels, ops
 from leatengine.kernels import MATVEC_TOKENS
 from leatengine.kernels.cutoff import BINS, RANGE
-from leatengine.quant import BLOCK, GGMLType, QTensor
+from leatengine.quant import BLOCK, GGMLType, QTensor, from_q8_0, q8_0_row
 from tests.helpers import cuts, glu, random_blocks
 
 # the warp-level kernels run on NVIDIA's GPUs and AMD's RDNA, tinygrad's emulated one too, and those
@@ -512,6 +512,30 @@ def slot(symbolic: bool) -> int | UOp:
     return UOp.variable("slot", 0, SLOTS - 1).bind(SLOT) if symbolic else SLOT
 
 
+def empty_cache(kv_heads: int, positions: int, dim: int, cache_type: str = "f16") -> Tensor:
+    # a cache of zeros: of f16 values, or of q8_0 rows
+    width, dtype = (q8_0_row(dim), dtypes.uint8) if cache_type == "q8_0" else (dim, dtypes.half)
+    return Tensor.zeros(2, SLOTS, kv_heads, positions, width, dtype=dtype).contiguous().realize()
+
+
+def held(cache: Tensor, dim: int) -> np.ndarray:
+    # a cache's keys and values, in f32
+    return (from_q8_0(cache, dim) if cache.dtype == dtypes.uint8 else cache.float()).numpy()
+
+
+def assert_same_cache(got: Tensor, expected: Tensor, dim: int) -> None:
+    # caches of the same keys and values, as the kernels and the reference ops store them: f16's
+    # within its rounding, or q8_0's the same bytes but where a value rounds the other way, now
+    # and then, a step of its scale
+    values = held(expected, dim)
+    if got.dtype != dtypes.uint8:
+        np.testing.assert_allclose(held(got, dim), values, rtol=1e-3, atol=1e-3)
+        return
+    assert (got.numpy() != expected.numpy()).mean() < 0.01
+    step = np.abs(values).max() / 127
+    np.testing.assert_allclose(held(got, dim), values, rtol=0, atol=1.01 * step)
+
+
 def reference_attention(
     q: np.ndarray, cache: np.ndarray, start: int, window: int = 0, scale: float | None = None,
     sinks: np.ndarray | None = None, slot: int = SLOT, causal: bool = True,
@@ -740,7 +764,9 @@ def test_flash_attention_not_causal(tokens, start, kv_heads, dim, window, symbol
 )
 @pytest.mark.parametrize("symbolic", [False, True])
 @pytest.mark.parametrize("rotated", [128, 96, 0])  # all, Phi-4-mini's 3/4, and SmolLM3's NoPE
-def test_rotate(monkeypatch, halves, biased, normed, v_norm, kv_heads, symbolic, rotated):
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
+def test_rotate(monkeypatch, halves, biased, normed, v_norm, kv_heads, symbolic, rotated,
+                cache_type):  # fmt: skip
     rng = np.random.default_rng(18)
     dim, pos = 128, 300
     q, k, v = (
@@ -767,22 +793,22 @@ def test_rotate(monkeypatch, halves, biased, normed, v_norm, kv_heads, symbolic,
     results = []
     for mode in ("auto", "ref"):
         monkeypatch.setenv("LEATENGINE_KERNELS", mode)
-        cache = Tensor.zeros(2, SLOTS, kv_heads, 512, dim, dtype=dtypes.half).contiguous().realize()
+        cache = empty_cache(kv_heads, 512, dim, cache_type)
         assert kernels.supports_rotate(q, cache)
         spans = [ops.Span(slot(symbolic), start)]
         out, cache = ops.rotate(q, k, v, cache, spans, rope, halves, biases, norms, v_norm, 1e-6)
         Tensor.realize(out, cache)  # in one schedule, as in the model: alone, either loses vars
-        results.append((out.numpy(), cache.numpy()))
-    np.testing.assert_allclose(results[0][0], results[1][0], rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(
-        results[0][1].astype(np.float32), results[1][1], rtol=1e-3, atol=1e-3
-    )
-    assert np.abs(results[0][1][:, SLOT, :, pos]).sum() > 0
+        results.append((out, cache))
+    (out, cache), (ref_out, ref_cache) = results
+    np.testing.assert_allclose(out.numpy(), ref_out.numpy(), rtol=1e-5, atol=1e-5)
+    assert_same_cache(cache, ref_cache, dim)
+    assert np.abs(held(cache, dim)[:, SLOT, :, pos]).sum() > 0
 
 
 @pytest.mark.parametrize("symbolic", [False, True])
 @pytest.mark.parametrize("per_slot", [False, True])
-def test_rotate_rows(monkeypatch, symbolic, per_slot):
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
+def test_rotate_rows(monkeypatch, symbolic, per_slot, cache_type):
     # tokens of a decode step, each at a position of a slot of its own or two in one slot, with
     # Qwen2's halves and biases, and tables of RoPE shared or each slot's, as M-RoPE's: the
     # kernel as the reference ops, span by span
@@ -806,13 +832,14 @@ def test_rotate_rows(monkeypatch, symbolic, per_slot):
     results = []
     for mode in ("auto", "ref"):
         monkeypatch.setenv("LEATENGINE_KERNELS", mode)
-        cache = Tensor.zeros(2, SLOTS, kv_heads, 512, dim, dtype=dtypes.half).contiguous().realize()
+        cache = empty_cache(kv_heads, 512, dim, cache_type)
         out, cache = ops.rotate(q, k, v, cache, spans, rope, True, biases, None, False, 1e-6)
         Tensor.realize(out, cache)
-        results.append((out.numpy(), cache.numpy().astype(np.float32)))
-    np.testing.assert_allclose(results[0][0], results[1][0], rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(results[0][1], results[1][1], rtol=1e-3, atol=1e-3)
-    assert all(np.abs(results[0][1][:, s, :, p]).sum() > 0 for s, p in rows)
+        results.append((out, cache))
+    (out, cache), (ref_out, ref_cache) = results
+    np.testing.assert_allclose(out.numpy(), ref_out.numpy(), rtol=1e-5, atol=1e-5)
+    assert_same_cache(cache, ref_cache, dim)
+    assert all(np.abs(held(cache, dim)[:, s, :, p]).sum() > 0 for s, p in rows)
 
 
 # heads too wide for registers, Gemma 4's of 512: blocks take parts of their outputs
@@ -934,7 +961,8 @@ def test_flash_attention_ring(tokens, start, dim, window, size, causal, symbolic
 
 @pytest.mark.parametrize("symbolic", [False, True])
 @pytest.mark.parametrize("rows", [False, True])
-def test_rotate_ring(monkeypatch, symbolic, rows):
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
+def test_rotate_ring(monkeypatch, symbolic, rows, cache_type):
     # tokens stored in a ring at their positions mod its size, by the kernel as by the reference
     # ops, and as a whole cache holds them: a span that wraps the ring, or a decode step's rows
     rng = np.random.default_rng(20)
@@ -957,16 +985,16 @@ def test_rotate_ring(monkeypatch, symbolic, rows):
     results = []
     for mode, positions in (("auto", size), ("ref", size), ("ref", 512)):
         monkeypatch.setenv("LEATENGINE_KERNELS", mode)
-        cache = Tensor.zeros(2, SLOTS, kv_heads, positions, dim, dtype=dtypes.half)
-        cache = cache.contiguous().realize()
+        cache = empty_cache(kv_heads, positions, dim, cache_type)
         ring = positions == size
         out, cache = ops.rotate(q, k, v, cache, spans, rope, True, None, norms, True, 1e-6,
                                 ring=ring)  # fmt: skip
         Tensor.realize(out, cache)
-        results.append((out.numpy(), cache.numpy().astype(np.float32)))
+        results.append((out, cache))
     (out, ring), (ref_out, ref_ring), (_, whole) = results
-    np.testing.assert_allclose(out, ref_out, rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(ring, ref_ring, rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(out.numpy(), ref_out.numpy(), rtol=1e-5, atol=1e-5)
+    assert_same_cache(ring, ref_ring, dim)
+    ring, whole = held(ring, dim), held(whole, dim)
     for s, p in places:
         np.testing.assert_allclose(ring[:, s, :, p % size], whole[:, s, :, p], rtol=1e-3, atol=1e-3)
         assert np.abs(ring[:, s, :, p % size]).sum() > 0

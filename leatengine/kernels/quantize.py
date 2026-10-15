@@ -4,7 +4,7 @@ import functools
 import math
 
 from tinygrad import Tensor, UOp, dtypes
-from tinygrad.uop.ops import AxisType, KernelInfo, Ops
+from tinygrad.uop.ops import AxisType, KernelInfo
 
 from leatengine.kernels.common import (
     GROUP,
@@ -13,7 +13,8 @@ from leatengine.kernels.common import (
     carry,
     lane_range,
     load_vector,
-    rounded,
+    q8,
+    q8_scale,
     warp_max,
     warp_sum,
 )
@@ -27,13 +28,10 @@ def _quantize_group(
 ) -> list[UOp]:
     # 8 lanes quantize a group of 32 values, 4 consecutive ones each, the lane's `part` of the
     # group: d = max|x| / 127, q = round(x / d), s = d * sum(q), with q packed four per int32 word
-    # so matrix kernels read it without a copy; only where `inside` holds, if given. Custom
-    # expressions keep both divisions exact: tinygrad would multiply by a reciprocal.
+    # so matrix kernels read it without a copy; only where `inside` holds, if given
     amax = warp_max(functools.reduce(UOp.maximum, (v.maximum(-v) for v in values)), 8)
-    scale = UOp(Ops.CUSTOMI, src=(amax,), arg=("({}/127.0f)", dtypes.float32))
-    quants = []
-    for v in values:
-        quants.append((scale > 0).where(rounded(v, scale), 0.0).cast(dtypes.int32))
+    scale = q8_scale(amax)
+    quants = [q8(v, scale) for v in values]
     word = functools.reduce(
         UOp.__or__, ((x & 0xFF).cast(dtypes.uint32) << (8 * i) for i, x in enumerate(quants))
     )

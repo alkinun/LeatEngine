@@ -25,9 +25,12 @@ from leatengine.kernels.common import (
     on_rdna3,
     opaque,
     pick,
+    q8,
+    q8_scale,
     register,
     shfl_xor,
     turns,
+    warp_max,
     warp_sum,
 )
 
@@ -660,7 +663,8 @@ def flash_attention(
 def _rotate_kernel(
     out: UOp, cache: UOp, q: UOp, k: UOp, v: UOp, *extra: UOp,
     slots: tuple[int | UOp, ...] | int | UOp, positions: tuple[int | UOp, ...] | int | UOp,
-    rotated: int, halves: bool, biased: bool, v_norm: bool, eps: float, ring: bool = False,
+    dim: int, rotated: int, halves: bool, biased: bool, v_norm: bool, eps: float,
+    ring: bool = False, quantized: bool = False,
 ) -> UOp:  # fmt: skip
     # A warp per token and head of q, then of k and its v. Token t is in slot slots[t] at
     # positions[t], or for a single slot and position, in that slot at that position plus t. extra
@@ -669,12 +673,15 @@ def _rotate_kernel(
     # and k's norm weights if any. Each of q, k and v gets its bias; each head of q and k is then
     # normed with its weight, and of v without, if v_norm; the first `rotated` dimensions of q and k
     # are rotated, q into out as (heads, tokens, dim), the layout attention reads, and k into the
-    # cache with v. Lanes take pairs of dimensions: those that rotate together, i and
-    # i + rotated / 2 or adjacent ones, each pair i turning by angle cos[pos, i], sin[pos, i], and
-    # the others' adjacent pairs as they are. A ring holds position pos at pos mod its positions.
+    # cache with v, as f16, or if `quantized` as q8_0 rows (leatengine.quant), each 32 dimensions'
+    # scale from the warp's largest of them. Lanes take pairs of dimensions: those that rotate
+    # together, i and i + rotated / 2 or adjacent ones, each pair i turning by angle cos[pos, i],
+    # sin[pos, i], and the others' adjacent pairs as they are. A ring holds position pos at pos
+    # mod its positions.
     (cos, sin), extra = (extra[:2], extra[2:]) if rotated else ((None, None), extra)
     biases, norms = (extra[:3], extra[3:]) if biased else ((), extra)
-    _, cache_slots, kv_heads, cache_positions, dim = (int(d) for d in cache.shape)
+    # a position's head of the cache: dim f16 values, or a q8_0 row of bytes
+    _, cache_slots, kv_heads, cache_positions, stride = (int(d) for d in cache.shape)
     tokens = int(k.shape[0]) // (kv_heads * dim)
     heads, half, turning = int(out.shape[0]) // (tokens * dim), dim // 2, rotated // 2
     warp, lane = UOp.range(heads + kv_heads, 0, AxisType.GLOBAL), lane_range()
@@ -715,18 +722,37 @@ def _rotate_kernel(
 
     place = pos % cache_positions if ring else pos  # the token's row of the cache
 
-    def stored(kind: int, d: UOp) -> UOp:  # where dimension d of the warp's key or value goes
-        # of the warp, not of its opaque copy, an int32: tinygrad widens an index by its bounds,
-        # and a cache of 2^31 values or more needs 64 bits
+    def stored(kind: int, xs: list[tuple[UOp, UOp]]) -> list[UOp]:
+        # the stores of the warp's key or value, of its dimensions d and values x: of the warp,
+        # not of its opaque copy, an int32: tinygrad widens an index by its bounds, and a cache of
+        # 2^31 values or more needs 64 bits
         at = ((kind * cache_slots + slot) * kv_heads + warp - heads) * cache_positions + place
-        return cache.flatten()[(at * dim + d).valid(is_kv)]
+        at = at * stride
+        if not quantized:
+            return [cache.flatten()[(at + d).valid(is_kv)].store(x.cast(dtypes.half))
+                    for d, x in xs]  # fmt: skip
+        # each 32 dimensions' scale, which lane b stores of the b-th, then the values, int8 as
+        # bytes: tinygrad renders a view of int8 as vectors CUDA and HIP lack
+        scales = tuple(
+            q8_scale(warp_max(functools.reduce(
+                UOp.maximum, ((d // 32).eq(b).where(x.maximum(-x), 0.0) for d, x in xs)
+            )))
+            for b in range(dim // 32)
+        )  # fmt: skip
+        as_f16 = cache.flatten().bitcast(dtypes.half)
+        stores = [as_f16[((at + dim) // 2 + b).valid(is_kv & lane.eq(b))].store(x.cast(dtypes.half))
+                  for b, x in enumerate(scales)]  # fmt: skip
+        for d, x in xs:
+            value = (q8(x, pick(d // 32, scales)) & 0xFF).cast(dtypes.uint8)
+            stores.append(cache.flatten()[(at + d).valid(is_kv)].store(value))
+        return stores
 
     x = [of_q_or_k(q, k, d) for d in flat]
     if biases:
         x = [a + of_q_or_k(biases[0], biases[1], d, False) for a, d in zip(x, flat, strict=True)]
     if norms:
         x = normed(x, [is_q.where(*(w[d].load() for w in norms)) for d in flat])
-    stores = []
+    stores, keys = [], []
     for n, ((d0, d1), i) in enumerate(zip(dims, pairs, strict=True)):
         x0, x1 = x[2 * n], x[2 * n + 1]
         if WARP * n < turning:  # pairs past the rotated ones turn by 0
@@ -740,21 +766,20 @@ def _rotate_kernel(
             x0, x1 = x0 * c - x1 * s, x0 * s + x1 * c
         for d, value in ((d0, x0), (d1, x1)):
             stores.append(out[((head * tokens + token) * dim + d).valid(is_q)].store(value))
-            stores.append(stored(0, d).store(value.cast(dtypes.half)))
+            keys.append((d, value))
     values = [of_v(v, d) + of_v(biases[2], d, False) if biases else of_v(v, d) for d in flat]
     if v_norm:
         values = normed(values)
-    for value, d in zip(values, flat, strict=True):
-        stores.append(stored(1, d).store(value.cast(dtypes.half)))
+    stores += stored(0, keys) + stored(1, list(zip(flat, values, strict=True)))
     info = KernelInfo(name="rotate", opts_to_apply=())
     return UOp.group(*stores).end(warp, token, lane).sink(arg=info)
 
 
 def supports_rotate(q: Tensor, cache: Tensor) -> bool:
-    # tokens known in advance, and whole warps of pairs of dimensions of an f16 cache
-    if not on_gpu(q) or cache.dtype != dtypes.half or not isinstance(q.numel(), int):
+    # tokens known in advance, and whole warps of pairs of dimensions, of an f16 or q8_0 cache
+    if not on_gpu(q) or cache.dtype not in (dtypes.half, dtypes.uint8):
         return False
-    return int(cache.shape[4]) % (2 * WARP) == 0
+    return isinstance(q.numel(), int) and int(q.shape[3]) % (2 * WARP) == 0
 
 
 def rotate(
@@ -778,9 +803,9 @@ def rotate(
     extra = tuple(w.float().contiguous() for w in (*(biases or ()), *(norms or ())))
     fxn = functools.partial(
         _rotate_kernel, slots=slot_vars if isinstance(slots, list) else slot_vars[0],
-        positions=position_vars if isinstance(positions, list) else position_vars[0],
+        positions=position_vars if isinstance(positions, list) else position_vars[0], dim=dim,
         rotated=0 if rope is None else rope[1], halves=halves, biased=biases is not None,
-        v_norm=v_norm, eps=eps, ring=ring,
+        v_norm=v_norm, eps=eps, ring=ring, quantized=cache.dtype == dtypes.uint8,
     )  # fmt: skip
     out, cache = Tensor.custom_kernel(out, cache, q, k, v, *tables, *extra, fxn=fxn)[:2]
     return out.reshape(1, heads, tokens, dim), cache
