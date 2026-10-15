@@ -346,3 +346,36 @@ class QTensor:
         if self.type not in DEQUANT:
             raise NotImplementedError(f"dequantizing {self.type.name} is not supported")
         return DEQUANT[self.type](self.data).reshape(self.shape).cast(dtype)
+
+
+# ******** a KV cache of q8_0 rows ********
+# A position's keys or values of a head, `dim` of them, a multiple of 32, as one row of bytes:
+# the values as int8, then an f16 scale of each 32, as llama.cpp's q8_0 cache holds them, padded
+# to whole words, which the kernels read rows by: 136 bytes for heads of 128 rather than f16's 256.
+
+
+def q8_0_row(dim: int) -> int:
+    """The bytes of a q8_0 row of `dim` values."""
+    return -(-(dim + dim // 16) // 4) * 4
+
+
+def to_q8_0(x: Tensor) -> Tensor:
+    """x (..., dim) as q8_0 rows (..., q8_0_row(dim)), as llama.cpp quantizes q8_0: each 32
+    values' scale d = max|x| / 127, and the values round(x / d), half away from zero."""
+    *lead, last = x.shape
+    dim = int(last)
+    blocks = x.float().reshape(*lead, dim // 32, 32)
+    d = blocks.abs().max(-1, keepdim=True) / 127
+    y = (d > 0).where(blocks / d, 0.0)
+    q = ((y.abs() + 0.5).floor() * y.sign()).cast(dtypes.int8).reshape(*lead, dim)
+    scales = d.reshape(*lead, dim // 32).cast(dtypes.half).bitcast(dtypes.uint8)
+    rows = q.bitcast(dtypes.uint8).cat(scales, dim=-1)
+    return rows.pad((None,) * len(lead) + ((0, q8_0_row(dim) - dim - dim // 16),))
+
+
+def from_q8_0(rows: Tensor, dim: int) -> Tensor:
+    """q8_0 rows (..., q8_0_row(dim)) as their `dim` values each (..., dim), in f32."""
+    *lead, _ = rows.shape
+    q = rows[..., :dim].bitcast(dtypes.int8).cast(dtypes.float32)
+    d = rows[..., dim : dim + dim // 16].bitcast(dtypes.half).cast(dtypes.float32)
+    return (q.reshape(*lead, dim // 32, 32) * d.unsqueeze(-1)).reshape(*lead, dim)

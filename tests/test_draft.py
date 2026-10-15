@@ -120,6 +120,28 @@ def test_speculative_stops_where_plain_does(tiny, tiny_assistant, arch):
     assert list(engine.generate(PROMPT, CONTEXT)) == full
 
 
+@pytest.mark.usefixtures("reference_ops")
+@pytest.mark.parametrize("arch", ["gemma4", "qwen35moe"])
+def test_drafters_take_a_q8_0_cache(tiny, tiny_assistant, arch):
+    # Gemma 4's assistant reading the target's q8_0 cache, and Qwen3.5's MTP layer keeping its
+    # own as q8_0 too: the tokens plain decoding generates with one
+    path, draft = models(tiny, tiny_assistant, arch)
+    options = {"max_context": CONTEXT, "prefill_chunk": 8, "cache_type": "q8_0"}
+    plain = list(Engine(path, **options).generate(PROMPT, 12))
+    engine, steps = Engine(path, draft=draft, **options), 0
+    if arch == "qwen35moe":
+        assert engine.drafter.layer.cache_type == "q8_0"  # type: ignore[union-attr]
+    speculative = engine._speculative
+
+    def counted(sequences):
+        nonlocal steps
+        steps += 1
+        return speculative(sequences)
+
+    engine._speculative = counted  # type: ignore[method-assign]
+    assert list(engine.generate(PROMPT, 12)) == plain and steps > 0
+
+
 def wrong(tokens: list[int]) -> list[int]:
     # every third token wrong, as a drafter's guesses of them might be
     return [t if i % 3 else (t + 1) % 300 for i, t in enumerate(tokens)]

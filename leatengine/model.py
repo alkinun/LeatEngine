@@ -9,9 +9,12 @@ from tinygrad.dtype import DType
 
 from leatengine import ops
 from leatengine.ops import Span
-from leatengine.quant import BLOCK, NATIVE, GGMLType, QTensor
+from leatengine.quant import BLOCK, NATIVE, GGMLType, QTensor, q8_0_row
 
 CACHE_TILE = 256  # positions
+# what a KV cache holds keys and values as: f16, or q8_0 rows of int8 and a scale per 32, as
+# leatengine.quant has them, of half the memory
+CACHE_TYPES = ("f16", "q8_0")
 # the fewest positions a sliding-window layer's ring holds, which holds a power of 2 of them: the
 # attention kernels' chunks and tiles of keys are each in one piece, and a position's row is its
 # low bits, where a ring of 1536 decoded Gemma 4 26B A4B 0.3% slower than its whole cache, as
@@ -357,7 +360,8 @@ class Transformer:
     Given the most tokens a run stores at once, `run`, a sliding-window layer's cache is a ring
     of its window and that many more positions, where it is smaller than the context, as only
     those are read: position p at p mod its size. A slot's rings then hold only the last
-    positions its runs wrote, as many as their size; see `holds`.
+    positions its runs wrote, as many as their size; see `holds`. The cache holds keys and values
+    as `cache_type`, one of CACHE_TYPES.
 
     Optional parts are used where the GGUF has their tensors: biases of q, k, v and the attention
     output, RMSNorms of q and k, of the attention and MLP outputs, attention sinks, a shared MLP
@@ -368,13 +372,20 @@ class Transformer:
 
     def __init__(
         self, config: Config, weights: dict[str, QTensor], max_context: int, slots: int = 1,
-        saved_tokens: int = 0, run: int | None = None,
+        saved_tokens: int = 0, run: int | None = None, cache_type: str = "f16",
     ):  # fmt: skip
         if not 0 < max_context <= config.context_length:
             raise ValueError(
                 f"max_context must be in [1, {config.context_length}], got {max_context}"
             )
+        if cache_type not in CACHE_TYPES:
+            raise ValueError(f"cache_type must be {' or '.join(CACHE_TYPES)}, got {cache_type}")
+        quantized = cache_type == "q8_0"
+        if quantized and (odd := [dim for dim in config.head_dims if dim % 32]):
+            raise ValueError(f"a q8_0 cache holds heads of a multiple of 32 dimensions, and this "
+                             f"model's are of {odd[0]}: use an f16 cache")  # fmt: skip
         self.config, self.max_context, self.slots = config, max_context, slots
+        self.cache_type = cache_type
         # each layer's tensors by name, without "blk.{i}." and ".weight"
         self.layers: list[dict[str, QTensor]] = [{} for _ in range(config.n_layers)]
         for name, w in weights.items():
@@ -452,11 +463,13 @@ class Transformer:
         self.sizes = tuple(_ring(window, run, positions) for window in config.windows)
         self.rings = tuple(size < positions for size in self.sizes)
         self.cache = [
-            None if recurrent else zeros(2, slots, kv_heads, size, dim, dtype=dtypes.half)
+            None if recurrent
+            else zeros(2, slots, kv_heads, size, q8_0_row(dim), dtype=dtypes.uint8) if quantized
+            else zeros(2, slots, kv_heads, size, dim, dtype=dtypes.half)
             for kv_heads, dim, recurrent, size in zip(
                 config.kv_heads, config.head_dims, config.recurrent, self.sizes, strict=True
             )
-        ]
+        ]  # fmt: skip
         # a recurrent layer's state of each slot: of Gated DeltaNet, the last inputs of its
         # convolution, and the recurrence's state of each value head, keys by values; of a short
         # convolution, its last inputs

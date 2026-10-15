@@ -1,5 +1,6 @@
 import math
 import subprocess
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -20,6 +21,7 @@ from tests.helpers import (
     P3_MSCALE,
     P3_ORIGINAL,
     P3_ROTATED,
+    q8_0,
     random_blocks,
     reference_embedding,
     reference_logits,
@@ -45,9 +47,13 @@ ARCHS = [
 ]
 
 
-def transformer(path, max_context: int = CONTEXT, slots: int = 1) -> Transformer:
+def transformer(
+    path, max_context: int = CONTEXT, slots: int = 1, cache_type: str = "f16"
+) -> Transformer:
     f = GGUF.open(path)
-    return Transformer(Config.from_gguf(f.metadata), f.load(), max_context, slots)
+    return Transformer(
+        Config.from_gguf(f.metadata), f.load(), max_context, slots, cache_type=cache_type
+    )
 
 
 @pytest.mark.usefixtures("reference_ops")
@@ -57,6 +63,28 @@ def test_forward_matches_reference(tiny, arch):
     model, expected = transformer(path), reference_logits(weights, PROMPT, arch)
     logits = model.logits(model(Tensor([PROMPT], dtype=dtypes.int32), 0)).numpy()[0]
     np.testing.assert_allclose(logits, expected, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.usefixtures("reference_ops")
+@pytest.mark.parametrize("arch", ["llama", "gpt-oss", "gemma4", "qwen35moe", "deepseek2"])
+def test_q8_0_cache_matches_reference(tiny, monkeypatch, arch):
+    # keys and values held as q8_0, as the f64 reference rounds them: of plain layers, of rings
+    # with sinks, of keys that are values, beside recurrent layers, and of MLA's one head
+    monkeypatch.setattr("tests.helpers.cached", q8_0)
+    path, weights = tiny(arch)
+    model, expected = transformer(path, cache_type="q8_0"), reference_logits(weights, PROMPT, arch)
+    logits = model.logits(model(Tensor([PROMPT], dtype=dtypes.int32), 0)).numpy()[0]
+    np.testing.assert_allclose(logits, expected, rtol=2e-3, atol=2e-3)
+
+
+def test_q8_0_cache_needs_whole_blocks(tiny_model):
+    path, _ = tiny_model
+    f = GGUF.open(path)
+    config = replace(Config.from_gguf(f.metadata), head_dims=(48, 48))
+    with pytest.raises(ValueError, match="heads of a multiple of 32 dimensions.*of 48"):
+        Transformer(config, f.load(), CONTEXT, cache_type="q8_0")
+    with pytest.raises(ValueError, match="cache_type must be f16 or q8_0"):
+        transformer(path, cache_type="q4_0")
 
 
 @pytest.mark.gpu
@@ -402,6 +430,22 @@ def test_shared_prefix_is_copied(tiny_model, monkeypatch):
     longer = PROMPT + [4]
     assert list(engine.generate(longer, 4)) == generated(path, longer, 4)
     assert starts == [9, len(PROMPT)]
+
+
+@pytest.mark.usefixtures("reference_ops")
+def test_q8_0_cache_generates_as_reference(tiny_model, monkeypatch):
+    # every token the reference's argmax as it rounds keys and values to q8_0, as decoding reads
+    # them; and a prefix copied to another slot as its rows
+    monkeypatch.setattr("tests.helpers.cached", q8_0)
+    path, weights = tiny_model
+    engine = Engine(path, max_context=CONTEXT, prefill_chunk=8, slots=2, cache_type="q8_0")
+    out = list(engine.generate(PROMPT, 8))
+    expected = reference_logits(weights, PROMPT + out)[len(PROMPT) - 1 :].argmax(-1)
+    assert out == expected[: len(out)].tolist()
+    starts, branch = prefill_starts(engine, monkeypatch), PROMPT[:9] + [1, 2, 3]
+    fresh = Engine(path, max_context=CONTEXT, prefill_chunk=8, cache_type="q8_0")
+    assert list(engine.generate(branch, 6)) == list(fresh.generate(branch, 6))
+    assert starts == [9]
 
 
 @pytest.mark.usefixtures("reference_ops")

@@ -244,7 +244,9 @@ class Qwen35Mtp:
         weights |= {"token_embd.weight": target.embed, "output.weight": target.output}
         weights["output_norm.weight"] = head_norm
         config = replace(c, n_layers=1, **one)
-        self.layer = Transformer(config, weights, target.max_context, target.slots)
+        self.layer = Transformer(
+            config, weights, target.max_context, target.slots, cache_type=target.cache_type
+        )
 
     def draft(
         self, tokens: Tensor, hidden: Tensor, slots: PerSequence, positions: PerSequence, count: int

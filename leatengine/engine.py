@@ -78,12 +78,12 @@ class _Batch:
 class Engine:
     """A loaded model, ready to generate.
 
-    Several sequences generate at once, one per slot of the KV cache: each step prefills a chunk of
-    at most one prompt, of SHARED_CHUNK tokens at most while others decode, and then decodes a token
-    of every other sequence in one batch, which reads each weight once for all of them. On the
-    reference ops a sequence generates as it would alone; the kernels for several tokens round
-    differently from those for one, so a batched sequence may take another token where two are
-    close.
+    Several sequences generate at once, one per slot of the KV cache, which holds keys and values as
+    `cache_type`, f16 or q8_0 (model.CACHE_TYPES): each step prefills a chunk of at most one prompt,
+    of SHARED_CHUNK tokens at most while others decode, and then decodes a token of every other
+    sequence in one batch, which reads each weight once for all of them. On the reference ops a
+    sequence generates as it would alone; the kernels for several tokens round differently from
+    those for one, so a batched sequence may take another token where two are close.
 
     With a drafter, sequences decoding decode speculatively, presence_penalty too, as many at
     once as the drafter's `sequences`: it guesses each one's next tokens, DRAFT_TOKENS at most and
@@ -124,6 +124,7 @@ class Engine:
     def __init__(
         self, path: str | Path, max_context: int = 4096, prefill_chunk: int = 512, slots: int = 1,
         draft: str | Path | None = None, vision: str | Path | None = None,
+        cache_type: str = "f16",
     ):  # fmt: skip
         if slots < 1:
             raise ValueError(f"slots must be at least 1, got {slots}")
@@ -152,7 +153,9 @@ class Engine:
         # its drafts
         run = max(prefill_chunk, self.vision.tokens if self.vision else 1,
                   DRAFT_TOKENS + 1 if draft is not None else 1)  # fmt: skip
-        self.model = Transformer(self.config, weights, max_context, cache_slots, saved, run)
+        self.model = Transformer(
+            self.config, weights, max_context, cache_slots, saved, run, cache_type
+        )
         self.drafter: Drafter | None = None if draft is None else load_drafter(draft, self.model)
         # of M-RoPE, each slot's offset of RoPE's positions from the cache's, which an image's
         # change, as it takes fewer of RoPE's than of the cache's; and what moves it on

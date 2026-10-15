@@ -6,7 +6,7 @@ from pathlib import Path
 
 import gguf
 import numpy as np
-from gguf.quants import dequantize
+from gguf.quants import dequantize, quantize
 from tinygrad import Tensor, UOp, dtypes
 
 from leatengine.draft import mtp
@@ -339,10 +339,10 @@ def experts(h, scores, expert):
 
 
 def attention(q, k, v, mask, scale, sinks=None):
-    # q (T, heads, dim) and k, v (T, kv heads, dim), with keys and values rounded to f16 as in
-    # the engine's cache: (T, heads * dim); with a sink per head, a score that takes its share of
+    # q (T, heads, dim) and k, v (T, kv heads, dim), with keys and values rounded as the engine's
+    # cache holds them: (T, heads * dim); with a sink per head, a score that takes its share of
     # the softmax and adds no value
-    k, v = (z.astype(np.float16).astype(np.float64) for z in (k, v))
+    k, v = cached(k), cached(v)
     group, heads = q.shape[1] // k.shape[1], []
     for hd in range(q.shape[1]):
         scores = q[:, hd] @ k[:, hd // group].T * scale + mask
@@ -351,6 +351,19 @@ def attention(q, k, v, mask, scale, sinks=None):
         p = np.exp(scores - top)
         heads.append(p / (p.sum(-1, keepdims=True) + np.exp(sink - top)) @ v[:, hd // group])
     return np.concatenate(heads, -1)
+
+
+def cached(z: np.ndarray) -> np.ndarray:
+    # keys or values as the engine's cache holds them: f16, unless a test of a q8_0 cache sets
+    # this to q8_0
+    return z.astype(np.float16).astype(np.float64)
+
+
+def q8_0(z: np.ndarray) -> np.ndarray:
+    # keys or values as a q8_0 cache holds them, as gguf-py quantizes q8_0
+    q8 = gguf.GGMLQuantizationType.Q8_0
+    blocks = quantize(z.astype(np.float32).reshape(-1, z.shape[-1]), q8)
+    return dequantize(blocks, q8).reshape(z.shape).astype(np.float64)
 
 
 def cuts(scores, top_k, top_p):
@@ -1648,9 +1661,6 @@ def _reference_deepseek2(w: dict[str, np.ndarray], tokens: list[int]) -> np.ndar
         out[..., 1::2] = z[..., 0::2] * sin + z[..., 1::2] * cos
         return out
 
-    def f16(z):
-        return z.astype(np.float16).astype(np.float64)
-
     x = w["token_embd.weight"][tokens].astype(np.float64)
     for i in range(LAYERS):
         lw = _layer(w, i)
@@ -1658,8 +1668,8 @@ def _reference_deepseek2(w: dict[str, np.ndarray], tokens: list[int]) -> np.ndar
         q = norm(h @ lw["attn_q_a"].T, lw["attn_q_a_norm"]) @ lw["attn_q_b"].T
         q = q.reshape(T, HEADS, DS_NOPE + DS_ROPE)
         kv = h @ lw["attn_kv_a_mqa"].T
-        latent = f16(norm(kv[:, :DS_KV_RANK], lw["attn_kv_a_norm"]))
-        k_rope = f16(rope(kv[:, None, DS_KV_RANK:]))  # (T, 1, rope)
+        latent = cached(norm(kv[:, :DS_KV_RANK], lw["attn_kv_a_norm"]))
+        k_rope = cached(rope(kv[:, None, DS_KV_RANK:]))  # (T, 1, rope)
         heads = []
         for hd in range(HEADS):
             k = np.concatenate([latent @ lw["attn_k_b"][hd], k_rope[:, 0]], -1)

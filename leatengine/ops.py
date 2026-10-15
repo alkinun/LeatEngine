@@ -12,7 +12,7 @@ from tinygrad import Tensor, UOp, dtypes
 
 from leatengine import kernels
 from leatengine.kernels.common import OAI_ALPHA, OAI_LIMIT, SOFTMAX, Routing
-from leatengine.quant import NATIVE, QTensor
+from leatengine.quant import NATIVE, QTensor, from_q8_0, to_q8_0
 
 
 def linear(x: Tensor, w: QTensor, residual: Tensor | None = None) -> Tensor:
@@ -244,8 +244,8 @@ def rotate(
     # without, if v_norm; the first R dimensions of q and k rotated by RoPE's tables (positions,
     # R/2), or each slot's (slots, positions, R/2), at their positions, or if `own` by the tokens'
     # own angles (T, R/2) of a single span, for rope ((cos, sin), R), if given; and k and v stored
-    # there in their slots of the cache, or of a `ring`, at their positions mod its positions.
-    # Returns q (1, H, T, D) and the cache.
+    # there in their slots of the cache, as f16 or q8_0 rows as it holds them, or of a `ring`, at
+    # their positions mod its positions. Returns q (1, H, T, D) and the cache.
     args = (rope, halves, biases, norms, v_norm, eps)
     if own:
         return _rotate(q, k, v, cache, spans[0], *args, own=True, ring=ring)
@@ -283,7 +283,8 @@ def _rotate(
         tables = rope[0] if own or rope[0][0].ndim == 2 else (t[slot] for t in rope[0])
         cos, sin = tables if own else (table[start_pos : start_pos + T] for table in tables)
         q, k = (rotary(t, cos, sin, halves) for t in (q, k))
-    new = Tensor.stack(k, v.transpose(1, 2)).cast(cache.dtype)
+    new = Tensor.stack(k, v.transpose(1, 2))
+    new = to_q8_0(new) if _q8_0(cache) else new.cast(cache.dtype)
     if not ring:
         cache[:, slot : slot + 1, :, start_pos : start_pos + T].assign(new)
         return q, cache
@@ -330,13 +331,13 @@ def attention(
     q: Tensor, cache: Tensor, spans: list[Span], scale: float, window: int = 0,
     sinks: Tensor | None = None, ring: bool = False,
 ) -> Tensor:  # fmt: skip
-    # q: (1, H, T, D), the spans' tokens in turn; cache: (2, slots, KV_H, positions, D). Each
-    # token attends over its span's slot, causally or over all the span's tokens as the span
-    # has it, and over only those fewer than `window` positions from it if given, either way,
-    # with scores q.k * scale; with a sink per head, if given, a score that takes its
-    # share of the softmax and adds no value, as gpt-oss's. A `ring` holds position p at p mod its
-    # positions, as many as the window and the tokens of a span more. Returns (1, T, H * D), the
-    # layout the output projection reads.
+    # q: (1, H, T, D), the spans' tokens in turn; cache: (2, slots, KV_H, positions, D) of f16,
+    # or of q8_0 rows of D values each in place of D. Each token attends over its span's slot,
+    # causally or over all the span's tokens as the span has it, and over only those fewer than
+    # `window` positions from it if given, either way, with scores q.k * scale; with a sink per
+    # head, if given, a score that takes its share of the softmax and adds no value, as
+    # gpt-oss's. A `ring` holds position p at p mod its positions, as many as the window and the
+    # tokens of a span more. Returns (1, T, H * D), the layout the output projection reads.
     # a token per row: of a single span of one, or of several spans, each token its own row
     rows = _rows(spans) if len(spans) > 1 or _tokens(spans) else None
     if _fast() and rows is not None and kernels.supports_attention(q, cache):
@@ -373,13 +374,13 @@ def _attention(
     mask = None
     causal = span.causal and not (isinstance(T, int) and T == 1)
     if ring:
-        k, v = (cache[i, slot : slot + 1].cast(q.dtype) for i in (0, 1))
+        k, v = (_held(cache[i, slot : slot + 1], int(D)).cast(q.dtype) for i in (0, 1))
         mask = _ring_mask(T, int(cache.shape[3]), start_pos, window, causal, q.max_shape[2])
     else:
         # the positions up to the span's end, within the cache's, as a span ends where the context
         # does at the latest, though its start's and its length's bounds add to more
         end = _smaller(start_pos + T, int(cache.shape[3]))
-        k, v = (cache[i, slot : slot + 1, :, :end].cast(q.dtype) for i in (0, 1))
+        k, v = (_held(cache[i, slot : slot + 1, :, :end], int(D)).cast(q.dtype) for i in (0, 1))
     if not ring and (window or causal):
         full = Tensor.full((1, 1, T, k.shape[2]), float("-inf"), dtype=q.dtype)
         # later positions, where the span sees only those before each token, else those `window`
@@ -395,6 +396,16 @@ def _attention(
     scores = scores.cat(sinks.reshape(1, H, 1, 1).expand(B, H, T, 1), dim=-1)
     out = scores.softmax(-1)[..., :-1] @ v
     return out.transpose(1, 2).reshape(B, T, H * D)
+
+
+def _q8_0(cache: Tensor) -> bool:
+    # whether a cache holds q8_0 rows of bytes rather than f16 values
+    return cache.dtype == dtypes.uint8
+
+
+def _held(cache: Tensor, dim: int) -> Tensor:
+    # a part of a cache, as the values of its heads of `dim`
+    return from_q8_0(cache, dim) if _q8_0(cache) else cache
 
 
 def _ring_mask(
