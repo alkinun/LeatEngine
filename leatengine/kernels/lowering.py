@@ -5,6 +5,9 @@ anew: `canonicalize_once` does each body once. tinygrad also lowers every kernel
 keeping only the compiled binaries on disk: `keep_programs` keeps the lowered programs there too.
 On the 3090, Llama 3.1 8B's warm-up took 28 s, 21 with each body canonicalized once, and 13 at a
 later start with its programs kept.
+
+tinygrad's GPU queues run host programs, which work out the launches of kernels of symbolic sizes:
+`host_renderer` has them rendered as before tinygrad took LLVM's renderer for them.
 """
 
 import functools
@@ -32,9 +35,22 @@ _CANONICAL: weakref.WeakKeyDictionary[UOp, UOp | None] = weakref.WeakKeyDictiona
 
 
 def install() -> None:
+    host_renderer()
     canonicalize_once()
     if not multiprocessing.current_process().daemon:  # tinygrad's compile workers lower what
         keep_programs()  # their parent found in neither cache
+
+
+def host_renderer() -> None:
+    """Makes tinygrad render the host programs that drive its GPU queues with the CPU's first
+    renderer, clang's where clang is installed, as it did until its commit 741ec2853 made it
+    LLVM's. Such a program works out a kernel's symbolic sizes as the GPU's renderer lowered them,
+    with subtractions and negations, which LLVM's renderer lacks: the kernels of a ring cache
+    failed to lower. An HCQ_RUNTIME_DEV of one's own stands."""
+    from tinygrad.helpers import HCQ_RUNTIME_DEV
+
+    if "HCQ_RUNTIME_DEV" not in os.environ:
+        HCQ_RUNTIME_DEV.value = "CPU"
 
 
 def canonicalize_once() -> None:

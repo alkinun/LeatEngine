@@ -563,7 +563,7 @@ dev = [
 requires-dist = [
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "pillow", specifier = ">=12.3.0" },
-    { name = "tinygrad", git = "https://github.com/tinygrad/tinygrad.git?rev=9d7054488aee0e455e226514ba4b8b2f32329c29" },
+    { name = "tinygrad", git = "https://github.com/tinygrad/tinygrad.git?rev=797924c3715f72f907b0a02e14aa327c3b626efc" },
 ]
 
 [package.metadata.requires-dev]
@@ -1283,7 +1283,7 @@ wheels = [
 [[package]]
 name = "tinygrad"
 version = "0.14.0"
-source = { git = "https://github.com/tinygrad/tinygrad.git?rev=9d7054488aee0e455e226514ba4b8b2f32329c29#9d7054488aee0e455e226514ba4b8b2f32329c29" }
+source = { git = "https://github.com/tinygrad/tinygrad.git?rev=797924c3715f72f907b0a02e14aa327c3b626efc#797924c3715f72f907b0a02e14aa327c3b626efc" }
 
 [[package]]
 name = "tqdm"

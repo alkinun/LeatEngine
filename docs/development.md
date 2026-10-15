@@ -19,7 +19,7 @@ Use Python 3.14 to match the primary CI environment; the CPU suite also runs on 
 
 The runtime requires tinygrad, Jinja2, and Pillow. Development dependencies provide independent
 GGUF/numerical references, HTTP-client tests, and quality checks. tinygrad is pinned to commit
-`9d7054488aee0e455e226514ba4b8b2f32329c29`; changing it is a deliberate compatibility update.
+`797924c3715f72f907b0a02e14aa327c3b626efc`; changing it is a deliberate compatibility update.
 Retain the lockfile for reproducible development installs.
 
 tinygrad keeps compiled kernels in `~/.cache/tinygrad/cache.db`, and LeatEngine keeps the lowered
@@ -53,7 +53,7 @@ in the installed package.
 
 ```bash
 git clone https://github.com/tinygrad/tinygrad.git /tmp/leatengine-tinygrad
-git -C /tmp/leatengine-tinygrad checkout 9d7054488aee0e455e226514ba4b8b2f32329c29
+git -C /tmp/leatengine-tinygrad checkout 797924c3715f72f907b0a02e14aa327c3b626efc
 PYTHONPATH=/tmp/leatengine-tinygrad DEV=MOCK+AMD uv run pytest -m gpu -n auto \
   --cov --cov-report= --durations=20
 ```
