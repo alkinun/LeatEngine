@@ -3,7 +3,7 @@
 A graph calls the same few kernels layer after layer, and tinygrad canonicalizes each call's body
 anew: `canonicalize_once` does each body once. tinygrad also lowers every kernel at every start,
 keeping only the compiled binaries on disk: `keep_programs` keeps the lowered programs there too.
-On the 3090, Llama 3.1 8B's warm-up took 28 s, 21 with each body canonicalized once, and 13 at a
+On the 3090, Llama 3.1 8B's warm-up takes 26 s, 19 with each body canonicalized once, and 12 at a
 later start with its programs kept.
 
 tinygrad's GPU queues run host programs, which work out the launches of kernels of symbolic sizes:
@@ -55,7 +55,7 @@ def host_renderer() -> None:
 
 def canonicalize_once() -> None:
     """Makes tinygrad canonicalize each kernel's body once rather than at each call of it: Llama
-    3.1 8B's warm-up canonicalized 89 bodies 3565 times, 7 of its 28 s. The canonical body, its
+    3.1 8B's warm-up canonicalizes 89 bodies 3565 times, 6 of its 26 s. The canonical body, its
     local buffers numbered for the schedule cache, is the body's alone."""
     import tinygrad.schedule as schedule
 
@@ -76,8 +76,8 @@ def canonicalize_once() -> None:
 
 def keep_programs() -> None:
     """Makes tinygrad keep the programs it lowers in its disk cache, as it keeps their binaries, and
-    read them there before it lowers one: Llama 3.1 8B's 161 take 5 MB, and loaded, a later start's
-    warm-up takes 13 s rather than 20. A program's row is by the key of tinygrad's own cache of
+    read them there before it lowers one: Llama 3.1 8B's 160 take 5 MB, and loaded, a later start's
+    warm-up takes 12 s rather than 18. A program's row is by the key of tinygrad's own cache of
     them and what else makes a program: the source of tinygrad and of the AMD renderer, clang's
     flags, and the environment variables tinygrad reads, so that a change to any lowers anew.
     CACHELEVEL=0 or CCACHE=0 turn it off, as they do tinygrad's."""
