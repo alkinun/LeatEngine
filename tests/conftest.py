@@ -9,11 +9,6 @@ import pytest
 # It reads DEV when imported, so this comes first.
 os.environ.setdefault("DEV", "CPU")
 GPU_BACKENDS = {"NV", "CUDA", "AMD", "MOCK+AMD"}
-if worker := os.environ.get("PYTEST_XDIST_WORKER"):
-    # each of pytest-xdist's workers its own cache of compiled kernels, beside tinygrad's: a
-    # database takes one writer at a time
-    cache = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser() / "tinygrad"
-    os.environ.setdefault("CACHEDB", str(cache / f"cache-{worker}.db"))
 if os.environ["DEV"].split(":")[0] == "MOCK+AMD":
     # tinygrad's emulated RDNA 3 GPU, from the tests of tinygrad's source tree at the pinned commit,
     # which PYTHONPATH must hold. It does not allow unaligned access, as GPUs do: clang would merge

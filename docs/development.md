@@ -24,8 +24,8 @@ Retain the lockfile for reproducible development installs.
 
 tinygrad keeps compiled kernels in `~/.cache/tinygrad/cache.db`, and LeatEngine keeps the schedules
 and lowered programs there too (`leatengine.kernels.lowering`), so that a model's later starts skip
-scheduling and lowering. `CACHELEVEL=0` turns all three off, as for timing a first start; the tests
-give each pytest-xdist worker a database of its own.
+scheduling and lowering. `CACHELEVEL=0` turns all three off, as for timing a first start. The tests'
+pytest-xdist workers share the database, so that each kernel is compiled once among them.
 
 The default tests use generated tiny GGUFs and CPU execution. GPU and real-model tests are
 opt-in. `LEATENGINE_KERNELS=ref` disables custom kernels for numerical comparisons.
@@ -58,10 +58,10 @@ PYTHONPATH=/tmp/leatengine-tinygrad DEV=MOCK+AMD uv run pytest -m gpu -n auto \
   --cov --cov-report= --durations=20
 ```
 
-The tests turn off unaligned memory access, which the emulator lacks, and isolate compilation
-caches per worker. This checks RDNA 3 kernel behavior in emulation; physical Strix Halo
-validation is separate. The emulator skips decode attention over heads wider than 512
-dimensions, which it computes wrongly; the [Strix Halo guide](strix-halo.md) covers that check.
+The tests turn off unaligned memory access, which the emulator lacks. This checks RDNA 3 kernel
+behavior in emulation; physical Strix Halo validation is separate. The emulator skips decode
+attention over heads wider than 512 dimensions, which it computes wrongly; the
+[Strix Halo guide](strix-halo.md) covers that check.
 
 ## Continuous integration
 
