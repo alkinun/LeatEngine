@@ -829,9 +829,14 @@ def test_unexpected_error(client, server, monkeypatch):
     with pytest.raises(openai.InternalServerError, match="failed to answer"):
         chat(client, "hello", max_tokens=1)
     monkeypatch.undo()
-    deep = [{"role": "user", "content": "hi", "x": json.loads("[" * 20000 + "]" * 20000)}]
-    with pytest.raises(openai.BadRequestError, match="nested too deeply"):
-        client.chat.completions.create(model="tiny", messages=deep, max_tokens=1)
+    # a body nested too deeply to parse, or to render: sent as text, as Python 3.12 can neither
+    # encode nor decode it
+    nested = "[" * 20000 + "]" * 20000
+    body = f'{{"messages": [{{"role": "user", "content": "hi", "x": {nested}}}], "max_tokens": 1}}'
+    url = f"http://127.0.0.1:{server.server_port}/v1/chat/completions"
+    with pytest.raises(urllib.error.HTTPError, match="400") as refused:
+        urllib.request.urlopen(urllib.request.Request(url, body.encode()))
+    assert "nested too deeply" in json.loads(refused.value.read())["error"]["message"]
     # a body too long to read is refused before it is read
     head = "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 4611686018427387904\r\n\r\n"
     with socket.create_connection(("127.0.0.1", server.server_port), timeout=10) as connection:

@@ -676,7 +676,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._error(413, f"a body has {_MAX_BODY} bytes at most, not {length}")
             try:
                 body = json.loads(self.rfile.read(length))
-            except (ValueError, RecursionError) as e:  # not JSON, or nested too deep to parse
+            except RecursionError:  # nested too deep to parse, where Python's stack is short
+                return self._error(400, "the request is nested too deeply")
+            except ValueError as e:  # not JSON
                 return self._error(400, str(e))
             self._run(route, body)
 
