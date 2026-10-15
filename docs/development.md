@@ -71,6 +71,8 @@ dimensions, which it computes wrongly; the [Strix Halo guide](strix-halo.md) cov
 - Tokenizer comparisons against llama.cpp at commit `889edf43ddae0cfe9a4564a882764dc879759870`.
 - Combined CPU/emulator coverage of at least 80%.
 - Wheel and source-distribution installation checks.
+- The release tarball, built twice for identical bytes, checked unpacked, and kept as the run's
+  artifact.
 
 CPU and emulated GPU jobs rebalance queued tests between workers with `--dist worksteal`, so
 long model cases do not leave the remaining tests queued behind one busy worker. AMD primitive
@@ -94,7 +96,47 @@ cd /tmp
 
 The wheel contains only the runtime package and distribution metadata. The source distribution
 also includes tests, scripts, and documentation. Installation needs access to the pinned
-tinygrad Git source; PyPI publication and offline bundles are separate work.
+tinygrad Git source, which PyPI does not accept as a dependency; the release tarball below needs
+neither.
+
+## Release tarball
+
+```bash
+uv run python scripts/build_release.py
+```
+
+This builds `dist/leatengine-0.0.1-linux-x86_64.tar.gz`, about 37 MiB, and its SHA-256 beside it.
+The tarball holds python-build-standalone's CPython 3.14 in `python/`, with LeatEngine and its
+locked dependencies installed into it, and `bin/leatengine`, which runs that Python from wherever
+the tarball is unpacked, ignoring `PYTHONPATH` and the like. `BUILD-INFO.json` records the
+commit, the CPython build, and the tinygrad commit. Running it needs no network, uv, or system
+Python:
+
+```bash
+tar -xzf leatengine-0.0.1-linux-x86_64.tar.gz
+leatengine-0.0.1-linux-x86_64/bin/leatengine serve /path/to/model.gguf
+```
+
+The host provides glibc 2.28 or newer and what [the README](../README.md#install) lists for the
+GPU: clang with its AMDGPU target is not bundled. Tk, IDLE, pip, and Python's headers and shared
+library are left out. Bytecode is compiled at build time and checked against its source's hash,
+so a read-only unpack starts without writing to it.
+
+A commit builds the same bytes. The CPython archive is pinned by SHA-256, dependencies come from
+`uv.lock`, tinygrad is built afresh rather than taken from uv's cache, build backends resolve as
+of the commit's time, and the archive has fixed file times, owners, and order. The bundled Python
+compresses it, so the building machine's zlib does not matter. `--reproducible` builds a second
+time in another directory and requires identical bytes. To bump CPython, change `PYTHON` and
+`PYTHON_SHA256` in the script, taking the hash from the python-build-standalone release's
+`SHA256SUMS`.
+
+After building, the script unpacks the tarball into a temporary directory whose path has a space
+and checks it: the launcher, directly and through a symlink; the packaging check's isolation and
+streamed completion from generated CPU weights; and `bin/leatengine serve` as a supervisor such
+as Lemonade would start it, waiting on `/health`, streaming a completion, and stopping it with
+SIGINT. Where unprivileged user namespaces are allowed, the last two run in a network namespace
+with only loopback; elsewhere the script says so and checks with the network. `--no-check` skips
+the checks.
 
 ## Provenance
 
