@@ -130,13 +130,13 @@ time in another directory and requires identical bytes. To bump CPython, change 
 `PYTHON_SHA256` in the script, taking the hash from the python-build-standalone release's
 `SHA256SUMS`.
 
-After building, the script unpacks the tarball into a temporary directory whose path has a space
-and checks it: the launcher, directly and through a symlink; the packaging check's isolation and
-streamed completion from generated CPU weights; and `bin/leatengine serve` as a supervisor such
-as Lemonade would start it, waiting on `/health`, streaming a completion, and stopping it with
-SIGINT. Where unprivileged user namespaces are allowed, the last two run in a network namespace
-with only loopback; elsewhere the script says so and checks with the network. `--no-check` skips
-the checks.
+After building, the script unpacks the tarball into a temporary directory whose path has a space and
+checks it: the launcher, directly and through a symlink; `leatengine doctor`'s report; the packaging
+check's isolation and streamed completion from generated CPU weights; and `bin/leatengine serve` as
+a supervisor such as Lemonade would start it, waiting on `/health`, streaming a completion, and
+stopping it with SIGINT. Where unprivileged user namespaces are allowed, the last two run in a
+network namespace with only loopback; elsewhere the script says so and checks with the network.
+`--no-check` skips the checks.
 
 ## Provenance
 

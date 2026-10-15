@@ -305,6 +305,13 @@ def check(tarball: Path) -> None:
         for launcher in (tree / "bin/leatengine", link):
             usage = output([str(launcher), "--help"], work, env)
             assert usage.startswith("usage: leatengine") and "serve" in usage, usage
+        # the machine's check reports from the tarball, of the tinygrad built into it, and exits 1
+        # on a machine without an AMD GPU rather than failing to run
+        done = subprocess.run([str(tree / "bin/leatengine"), "doctor", "--json"], cwd=work,
+                              env=env, capture_output=True, text=True, timeout=120)  # fmt: skip
+        report, built = json.loads(done.stdout), json.loads((tree / "BUILD-INFO.json").read_text())
+        assert report["tinygrad"] == built["tinygrad"][:9], done.stdout + done.stderr
+        assert report["leatengine"] == VERSION and report["checks"], done.stdout
         prefix = offline()
         python = str(tree / "python/bin/python3")
         run([*prefix, python, "-I", "-c", SMOKE, str(model), VERSION], work, env)
