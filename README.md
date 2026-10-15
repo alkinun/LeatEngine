@@ -48,9 +48,10 @@ leatengine run /path/to/model.gguf
 leatengine serve /path/to/model.gguf
 ```
 
-The server listens on `127.0.0.1:8080`, with 4 slots and a context of 4096 tokens by default.
-Use `--max-context` and `--slots` to fit available memory. `python -m leatengine` exposes the
-same commands in the environment where the package is installed.
+The server listens on `127.0.0.1:8080`, with 4 slots and a context of 4096 tokens by default. Use
+`--max-context` and `--slots` to fit available memory, and `--cache-type q8_0` to hold the KV cache
+in about half the memory of its default, f16, as llama.cpp's q8_0 cache does. `python -m leatengine`
+exposes the same commands in the environment where the package is installed.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \

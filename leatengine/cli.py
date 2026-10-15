@@ -33,6 +33,7 @@ def main(argv: list[str] | None = None) -> None:
     run = commands.add_parser("run", help="chat with a model in the terminal")
     run.add_argument("model", type=Path, help="GGUF file")
     run.add_argument("--max-context", type=_positive, default=4096)
+    _cache_type(run)
     run.add_argument("--temperature", type=_option("temperature"), default=0.7)
     run.add_argument(
         "--top-k", type=_option("top_k"), default=0, help="keep the k likeliest tokens; 0 keeps all"
@@ -64,6 +65,7 @@ def main(argv: list[str] | None = None) -> None:
         "--slots", type=_positive, default=4,
         help="sequences generating at once, each in a slot of the KV cache that keeps its tokens",
     )  # fmt: skip
+    _cache_type(serve)
     serve.add_argument(
         "--draft", type=Path,
         help="a drafter's GGUF, for speculative decoding, of the one model; by default each model "
@@ -105,6 +107,7 @@ def main(argv: list[str] | None = None) -> None:
     speed.add_argument(
         "-s", "--sequences", type=_positive, default=1, help="sequences generating at once"
     )
+    _cache_type(speed)
     speed.add_argument(
         "--draft",
         type=Path,
@@ -137,6 +140,7 @@ def main(argv: list[str] | None = None) -> None:
         help="chunk size, as in llama-perplexity -c; a --kl-base file has its own",
     )  # fmt: skip
     quality.add_argument("--chunks", type=_positive, help="score only the first N chunks")
+    _cache_type(quality)
     quality.add_argument(
         "--decode", action="store_true", help="score one token at a time, as generation runs"
     )
@@ -199,6 +203,15 @@ def _option(name: str) -> Any:
     return parse
 
 
+def _cache_type(parser: argparse.ArgumentParser) -> None:
+    # how the KV cache holds keys and values, as leatengine.model.CACHE_TYPES, which importing
+    # would start tinygrad before the device is chosen
+    parser.add_argument(
+        "--cache-type", choices=("f16", "q8_0"), default="f16",
+        help="what the KV cache holds keys and values as: f16, or q8_0 in about half the memory",
+    )  # fmt: skip
+
+
 def _port(text: str) -> int:
     if not 0 <= (n := int(text)) <= 65535:
         raise argparse.ArgumentTypeError(f"must be from 0 to 65535, got {n}")
@@ -232,7 +245,8 @@ def _run(args: argparse.Namespace) -> None:
     from leatengine.vision import Image, beside
 
     vision, draft = args.mmproj or beside(args.model), args.draft or own_drafter(args.model)
-    engine = Engine(args.model, max_context=args.max_context, draft=draft, vision=vision)
+    engine = Engine(args.model, max_context=args.max_context, draft=draft, vision=vision,
+                    cache_type=args.cache_type)  # fmt: skip
     chat, tok = ChatTemplate(engine.gguf.metadata, engine.tokenizer), engine.tokenizer
     sampling = Sampling(args.temperature, args.top_k, args.top_p, args.min_p, args.presence_penalty)
     first = [{"role": "system", "content": args.system}] if args.system else []
@@ -335,7 +349,7 @@ def _serve(args: argparse.Namespace) -> None:
         raise SystemExit(f"there are no keys at {args.keys}: make one with "
                          f"`leatengine keys add NAME --file {args.keys}`")  # fmt: skip
     options = {"max_context": args.max_context, "slots": args.slots, "draft": args.draft,
-               "vision": args.mmproj}  # fmt: skip
+               "vision": args.mmproj, "cache_type": args.cache_type}  # fmt: skip
     keys = Keys(args.keys) if args.keys is not None else None
     sampling = Overrides(args.sampling) if args.sampling is not None else None
     if sampling is not None:
@@ -434,26 +448,29 @@ def _bench(args: argparse.Namespace) -> None:
         metadata = GGUF.open(args.model).metadata
         context = min(context, Config.from_gguf(metadata).context_length)
     engine = Engine(
-        args.model, max_context=context, prefill_chunk=args.prompt, slots=n, draft=args.draft
-    )
+        args.model, max_context=context, prefill_chunk=args.prompt, slots=n, draft=args.draft,
+        cache_type=args.cache_type,
+    )  # fmt: skip
     name = engine.gguf.path.stem
+    head = {"model": name, "device": Device.DEFAULT, "cache_type": args.cache_type}
+    title = f"{name} on {Device.DEFAULT}, {args.cache_type} KV cache"
     if args.chat:
         made: dict[str, Any] = dict(recommended(engine.gguf.metadata)[0])  # the reasoning set's
         sampling = Sampling(**made) if args.recommended else GREEDY
         chat = bench.chat_speed(engine, args.generate, args.reps, n, sampling)
         if args.json:
-            print(json.dumps({"model": name, "device": Device.DEFAULT} | asdict(chat)))
+            print(json.dumps(head | asdict(chat)))
             return
         each = f", {n} at once, {chat.decode / n:.1f} each" if n > 1 else ""
-        print(f"{name} on {Device.DEFAULT}")
+        print(title)
         print(f"  chat tg{args.generate:<4} {chat.decode:8.1f} tok/s   "
               f"{chat.per_step:.2f} tokens a step{each}")  # fmt: skip
         return
     result = bench.speed(engine, args.prompt, args.generate, args.reps, n)
     if args.json:
-        print(json.dumps({"model": name, "device": Device.DEFAULT} | asdict(result)))
+        print(json.dumps(head | asdict(result)))
         return
-    print(f"{name} on {Device.DEFAULT}")
+    print(title)
     print(f"  pp{args.prompt:<6} {result.prefill:10.1f} tok/s")
     gbs = f"{result.weight_gbs:.0f} GB/s of weights"
     each = f", {n} at once, {result.decode / n:.1f} each" if n > 1 else ""
@@ -465,7 +482,8 @@ def _perplexity(args: argparse.Namespace) -> None:
     from leatengine.engine import Engine
 
     ctx = bench.base_chunk(args.kl_base) if args.kl_base else args.ctx
-    engine = Engine(args.model, max_context=ctx, prefill_chunk=ctx)  # a chunk in one run
+    # a chunk in one run
+    engine = Engine(args.model, max_context=ctx, prefill_chunk=ctx, cache_type=args.cache_type)
     if args.kl_base:
         result = bench.kl_divergence(engine, args.kl_base, args.chunks, args.decode)
     else:

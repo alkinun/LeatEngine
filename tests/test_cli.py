@@ -14,7 +14,7 @@ from leatengine.cli import _url, main
 from leatengine.engine import Engine
 from leatengine.gguf import GGUF
 from leatengine.tokenizer import Tokenizer
-from tests.helpers import reference_logits
+from tests.helpers import q8_0, reference_logits
 
 CTX, FIRST = 16, 8  # llama-perplexity scores positions FIRST .. CTX-2 of each chunk
 TEXT = ("the quick brown fox jumps over the lazy dog " * 2)[:64]  # 4 chunks of byte tokens
@@ -57,7 +57,13 @@ def test_bench(tiny_model, capsys, prompt, sequences):
     args = ("-p", prompt, "-n", 6, "-r", 1, "-s", sequences)
     result = run_json(capsys, "bench", tiny_model[0], *args)
     assert result["prefill"] > 0 and result["decode"] > 0 and result["weight_gbs"] > 0
-    assert result["sequences"] == sequences
+    assert result["sequences"] == sequences and result["cache_type"] == "f16"
+
+
+def test_bench_q8_0_cache(tiny_model, capsys):
+    args = ("-p", 8, "-n", 6, "-r", 1, "--cache-type", "q8_0")
+    result = run_json(capsys, "bench", tiny_model[0], *args)
+    assert result["cache_type"] == "q8_0" and result["decode"] > 0
 
 
 def test_bench_draft(tiny, tiny_assistant, capsys):
@@ -95,7 +101,12 @@ def test_perplexity(tiny_model, tmp_path, capsys, mode):
 
 @pytest.mark.usefixtures("reference_ops")
 @pytest.mark.parametrize("mode", [[], ["--decode"]])
-def test_kl_divergence(tiny_model, tmp_path, capsys, mode):
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
+def test_kl_divergence(tiny_model, tmp_path, capsys, monkeypatch, mode, cache_type):
+    # against the reference's logits, of keys and values rounded as the cache holds them
+    if cache_type == "q8_0":
+        monkeypatch.setattr("tests.helpers.cached", q8_0)
+    mode = [*mode, "--cache-type", cache_type]
     path, weights = tiny_model
     vocab = weights["output.weight"].shape[0]
     write_kl_base(base := tmp_path / "base.kld", weights, chunks(path), vocab)
@@ -195,7 +206,7 @@ def test_serve_directories(tiny_model, tmp_path, monkeypatch, capsys):
     other.write_header_to_file()
     other.write_kv_data_to_file()
     other.close()
-    loaded, failing, keys, samplings, served = [], [], [], [], []
+    loaded, failing, keys, samplings, served, engines = [], [], [], [], [], []
 
     class Fake:
         server_port = 8080
@@ -205,6 +216,7 @@ def test_serve_directories(tiny_model, tmp_path, monkeypatch, capsys):
             served.append(files)
             keys.append(given)
             samplings.append(sampling)
+            engines.append(options)
 
         def __enter__(self):
             return self
@@ -237,7 +249,9 @@ def test_serve_directories(tiny_model, tmp_path, monkeypatch, capsys):
     assert [f.name for f in served[-1]] == ["tiny.gguf"]
     assert keys[-1].path == tmp_path / "keys.json"
     main(["serve", str(models), "--host", "::1"])  # this machine's alone: no keys needed
-    assert keys[-1] is None and samplings[-1] is None
+    assert keys[-1] is None and samplings[-1] is None and engines[-1]["cache_type"] == "f16"
+    main(["serve", str(models), "--cache-type", "q8_0"])
+    assert engines[-1]["cache_type"] == "q8_0"
     # an operator's sampling, read as it starts, which a file of none or a broken one stops
     sampling = tmp_path / "sampling.json"
     with pytest.raises(SystemExit, match="cannot be read"):
@@ -266,6 +280,9 @@ def test_serve_directories(tiny_model, tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit):
         main(["serve", "--port", "70000", str(models)])
     assert "must be from 0 to 65535" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        main(["serve", "--cache-type", "q4_0", str(models)])
+    assert "--cache-type: invalid choice: 'q4_0'" in capsys.readouterr().err
 
 
 def test_url():
