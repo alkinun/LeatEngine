@@ -75,9 +75,11 @@ attention over heads wider than 512 dimensions, which it computes wrongly; the
   artifact.
 
 CPU and emulated GPU jobs rebalance queued tests between workers with `--dist worksteal`, so
-long model cases do not leave the remaining tests queued behind one busy worker. AMD primitive
-kernels and the remaining GPU integration tests run in separate CI jobs; both contribute to the
-combined coverage gate.
+long model cases do not leave the remaining tests queued behind one busy worker. The emulated GPU
+tests run in three jobs: the attention kernels', the other kernels', and the tiny models through
+them; all contribute to the combined coverage gate. Each test job starts from the tinygrad cache
+of its last run, kept by `uv.lock`, clang and the runner's CPU, so that a run compiles, lowers and
+schedules only what changed.
 
 The packaging check builds both artifacts and installs each into a fresh environment. It runs
 outside the source checkout, checks both CLI entry points and package boundaries, and serves

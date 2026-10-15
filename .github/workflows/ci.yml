@@ -71,6 +71,19 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
+      # tinygrad's disk cache from the last run, of the kernels it compiled and of the schedules and
+      # programs LeatEngine keeps, so that a run makes only what changed: by uv.lock, which pins
+      # tinygrad, by clang, and by the CPU, whose own instructions -march=native compiles for
+      - run: |
+          tools=$( { clang --version; grep -m 1 '^model name' /proc/cpuinfo; grep -m 1 '^flags' /proc/cpuinfo; } | sha256sum | cut -c 1-16)
+          echo "TINYGRAD_CACHE=tinygrad-$JOB-${{ hashFiles('uv.lock') }}-$tools" >> "$GITHUB_ENV"
+        env:
+          JOB: cpu-${{ matrix.python }}
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/tinygrad
+          key: ${{ env.TINYGRAD_CACHE }}-${{ github.run_id }}
+          restore-keys: ${{ env.TINYGRAD_CACHE }}-
       - run: uv run pytest -n auto --dist worksteal --cov --cov-report= --durations=20
         env:
           DEV: CPU
@@ -91,8 +104,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - suite: primitives
-            selection: tests/test_kernels.py
+          # the kernels alone, half of them each: those of attention, and the others
+          - suite: attention
+            selection: tests/test_kernels.py -k "attention or rotate or delta"
+          - suite: matrices
+            selection: tests/test_kernels.py -k "not (attention or rotate or delta)"
           - suite: models
             selection: --ignore=tests/test_kernels.py
     steps:
@@ -106,6 +122,17 @@ jobs:
         with:
           python-version: "3.14"
       - run: uv sync --locked
+      # tinygrad's disk cache from the last run, as the CPU tests keep theirs
+      - run: |
+          tools=$( { clang --version; grep -m 1 '^model name' /proc/cpuinfo; grep -m 1 '^flags' /proc/cpuinfo; } | sha256sum | cut -c 1-16)
+          echo "TINYGRAD_CACHE=tinygrad-$JOB-${{ hashFiles('uv.lock') }}-$tools" >> "$GITHUB_ENV"
+        env:
+          JOB: kernels-${{ matrix.suite }}
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/tinygrad
+          key: ${{ env.TINYGRAD_CACHE }}-${{ github.run_id }}
+          restore-keys: ${{ env.TINYGRAD_CACHE }}-
       - run: uv run pytest -m gpu ${{ matrix.selection }} -n auto --dist worksteal --cov --cov-report= --durations=20
         env:
           DEV: MOCK+AMD
