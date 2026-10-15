@@ -1,4 +1,4 @@
-"""Terminal chat, HTTP serving, API keys, and inference measurements.
+"""Terminal chat, HTTP serving, API keys, inference measurements, and a check of the machine.
 
 Engine imports follow device selection, before tinygrad initializes its backend.
 """
@@ -142,6 +142,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     quality.add_argument("--json", action="store_true", help="print one JSON object")
 
+    check = commands.add_parser(
+        "doctor", help="check this machine for LeatEngine on Strix Halo: its GPU, memory and clang"
+    )
+    check.add_argument("--json", action="store_true", help="print one JSON object")
+
     args = parser.parse_args(argv)
     if args.command == "serve":
         _check_serve(serve, args)
@@ -149,7 +154,7 @@ def main(argv: list[str] | None = None) -> None:
         _device()
     handlers = {
         "run": _run, "serve": _serve, "keys": _keys, "bench": _bench,
-        "perplexity": _perplexity,
+        "perplexity": _perplexity, "doctor": _doctor,
     }  # fmt: skip
     handlers[args.command](args)
 
@@ -474,3 +479,12 @@ def _perplexity(args: argparse.Namespace) -> None:
     if result.kl_mean is not None:
         print(f"KL mean {result.kl_mean:.6f}  p99 {result.kl_p99:.6f}  max {result.kl_max:.6f}")
         print(f"same top token {result.top1:.2%}")
+
+
+def _doctor(args: argparse.Namespace) -> None:
+    from leatengine import doctor
+
+    found = doctor.checks()
+    print(json.dumps(doctor.as_json(found)) if args.json else doctor.report(found))
+    if any(c.status == "fail" for c in found):
+        raise SystemExit(1)  # as a script waiting on a ready machine reads it

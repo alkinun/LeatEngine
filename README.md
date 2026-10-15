@@ -19,8 +19,12 @@ ROCm is not needed. See the [Strix Halo guide](docs/strix-halo.md).
 
 ```bash
 uv tool install --python 3.14 'git+https://github.com/alkinun/LeatEngine.git'
-leatengine --help
+leatengine doctor
 ```
+
+`leatengine doctor` checks the kernel, access to the GPU, how much memory the GPU's buffers can
+take, and clang, then runs a kernel on the GPU. It says what to change where something will not
+do, and its report can be pasted into an issue as it is.
 
 For development or to build a wheel:
 
@@ -113,6 +117,7 @@ reference ops, which are slower.
 | `keys` | Add, list, and remove API keys |
 | `bench` | Measure prefill and decode throughput |
 | `perplexity` | Measure perplexity or compare logits with llama.cpp |
+| `doctor` | Check the machine: kernel, GPU access, GPU memory, clang, and a run on the GPU |
 
 Use `leatengine COMMAND --help` for arguments. The server keeps one chat model loaded at a time,
 with an optional embedding model alongside it. There is no frontend or application service.
