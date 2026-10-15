@@ -545,15 +545,16 @@ def test_lowered_programs_kept(monkeypatch):
     dict.pop(programs, key)
     with Context(CCACHE=0):  # as tinygrad keeps no binaries, no programs either
         assert key not in programs
+    fingerprint = lowering._fingerprint()
+    monkeypatch.setenv("ALIGNED", "0")  # a switch tinygrad's C renderers read, which programs hold
+    assert lowering._fingerprint.__wrapped__() != fingerprint
+    with monkeypatch.context() as m:  # of another tinygrad, while the row is whole
+        m.setattr(lowering, "_fingerprint", lambda: "another tinygrad")
+        assert key not in programs and programs.get(key) is None
     # a row a flipped bit damaged is lowered anew rather than served
     digest, data = diskcache_get(lowering.TABLE, name := lowering._name(key))
     diskcache_put(lowering.TABLE, name, (digest, bytes([data[0] ^ 1]) + data[1:]))
     assert key not in programs
-    fingerprint = lowering._fingerprint()
-    monkeypatch.setenv("ALIGNED", "0")  # a switch tinygrad's C renderers read, which programs hold
-    assert lowering._fingerprint.__wrapped__() != fingerprint
-    monkeypatch.setattr(lowering, "_fingerprint", lambda: "another tinygrad")
-    assert key not in programs and programs.get(key) is None
 
 
 def test_one_generation_at_a_time(tiny_model):
