@@ -10,7 +10,7 @@ from leatengine import kernels, ops
 from leatengine.kernels import MATVEC_TOKENS
 from leatengine.kernels.cutoff import BINS, RANGE
 from leatengine.quant import BLOCK, GGMLType, QTensor, from_q8_0, q8_0_row
-from tests.helpers import cuts, glu, random_blocks
+from tests.helpers import cuts, glu, q8_0, q8_0_rows, random_blocks
 
 # the warp-level kernels run on NVIDIA's GPUs and AMD's RDNA, tinygrad's emulated one too, and those
 # on tensor cores on NVIDIA's and RDNA 3's
@@ -518,6 +518,15 @@ def empty_cache(kv_heads: int, positions: int, dim: int, cache_type: str = "f16"
     return Tensor.zeros(2, SLOTS, kv_heads, positions, width, dtype=dtype).contiguous().realize()
 
 
+def as_cache(values: np.ndarray, cache_type: str = "f16") -> tuple[Tensor, np.ndarray]:
+    # keys and values (2, slots, kv heads, positions, dim) as a cache of f16 values or of q8_0
+    # rows, quantized here: the cache, and the values it holds
+    if cache_type == "q8_0":
+        return Tensor(q8_0_rows(values)).realize(), q8_0(values)
+    cache = values.astype(np.float16)
+    return Tensor(cache).realize(), cache
+
+
 def held(cache: Tensor, dim: int) -> np.ndarray:
     # a cache's keys and values, in f32
     return (from_q8_0(cache, dim) if cache.dtype == dtypes.uint8 else cache.float()).numpy()
@@ -566,12 +575,13 @@ def reference_attention(
      (4096, 4096)],
 )  # fmt: skip
 @pytest.mark.parametrize("symbolic", [False, True])
-def test_attention(n, length, symbolic):
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
+def test_attention(n, length, symbolic, cache_type):
     rng = np.random.default_rng(length)
-    cache = rng.standard_normal((2, SLOTS, 8, n, 128)).astype(np.float16)
+    cache_t, cache = as_cache(rng.standard_normal((2, SLOTS, 8, n, 128)), cache_type)
     q = rng.standard_normal((1, 32, 1, 128)).astype(np.float32)
     valid = UOp.variable("start_pos", 0, n - 1).bind(length - 1) + 1 if symbolic else length
-    q_t, cache_t = Tensor(q).realize(), Tensor(cache).realize()  # the model's cache is a buffer
+    q_t = Tensor(q).realize()  # the model's cache is a buffer too
     assert kernels.supports_attention(q_t, cache_t)
     got = kernels.attention(q_t, cache_t, [slot(symbolic)], [valid], 128**-0.5).numpy()
     got = got.reshape(-1, 128)
@@ -585,16 +595,17 @@ def test_attention(n, length, symbolic):
                                                   (20, 1, 576)])  # fmt: skip
 @pytest.mark.parametrize("length", [65, 1000])
 @pytest.mark.parametrize("symbolic", [False, True])
-def test_attention_groups(heads, kv_heads, dim, length, symbolic):
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
+def test_attention_groups(heads, kv_heads, dim, length, symbolic, cache_type):
     if dim > 512 and os.environ.get("DEV", "").startswith("MOCK+AMD"):
         # the emulator misreads this kernel's 16-bit operations in VGPRs past 127, which it then
         # takes, as their registers' high halves; within 128 VGPRs, it computes them rightly
         pytest.skip("tinygrad's RDNA 3 emulator misreads 16-bit operands in VGPRs past 127")
     rng = np.random.default_rng(length + heads)
-    cache = rng.standard_normal((2, SLOTS, kv_heads, 1024, dim)).astype(np.float16)
+    cache_t, cache = as_cache(rng.standard_normal((2, SLOTS, kv_heads, 1024, dim)), cache_type)
     q = rng.standard_normal((1, heads, 1, dim)).astype(np.float32)
     valid = UOp.variable("start_pos", 0, 1023).bind(length - 1) + 1 if symbolic else length
-    q_t, cache_t = Tensor(q).realize(), Tensor(cache).realize()
+    q_t = Tensor(q).realize()
     assert kernels.supports_attention(q_t, cache_t)
     got = kernels.attention(q_t, cache_t, [slot(symbolic)], [valid], dim**-0.5).numpy()
     got = got.reshape(-1, dim)
@@ -610,9 +621,10 @@ def test_attention_groups(heads, kv_heads, dim, length, symbolic):
 @pytest.mark.parametrize(
     "rows", [[(0, 1), (2, 70), (1, 4000), (2, 3000)], [(0, 2048), (2, 68)]], ids=["long", "short"]
 )
-def test_attention_rows(window, sinks, symbolic, rows):
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
+def test_attention_rows(window, sinks, symbolic, rows, cache_type):
     rng = np.random.default_rng(len(rows) + window)
-    cache = rng.standard_normal((2, SLOTS, 8, 4096, 128)).astype(np.float16)
+    cache_t, cache = as_cache(rng.standard_normal((2, SLOTS, 8, 4096, 128)), cache_type)
     q = rng.standard_normal((1, 32, len(rows), 128)).astype(np.float32) * 0.3
     sink = rng.standard_normal(32).astype(np.float32) if sinks else None
     slots: list[int | UOp] = [s for s, _ in rows]
@@ -622,7 +634,7 @@ def test_attention_rows(window, sinks, symbolic, rows):
         lengths = [
             UOp.variable(f"pos{i}", 0, 4095).bind(n - 1) + 1 for i, (_, n) in enumerate(rows)
         ]
-    q_t, cache_t = Tensor(q).realize(), Tensor(cache).realize()
+    q_t = Tensor(q).realize()
     assert kernels.supports_attention(q_t, cache_t)
     sink_t = None if sink is None else Tensor(sink)
     got = kernels.attention(q_t, cache_t, slots, lengths, 0.1, window, sink_t).numpy()[0]
@@ -635,11 +647,12 @@ def test_attention_rows(window, sinks, symbolic, rows):
 # window of 1024, that of length 2047 takes a chunk more than the last's of 2048
 @pytest.mark.parametrize("window", [0, 1024])
 @pytest.mark.parametrize("symbolic", [False, True])
-def test_attention_spans(window, symbolic):
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
+def test_attention_spans(window, symbolic, cache_type):
     spans = [(0, 2044, 4), (2, 67, 3)]  # slot, start, tokens
     rows = [(slot, start + i + 1) for slot, start, n in spans for i in range(n)]
     rng = np.random.default_rng(len(rows) + window)
-    cache = rng.standard_normal((2, SLOTS, 8, 4096, 128)).astype(np.float16)
+    cache_t, cache = as_cache(rng.standard_normal((2, SLOTS, 8, 4096, 128)), cache_type)
     q = rng.standard_normal((1, 32, len(rows), 128)).astype(np.float32) * 0.3
     slots: list[int | UOp] = [s for s, _ in rows]
     lengths: list[int | UOp] = [n for _, n in rows]
@@ -648,7 +661,7 @@ def test_attention_spans(window, symbolic):
             UOp.variable(f"pos{i}", 0, 4000).bind(start) for i, (_, start, _) in enumerate(spans)
         ]
         lengths = [starts[i] + j + 1 for i, (_, _, n) in enumerate(spans) for j in range(n)]
-    q_t, cache_t = Tensor(q).realize(), Tensor(cache).realize()
+    q_t = Tensor(q).realize()
     got = kernels.attention(q_t, cache_t, slots, lengths, 0.1, window, ends=[3, 6]).numpy()[0]
     for t, (s, n) in enumerate(rows):
         expected = reference_attention(q[0, :, t : t + 1], cache, n - 1, window, 0.1, None, s)
@@ -668,12 +681,13 @@ def chunk_len(tokens: int) -> UOp:
 )
 @pytest.mark.parametrize("heads, kv_heads, dim", [(32, 8, 128), (28, 4, 128), (32, 32, 96)])
 @pytest.mark.parametrize("symbolic", [False, True])
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
 @matrix_cores
-def test_flash_attention(tokens, start, heads, kv_heads, dim, symbolic):
+def test_flash_attention(tokens, start, heads, kv_heads, dim, symbolic, cache_type):
     rng = np.random.default_rng(tokens + start)
-    cache = rng.standard_normal((2, SLOTS, kv_heads, 4096, dim)).astype(np.float16)
+    cache_t, cache = as_cache(rng.standard_normal((2, SLOTS, kv_heads, 4096, dim)), cache_type)
     q = rng.standard_normal((1, heads, 512, dim)).astype(np.float32)
-    q_t, cache_t = Tensor(q).realize(), Tensor(cache).realize()
+    q_t = Tensor(q).realize()
     if symbolic:  # as while prefilling: a bound start and number of tokens
         pos = UOp.variable("start_pos", 0, 4095).bind(start)
         q_t = q_t[:, :, : chunk_len(tokens)]
@@ -682,8 +696,8 @@ def test_flash_attention(tokens, start, heads, kv_heads, dim, symbolic):
     assert kernels.supports_flash_attention(q_t, cache_t)
     got = kernels.flash_attention(q_t, cache_t, slot(symbolic), pos, dim**-0.5)
     got = got.pad_to((1, 512, heads * dim)).numpy()[0, :tokens]
-    expected = reference_attention(q[0, :, :tokens], cache, start)
-    # queries and weights are rounded to f16 for the tensor cores
+    # queries, weights and values are rounded to f16 for the tensor cores, a q8_0 cache's as read
+    expected = reference_attention(q[0, :, :tokens], cache.astype(np.float16), start)
     np.testing.assert_allclose(got.reshape(expected.shape), expected, rtol=3e-3, atol=3e-3)
 
 
@@ -692,12 +706,13 @@ def test_flash_attention(tokens, start, heads, kv_heads, dim, symbolic):
 @pytest.mark.parametrize("kv_heads, dim, window", [(8, 256, 1024), (2, 512, 0), (8, 128, 100)])
 @pytest.mark.parametrize("n, length", [(4096, 70), (4096, 1100), (4096, 3079), (2048, 1500)])
 @pytest.mark.parametrize("symbolic", [False, True])
-def test_attention_window(kv_heads, dim, window, n, length, symbolic):
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
+def test_attention_window(kv_heads, dim, window, n, length, symbolic, cache_type):
     rng = np.random.default_rng(length + dim)
-    cache = rng.standard_normal((2, SLOTS, kv_heads, n, dim)).astype(np.float16)
+    cache_t, cache = as_cache(rng.standard_normal((2, SLOTS, kv_heads, n, dim)), cache_type)
     q = rng.standard_normal((1, 16, 1, dim)).astype(np.float32) * 0.2
     valid = UOp.variable("start_pos", 0, n - 1).bind(length - 1) + 1 if symbolic else length
-    q_t, cache_t = Tensor(q).realize(), Tensor(cache).realize()
+    q_t = Tensor(q).realize()
     assert kernels.supports_attention(q_t, cache_t)
     got = kernels.attention(q_t, cache_t, [slot(symbolic)], [valid], 1.0, window).numpy()
     got = got.reshape(-1, dim)
@@ -848,12 +863,13 @@ def test_rotate_rows(monkeypatch, symbolic, per_slot, cache_type):
     [(37, 0, 0), (100, 1000, 0), (512, 1500, 1024), (7, 1000, 0), (3, 1900, 1024)],
 )
 @pytest.mark.parametrize("symbolic", [False, True])
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
 @matrix_cores
-def test_flash_attention_wide(tokens, start, window, symbolic):
+def test_flash_attention_wide(tokens, start, window, symbolic, cache_type):
     rng = np.random.default_rng(tokens + start)
-    cache = rng.standard_normal((2, SLOTS, 2, 2048, 512)).astype(np.float16) * np.float16(0.2)
+    cache_t, cache = as_cache(rng.standard_normal((2, SLOTS, 2, 2048, 512)) * 0.2, cache_type)
     q = rng.standard_normal((1, 16, 512, 512)).astype(np.float32) * 0.2
-    q_t, cache_t = Tensor(q).realize(), Tensor(cache).realize()
+    q_t = Tensor(q).realize()
     if symbolic:
         pos = UOp.variable("start_pos", 0, 2047).bind(start)
         q_t = q_t[:, :, : chunk_len(tokens)]
@@ -862,7 +878,7 @@ def test_flash_attention_wide(tokens, start, window, symbolic):
     assert kernels.supports_flash_attention(q_t, cache_t)
     got = kernels.flash_attention(q_t, cache_t, slot(symbolic), pos, 1.0, window)
     got = got.pad_to((1, 512, 16 * 512)).numpy()[0, :tokens]
-    expected = reference_attention(q[0, :, :tokens], cache, start, window, 1.0)
+    expected = reference_attention(q[0, :, :tokens], cache.astype(np.float16), start, window, 1.0)
     np.testing.assert_allclose(got.reshape(expected.shape), expected, rtol=3e-3, atol=3e-3)
 
 
@@ -888,10 +904,12 @@ def ring_of(cache: np.ndarray, ends: dict[int, int], size: int, rng) -> np.ndarr
 @pytest.mark.parametrize(
     "rows", [[(0, 1), (2, 1100), (1, 3079)], [(0, 2048), (2, 70)]], ids=["long", "short"]
 )
-def test_attention_ring(window, size, symbolic, rows):
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
+def test_attention_ring(window, size, symbolic, rows, cache_type):
     rng = np.random.default_rng(len(rows) + window)
-    cache = rng.standard_normal((2, SLOTS, 8, 4096, 256)).astype(np.float16)
-    ring = ring_of(cache, dict(rows), size, rng)
+    whole = rng.standard_normal((2, SLOTS, 8, 4096, 256))
+    ring_t, _ = as_cache(ring_of(whole, dict(rows), size, rng), cache_type)
+    _, cache = as_cache(whole, cache_type)
     q = rng.standard_normal((1, 16, len(rows), 256)).astype(np.float32) * 0.2
     sink = rng.standard_normal(16).astype(np.float32)
     slots: list[int | UOp] = [s for s, _ in rows]
@@ -901,7 +919,7 @@ def test_attention_ring(window, size, symbolic, rows):
         lengths = [
             UOp.variable(f"pos{i}", 0, 4095).bind(n - 1) + 1 for i, (_, n) in enumerate(rows)
         ]
-    q_t, ring_t = Tensor(q).realize(), Tensor(ring).realize()
+    q_t = Tensor(q).realize()
     assert kernels.supports_attention(q_t, ring_t)
     got = kernels.attention(q_t, ring_t, slots, lengths, 1.0, window, Tensor(sink), ring=True)
     for t, (s, n) in enumerate(rows):
@@ -911,12 +929,15 @@ def test_attention_ring(window, size, symbolic, rows):
 
 # rows of two sequences' consecutive tokens, as a speculative step's, over rings
 @pytest.mark.parametrize("symbolic", [False, True])
-def test_attention_ring_spans(symbolic):
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
+def test_attention_ring_spans(symbolic, cache_type):
     spans, window, size = [(0, 2044, 4), (2, 67, 3)], 1024, 1088  # slot, start, tokens
     rows = [(slot, start + i + 1) for slot, start, n in spans for i in range(n)]
     rng = np.random.default_rng(5)
-    cache = rng.standard_normal((2, SLOTS, 8, 4096, 128)).astype(np.float16)
-    ring = ring_of(cache, {slot: start + n for slot, start, n in spans}, size, rng)
+    whole = rng.standard_normal((2, SLOTS, 8, 4096, 128))
+    ends = {slot: start + n for slot, start, n in spans}
+    ring_t, _ = as_cache(ring_of(whole, ends, size, rng), cache_type)
+    _, cache = as_cache(whole, cache_type)
     q = rng.standard_normal((1, 32, len(rows), 128)).astype(np.float32) * 0.3
     slots: list[int | UOp] = [s for s, _ in rows]
     lengths: list[int | UOp] = [n for _, n in rows]
@@ -925,7 +946,7 @@ def test_attention_ring_spans(symbolic):
             UOp.variable(f"pos{i}", 0, 4000).bind(start) for i, (_, start, _) in enumerate(spans)
         ]
         lengths = [starts[i] + j + 1 for i, (_, _, n) in enumerate(spans) for j in range(n)]
-    q_t, ring_t = Tensor(q).realize(), Tensor(ring).realize()
+    q_t = Tensor(q).realize()
     got = kernels.attention(q_t, ring_t, slots, lengths, 0.1, window, ends=[3, 6], ring=True)
     for t, (s, n) in enumerate(rows):
         expected = reference_attention(q[0, :, t : t + 1], cache, n - 1, window, 0.1, None, s)
@@ -938,13 +959,15 @@ def test_attention_ring_spans(symbolic):
 @pytest.mark.parametrize("dim, window, size", [(256, 1024, 1536), (128, 100, 640)])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("symbolic", [False, True])
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
 @matrix_cores
-def test_flash_attention_ring(tokens, start, dim, window, size, causal, symbolic):
+def test_flash_attention_ring(tokens, start, dim, window, size, causal, symbolic, cache_type):
     rng = np.random.default_rng(tokens + start + dim)
-    cache = rng.standard_normal((2, SLOTS, 8, 4096, dim)).astype(np.float16)
-    ring = ring_of(cache, {SLOT: start + tokens}, size, rng)
+    whole = rng.standard_normal((2, SLOTS, 8, 4096, dim))
+    ring_t, _ = as_cache(ring_of(whole, {SLOT: start + tokens}, size, rng), cache_type)
+    _, cache = as_cache(whole, cache_type)
     q = rng.standard_normal((1, 16, 512, dim)).astype(np.float32) * 0.2
-    q_t, ring_t = Tensor(q).realize(), Tensor(ring).realize()
+    q_t = Tensor(q).realize()
     if symbolic:
         pos = UOp.variable("start_pos", 0, 4095).bind(start)
         q_t = q_t[:, :, : chunk_len(tokens)]
@@ -955,7 +978,8 @@ def test_flash_attention_ring(tokens, start, dim, window, size, causal, symbolic
         q_t, ring_t, slot(symbolic), pos, 1.0, window, causal=causal, ring=True
     )
     got = got.pad_to((1, 512, 16 * dim)).numpy()[0, :tokens]
-    expected = reference_attention(q[0, :, :tokens], cache, start, window, 1.0, causal=causal)
+    values = cache.astype(np.float16)  # as the tensor cores take them
+    expected = reference_attention(q[0, :, :tokens], values, start, window, 1.0, causal=causal)
     np.testing.assert_allclose(got.reshape(expected.shape), expected, rtol=3e-3, atol=3e-3)
 
 
@@ -1038,12 +1062,13 @@ def test_cutoff(rows, n):
 # many, in a window of 128 positions or not
 @pytest.mark.parametrize("tokens, start", [(1, 70), (1, 1000), (11, 300), (100, 1000)])
 @pytest.mark.parametrize("window", [0, 128])
-def test_attention_sinks(tokens, start, window):
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
+def test_attention_sinks(tokens, start, window, cache_type):
     rng = np.random.default_rng(tokens + start + window)
-    cache = rng.standard_normal((2, SLOTS, 8, 2048, 64)).astype(np.float16)
+    cache_t, cache = as_cache(rng.standard_normal((2, SLOTS, 8, 2048, 64)), cache_type)
     q = rng.standard_normal((1, 64, tokens, 64)).astype(np.float32)
     sinks = rng.uniform(-2, 4, 64).astype(np.float32)
-    q_t, cache_t, sinks_t = Tensor(q).realize(), Tensor(cache).realize(), Tensor(sinks)
+    q_t, sinks_t = Tensor(q).realize(), Tensor(sinks)
     if tokens > 1 and not MATRIX_CORES:
         pytest.skip("FlashAttention is on tensor cores")
     if tokens == 1:
@@ -1053,7 +1078,8 @@ def test_attention_sinks(tokens, start, window):
         assert kernels.supports_flash_attention(q_t, cache_t)
         got = kernels.flash_attention(q_t, cache_t, SLOT, start, 0.125, window, sinks_t)
     got = got.numpy().reshape(tokens, 64, 64)
-    expected = reference_attention(q[0], cache, start, window, 0.125, sinks)
+    values = cache if tokens == 1 else cache.astype(np.float16)  # as tensor cores take them
+    expected = reference_attention(q[0], values, start, window, 0.125, sinks)
     np.testing.assert_allclose(got, expected, rtol=3e-3, atol=3e-3)
 
 

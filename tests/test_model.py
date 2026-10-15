@@ -45,6 +45,9 @@ ARCHS = [
     "lfm2moe",
     "deepseek2",
 ]
+# of plain layers, of rings with sinks, of keys that are values, beside recurrent layers, and of
+# MLA's one head: the ways a q8_0 cache holds keys and values
+Q8_0_ARCHS = ["llama", "gpt-oss", "gemma4", "qwen35moe", "deepseek2"]
 
 
 def transformer(
@@ -66,10 +69,9 @@ def test_forward_matches_reference(tiny, arch):
 
 
 @pytest.mark.usefixtures("reference_ops")
-@pytest.mark.parametrize("arch", ["llama", "gpt-oss", "gemma4", "qwen35moe", "deepseek2"])
+@pytest.mark.parametrize("arch", Q8_0_ARCHS)
 def test_q8_0_cache_matches_reference(tiny, monkeypatch, arch):
-    # keys and values held as q8_0, as the f64 reference rounds them: of plain layers, of rings
-    # with sinks, of keys that are values, beside recurrent layers, and of MLA's one head
+    # keys and values held as q8_0, as the f64 reference rounds them
     monkeypatch.setattr("tests.helpers.cached", q8_0)
     path, weights = tiny(arch)
     model, expected = transformer(path, cache_type="q8_0"), reference_logits(weights, PROMPT, arch)
@@ -88,13 +90,19 @@ def test_q8_0_cache_needs_whole_blocks(tiny_model):
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("arch", ARCHS)
-def test_kernels_match_reference(tiny, arch):
+@pytest.mark.parametrize(
+    "arch, cache_type", [(a, "f16") for a in ARCHS] + [(a, "q8_0") for a in Q8_0_ARCHS]
+)
+def test_kernels_match_reference(tiny, monkeypatch, arch, cache_type):
     # the kernels, where they take the tiny models' shapes, run every architecture as the f64
     # reference does but for their int8 activations' rounding, some hundredths of the largest
-    # logit: a whole prompt, as prefilling, and a token at a time, as decoding
+    # logit: a whole prompt, as prefilling, and a token at a time, as decoding; and with a q8_0
+    # cache, as the reference rounds keys and values to q8_0
+    if cache_type == "q8_0":
+        monkeypatch.setattr("tests.helpers.cached", q8_0)
     path, weights = tiny(arch)
-    model, expected = transformer(path), reference_logits(weights, PROMPT, arch)
+    model = transformer(path, cache_type=cache_type)
+    expected = reference_logits(weights, PROMPT, arch)
     whole = model.logits(model(Tensor([PROMPT], dtype=dtypes.int32), 0)).numpy()[0]
     pos = UOp.variable("start_pos", 0, CONTEXT - 1)
     each = [model.logits(model(Tensor([[t]], dtype=dtypes.int32), pos.bind(i))).numpy()[0, 0]

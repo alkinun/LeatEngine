@@ -20,6 +20,7 @@ from leatengine.kernels.common import (
     carry_all,
     lane_range,
     load_vector,
+    load_words,
     on_gpu,
     on_matrix_cores,
     on_rdna3,
@@ -56,11 +57,12 @@ def _attention_partial_kernel(
     # PARTIALS-th chunk of its keys, of `most` at most for any row, for a `split`-th of the query
     # heads of its GQA group, from the chunk of the first key the window holds; blocks past a
     # row's chunks take none. Each of `waves` warps scores KEYS / waves keys of a chunk; lanes
-    # hold dim / 32 dimensions. The warps then merge through shared memory into one partial per
-    # block: the unnormalized output, its running max and its sum of weights. A ring holds
-    # position p at p mod its positions, a chunk's keys together.
-    rows, kv_heads, positions, dim = len(slots), *(int(d) for d in cache.shape[2:])
-    heads = int(q.shape[0])
+    # hold dim / 32 dimensions, of the cache's f16 values or q8_0 rows. The warps then merge
+    # through shared memory into one partial per block: the unnormalized output, its running max
+    # and its sum of weights. A ring holds position p at p mod its positions, a chunk's keys
+    # together.
+    rows, kv_heads, positions = len(slots), int(cache.shape[2]), int(cache.shape[3])
+    heads, dim = int(q.shape[0]), int(q.shape[2])
     group, per_lane = heads // kv_heads // split, dim // WARP  # query heads per block
     partials = int(out.shape[1])
     per_wave, zero = KEYS // waves, UOp.const(0.0, dtypes.float32)
@@ -83,9 +85,9 @@ def _attention_partial_kernel(
         key = chunk * KEYS + wave * per_wave + j
         valid.append((key < length) & (key >= since) if window else key < length)
         row = (chunk * KEYS) % positions + wave * per_wave + j if ring else key
-        k = load_vector(cache[0, slot, kv, row, lane * per_lane], per_lane)
+        k = _held(cache, (0, slot, kv, row), lane * per_lane, per_lane, dim)
         # values load during scoring, so both streams are in flight together
-        v = load_vector(cache[1, slot, kv, row, lane * per_lane], per_lane)
+        v = _held(cache, (1, slot, kv, row), lane * per_lane, per_lane, dim)
         values.append([valid[j].where(x, zero) for x in v])
         dots = [warp_sum(sum((a * b for a, b in zip(qh, k, strict=True)), zero)) for qh in qs]
         scores.append([valid[j].where(d * scale, -1e30) for d in dots])
@@ -195,6 +197,34 @@ def _attention_combine_kernel(
     return UOp.group(*stores).end(lane, part, head).sink(arg=info)
 
 
+def _held(
+    cache: UOp, at: tuple[int | UOp, ...], first: UOp, count: int, dim: int
+) -> list[UOp]:  # fmt: skip
+    # `count` dimensions from `first` of the cache's head at `at` (kind, slot, kv head, position),
+    # in f32: of f16 values, or of a q8_0 row (leatengine.quant), each its int8 times its 32's
+    # scale, the row's bytes loaded as words, or where `count` is not a multiple of 4, halfwords
+    if cache.dtype == dtypes.half:
+        return list(load_vector(cache[(*at, first)], count))
+    kind, slot, kv, row = at
+    _, slots, kv_heads, positions, stride = (int(d) for d in cache.shape)
+    start = (((kind * slots + slot) * kv_heads + kv) * positions + row) * stride
+    size = 4 if count % 4 == 0 else 2
+    view = cache.flatten().bitcast(dtypes.uint32 if size == 4 else dtypes.uint16)
+    at_word = (start + first) // size
+    words = load_words(view, at_word, count // size) if count > size else (view[at_word].load(),)
+    ints = [((w.cast(dtypes.uint32) >> (8 * i) & 0xFF) ^ 0x80).cast(dtypes.int32) - 0x80
+            for w in words for i in range(size)]  # fmt: skip
+    as_f16 = cache.flatten().bitcast(dtypes.half)
+
+    def scale(d: int | UOp) -> UOp:  # dimension d's
+        return as_f16[(start + dim) // 2 + d // 32].load().float()
+
+    if 32 % count == 0:  # the lane's dimensions all of one 32
+        one = scale(first)
+        return [x.float() * one for x in ints]
+    return [x.float() * scale(first + i) for i, x in enumerate(ints)]
+
+
 def _combine_tile(dim: int) -> int | None:
     # the dimensions a warp of the combine kernel takes, if any divide heads of `dim`: 64, two a
     # lane, or else one a lane, as Phi-3 mini's heads of 96 need
@@ -231,11 +261,13 @@ def _per_block(group: int, dim: int) -> int:
 
 
 def supports_attention(q: Tensor, cache: Tensor) -> bool:
-    # a token per row, as many rows as known in advance, over an f16 cache
-    shape = (*cache.shape[2:], *q.shape)
-    if not on_gpu(q) or cache.dtype != dtypes.half or not all(isinstance(x, int) for x in shape):
+    # a token per row, as many rows as known in advance, over an f16 or q8_0 cache
+    shape = (*cache.shape[2:4], *q.shape)
+    if not on_gpu(q) or cache.dtype not in (dtypes.half, dtypes.uint8):
         return False
-    kv_heads, n, dim, batch, heads, _, _ = (int(x) for x in shape)
+    if not all(isinstance(x, int) for x in shape):
+        return False
+    kv_heads, n, batch, heads, _, dim = (int(x) for x in shape)
     group = _per_block(heads // kv_heads, dim)
     fits = group * dim * 2 + group * 8 <= SHARED  # one warp's share of shared memory
     return batch == 1 and dim % 64 == 0 and n % KEYS == 0 and fits
@@ -466,8 +498,9 @@ def _flash_attention_kernel(
     key_tile: int, parts: int, splits: int, wmma: bool = False, causal: bool = True,
     ring: bool = False,
 ) -> UOp:  # fmt: skip
-    # srcs: q (count, heads, dim) in f16, scaled so that exp2 gives the softmax, and the f16
-    # cache, read as words of f16 pairs; query i is at position start + i and sees the slot's
+    # srcs: q (count, heads, dim) in f16, scaled so that exp2 gives the softmax, and the cache,
+    # read as words of f16 pairs, of q8_0 rows dequantized; query i is at position start + i and
+    # sees the slot's
     # positions up to it, or if not causal up to the last query's, and of those only the ones
     # fewer than `window` from it, either way, if given. Blocks take key_tile keys at a time, and
     # 1 / parts of their outputs, which warps work out on WMMA's fragments if wmma, else on
@@ -478,9 +511,8 @@ def _flash_attention_kernel(
     # position p at p mod its positions, a tile's keys together.
     stats, (q, cache, *sinks) = (srcs[0], srcs[1:]) if splits > 1 else (None, srcs)
     heads, dim = int(q.shape[1]), int(q.shape[2])
-    _, slots, kv_heads, positions, _ = (int(d) for d in cache.shape)
+    _, slots, kv_heads, positions, stride = (int(d) for d in cache.shape)
     words, width = dim // 2, dim // parts  # the part's dimensions of the output
-    cache = cache.flatten().bitcast(dtypes.uint32).reshape(2, slots, kv_heads, positions, words)
     group = heads // kv_heads
     threads = group * WARP
     tile: UOp = UOp.const(0, dtypes.weakint)
@@ -513,6 +545,17 @@ def _flash_attention_kernel(
     def query(r: int, w: int | UOp) -> UOp:  # word w of the lane's query r
         return _halves_word(*(src[rows[r], head, 2 * w + i].load() for i in (0, 1)))
 
+    def word(kind: int, position: UOp, w: UOp) -> UOp:
+        # dimensions 2w and 2w + 1 of the slot's key or value at a position as a word of f16s: as
+        # an f16 cache holds them, or a q8_0 row's int8s times their 32's scale
+        start = (((kind * slots + slot) * kv_heads + kv_head) * positions + position) * stride
+        if cache.dtype == dtypes.half:
+            return cache.flatten().bitcast(dtypes.uint32)[start // 2 + w].load()
+        both = cache.flatten().bitcast(dtypes.uint16)[start // 2 + w].load().cast(dtypes.uint32)
+        scale = cache.flatten().bitcast(dtypes.half)[(start + dim) // 2 + w // 16].load().float()
+        ints = [((both >> (8 * i) & 0xFF) ^ 0x80).cast(dtypes.int32) - 0x80 for i in (0, 1)]
+        return _halves_word(*((x.float() * scale).cast(dtypes.half) for x in ints))
+
     keys = UOp.alloc((key_tile, words + 4), dtypes.uint32, addrspace=AddrSpace.LOCAL)
     values = UOp.alloc((width, key_tile // 2 + 4), dtypes.uint32, addrspace=AddrSpace.LOCAL)
     stores = []
@@ -520,13 +563,10 @@ def _flash_attention_kernel(
     row = (kt * key_tile) % positions if ring else kt * key_tile  # of the tile's first key
     for item in turns(key_tile * words, threads, tid):
         key, w = item // words, item % words
-        stores.append(keys[key, w].store(cache[0, slot, kv_head, row + key, w].load()))
+        stores.append(keys[key, w].store(word(0, row + key, w)))
     for item in turns(key_tile // 2 * width // 2, threads, tid):
         pair, w = item % (key_tile // 2), item // (key_tile // 2)
-        a, b = (
-            cache[1, slot, kv_head, row + 2 * pair + j, part * width // 2 + w].load()
-            for j in (0, 1)
-        )
+        a, b = (word(1, row + 2 * pair + j, part * width // 2 + w) for j in (0, 1))
         stores.append(values[2 * w, pair].store((a & 0xFFFF) | (b << 16)))
         stores.append(values[2 * w + 1, pair].store((a >> 16) | (b & 0xFFFF0000)))
     keys, values = keys.after(*stores), values.after(*stores)
@@ -604,9 +644,9 @@ def _flash_shape(positions: int, dim: int) -> tuple[int, int] | None:
 
 
 def supports_flash_attention(q: Tensor, cache: Tensor) -> bool:
-    # one sequence's queries, and heads and an f16 cache the kernel's tiles fit
-    positions, dim = cache.shape[3:]
-    if not on_matrix_cores(q) or cache.dtype != dtypes.half:
+    # one sequence's queries, and heads the kernel's tiles fit, of an f16 or q8_0 cache
+    positions, dim = cache.shape[3], q.shape[3]
+    if not on_matrix_cores(q) or cache.dtype not in (dtypes.half, dtypes.uint8):
         return False
     if not isinstance(positions, int) or not isinstance(dim, int):
         return False
@@ -664,7 +704,7 @@ def _rotate_kernel(
     out: UOp, cache: UOp, q: UOp, k: UOp, v: UOp, *extra: UOp,
     slots: tuple[int | UOp, ...] | int | UOp, positions: tuple[int | UOp, ...] | int | UOp,
     dim: int, rotated: int, halves: bool, biased: bool, v_norm: bool, eps: float,
-    ring: bool = False, quantized: bool = False,
+    ring: bool = False,
 ) -> UOp:  # fmt: skip
     # A warp per token and head of q, then of k and its v. Token t is in slot slots[t] at
     # positions[t], or for a single slot and position, in that slot at that position plus t. extra
@@ -673,11 +713,11 @@ def _rotate_kernel(
     # and k's norm weights if any. Each of q, k and v gets its bias; each head of q and k is then
     # normed with its weight, and of v without, if v_norm; the first `rotated` dimensions of q and k
     # are rotated, q into out as (heads, tokens, dim), the layout attention reads, and k into the
-    # cache with v, as f16, or if `quantized` as q8_0 rows (leatengine.quant), each 32 dimensions'
-    # scale from the warp's largest of them. Lanes take pairs of dimensions: those that rotate
-    # together, i and i + rotated / 2 or adjacent ones, each pair i turning by angle cos[pos, i],
-    # sin[pos, i], and the others' adjacent pairs as they are. A ring holds position pos at pos
-    # mod its positions.
+    # cache with v, as f16, or as q8_0 rows (leatengine.quant) in a cache of bytes, each 32
+    # dimensions' scale from the warp's largest of them. Lanes take pairs of dimensions: those that
+    # rotate together, i and i + rotated / 2 or adjacent ones, each pair i turning by angle
+    # cos[pos, i], sin[pos, i], and the others' adjacent pairs as they are. A ring holds position
+    # pos at pos mod its positions.
     (cos, sin), extra = (extra[:2], extra[2:]) if rotated else ((None, None), extra)
     biases, norms = (extra[:3], extra[3:]) if biased else ((), extra)
     # a position's head of the cache: dim f16 values, or a q8_0 row of bytes
@@ -728,7 +768,7 @@ def _rotate_kernel(
         # 2^31 values or more needs 64 bits
         at = ((kind * cache_slots + slot) * kv_heads + warp - heads) * cache_positions + place
         at = at * stride
-        if not quantized:
+        if cache.dtype == dtypes.half:
             return [cache.flatten()[(at + d).valid(is_kv)].store(x.cast(dtypes.half))
                     for d, x in xs]  # fmt: skip
         # each 32 dimensions' scale, which lane b stores of the b-th, then the values, int8 as
@@ -805,7 +845,7 @@ def rotate(
         _rotate_kernel, slots=slot_vars if isinstance(slots, list) else slot_vars[0],
         positions=position_vars if isinstance(positions, list) else position_vars[0], dim=dim,
         rotated=0 if rope is None else rope[1], halves=halves, biased=biases is not None,
-        v_norm=v_norm, eps=eps, ring=ring, quantized=cache.dtype == dtypes.uint8,
+        v_norm=v_norm, eps=eps, ring=ring,
     )  # fmt: skip
     out, cache = Tensor.custom_kernel(out, cache, q, k, v, *tables, *extra, fxn=fxn)[:2]
     return out.reshape(1, heads, tokens, dim), cache

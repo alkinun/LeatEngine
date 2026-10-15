@@ -11,7 +11,7 @@ from tinygrad import Tensor, UOp, dtypes
 
 from leatengine.draft import mtp
 from leatengine.gguf import GGUF
-from leatengine.quant import BLOCK, GGMLType
+from leatengine.quant import BLOCK, GGMLType, q8_0_row
 from leatengine.tokenizer import _BYTE_CHAR, CONTROL, NORMAL, USER_DEFINED, Tokenizer
 
 # byte offsets of each block's f16 scales; random bytes there would be inf/nan
@@ -364,6 +364,18 @@ def q8_0(z: np.ndarray) -> np.ndarray:
     q8 = gguf.GGMLQuantizationType.Q8_0
     blocks = quantize(z.astype(np.float32).reshape(-1, z.shape[-1]), q8)
     return dequantize(blocks, q8).reshape(z.shape).astype(np.float64)
+
+
+def q8_0_rows(z: np.ndarray) -> np.ndarray:
+    # keys or values (..., dim) as a q8_0 cache's rows of bytes (..., q8_0_row(dim)), as gguf-py
+    # quantizes q8_0
+    *lead, dim = z.shape
+    q8 = gguf.GGMLQuantizationType.Q8_0
+    blocks = quantize(z.astype(np.float32).reshape(-1, dim), q8).reshape(-1, dim // 32, 34)
+    rows = np.zeros((len(blocks), q8_0_row(dim)), np.uint8)
+    rows[:, :dim] = blocks[..., 2:].reshape(-1, dim)
+    rows[:, dim : dim + dim // 16] = blocks[..., :2].reshape(-1, dim // 16)
+    return rows.reshape(*lead, -1)
 
 
 def cuts(scores, top_k, top_p):
