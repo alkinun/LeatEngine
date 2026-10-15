@@ -122,9 +122,12 @@ def gpu_run(render: int | None, dev: str = "AMD") -> Check:
     lands, if the GPU's render node has minor `render`."""
     code = f"from leatengine.doctor import probe; probe({render!r})"
     env = {**os.environ, "DEV": dev}
+    # as isolated from PYTHONPATH and the like as this process, as the release tarball's launcher
+    # runs it
+    isolated = ["-I"] if sys.flags.isolated else []
     try:
-        done = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
-                              text=True, timeout=RUN_SECONDS)  # fmt: skip
+        done = subprocess.run([sys.executable, *isolated, "-c", code], env=env,
+                              capture_output=True, text=True, timeout=RUN_SECONDS)  # fmt: skip
     except subprocess.TimeoutExpired:
         return Check("gpu run", "fail", f"no answer in {RUN_SECONDS} s",
                      "the GPU may have hung: see `dmesg | grep -i amdgpu`")  # fmt: skip
