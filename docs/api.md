@@ -1,7 +1,7 @@
 # HTTP API and configuration
 
 Start with `leatengine serve MODEL.gguf`. The default address is `http://127.0.0.1:8080`.
-The API implements a subset of OpenAI chat and text completions and embeddings, plus
+The API implements a subset of OpenAI chat and text completions, responses, and embeddings, plus
 model-management, metrics and health extensions. It serves no HTML, frontend, or browser
 application.
 
@@ -13,6 +13,7 @@ application.
 | `POST /v1/models/load` | Load a configured model, replacing the current chat model |
 | `POST /v1/chat/completions` | Generate one reply, optionally streamed |
 | `POST /v1/completions` | Continue a prompt, or fill in the middle, optionally streamed |
+| `POST /v1/responses` | Generate one reply as a response, statelessly, optionally streamed |
 | `POST /v1/embeddings` | Embed text using the separately configured embedding model |
 | `GET /metrics` | Prometheus metrics with the `leatengine_` prefix |
 | `GET /health` | `200` once a chat model is loaded and warmed up, `503` until then |
@@ -96,7 +97,7 @@ roles and tool formats a model understands.
   `usage.prompt_tokens_details.cached_tokens`; streamed usage requires `include_usage`.
 
 This is not a complete OpenAI implementation: multiple choices and logit biases are
-unsupported. Responses, audio, file-storage, and tool-execution endpoints are not implemented.
+unsupported. Audio, file-storage, and tool-execution endpoints are not implemented.
 A prompt must fit the configured context; clients manage conversation history.
 
 ## Text completions
@@ -117,6 +118,24 @@ Sampling controls, `stop`, `seed`, `stream`, and `stream_options` work as for ch
 `logprobs` is a count of the likeliest tokens, 0 to 20, whose log-probabilities come with each
 token's, as OpenAI's text completions give them: `tokens`, `token_logprobs`, `top_logprobs` by
 token text, and `text_offset`. `echo` and `best_of` are not supported.
+
+## Responses
+
+`POST /v1/responses` answers as OpenAI's Responses API does, of a stateless subset: the server
+keeps no response, so `previous_response_id`, `conversation`, and `background` are refused, and a
+client sends the whole conversation as `input` each time, its past output items too, as clients
+do with `store: false`. `input` is a string or a list of messages, `function_call` and
+`function_call_output` items, and `reasoning` items, whose text goes back to the model as its
+reasoning before the calls it made, as gpt-oss's template keeps it. `instructions`, function
+`tools`, `tool_choice`, `text.format` (as `response_format`), `reasoning.effort`,
+`max_output_tokens`, the sampling controls, and `stream` work as for chat completions; `include`
+and `truncation` are ignored. Other tools, such as web search, are refused.
+
+A reply's output is a `reasoning` item of its reasoning's text, a `message` of its text, and a
+`function_call` per call. A reply cut off by `max_output_tokens` or the context is `incomplete`.
+`usage` counts no reasoning tokens apart. Streams send the Responses API's events: each output
+item added, its text's deltas, and it done, then `response.completed` or
+`response.incomplete` with the whole response; calls come once the reply is done.
 
 ## Embeddings
 

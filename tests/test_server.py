@@ -590,6 +590,84 @@ def replies_with(engine, monkeypatch):
     return reply_with
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_response(client, expected, stream):
+    # a reply as a response of the Responses API: its text a message, cut off by
+    # max_output_tokens as incomplete; streamed, each event numbered, the text in deltas
+    asked = {"model": "tiny", "input": "hello", "max_output_tokens": 8, "temperature": 0}
+    if stream:
+        events = list(client.responses.create(**asked, stream=True))
+        kinds = [e.type for e in events]
+        assert kinds[:4] == [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+        ]
+        assert kinds[-4:] == ["response.output_text.done", "response.content_part.done",
+                              "response.output_item.done", "response.incomplete"]  # fmt: skip
+        assert [e.sequence_number for e in events] == list(range(len(events)))
+        response = events[-1].response
+        deltas = "".join(e.delta for e in events if e.type == "response.output_text.delta")
+        assert deltas == response.output_text
+    else:
+        response = client.responses.create(**asked)
+    assert response.output_text == expected("hello", 8) and response.id.startswith("resp_")
+    assert response.status == "incomplete"
+    assert response.incomplete_details.reason == "max_output_tokens"
+    assert (response.usage.input_tokens, response.usage.output_tokens) == (5, 8)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_response_reasons_and_calls(client, replies_with, monkeypatch, stream):
+    # Qwen3's reasoning, text and a call, as a reasoning item, a message and a function_call;
+    # streamed, each item added and done in turn
+    monkeypatch.setattr(ChatTemplate, "form", property(lambda self: "think"))
+    replies_with("<think>Rain, I fear.</think>Checking.\n<tool_call>\n"
+                 '{"name": "weather", "arguments": {"city": "Paris"}}\n</tool_call>')  # fmt: skip
+    asked = {"model": "tiny", "input": "Weather in Paris?",
+             "tools": [{"type": "function", **WEATHER["function"]}]}  # fmt: skip
+    if stream:
+        events = list(client.responses.create(**asked, stream=True))
+        deltas = [e.delta for e in events if e.type == "response.reasoning_text.delta"]
+        assert "".join(deltas) == "Rain, I fear."
+        added = [e.output_index for e in events if e.type == "response.output_item.added"]
+        done = [e.output_index for e in events if e.type == "response.output_item.done"]
+        assert added == done == [0, 1, 2] and events[-1].type == "response.completed"
+        response = events[-1].response
+    else:
+        response = client.responses.create(**asked)
+    reasoning, message, call = response.output
+    assert reasoning.content[0].text == "Rain, I fear." and message.content[0].text == "Checking."
+    assert call.name == "weather" and json.loads(call.arguments) == {"city": "Paris"}
+    assert call.call_id.startswith("call_") and response.status == "completed"
+
+
+def test_response_text_format(client):
+    # a text format of a schema, held to as a response_format's
+    formatted = {"format": {"type": "json_schema", "name": "pick", "schema": PICK, "strict": True}}
+    whole = 0
+    for seed in range(6):
+        response = client.responses.create(
+            model="tiny", input="hello", max_output_tokens=40, temperature=1, text=formatted,
+            extra_body={"seed": seed},
+        )  # fmt: skip
+        if response.status == "completed":
+            assert json.loads(response.output_text)["b"] in ("x", "yz")
+            whole += 1
+    assert whole
+
+
+@pytest.mark.parametrize("kwargs, error", [
+    ({"previous_response_id": "resp_1"}, "previous_response_id is not supported"),
+    ({"tools": [{"type": "web_search"}]}, "tools must be a list of function tools"),
+    ({"input": [{"type": "item_reference", "id": "x"}]}, "items of type 'item_reference'"),
+])  # fmt: skip
+def test_bad_response(client, kwargs, error):
+    with pytest.raises(openai.BadRequestError, match=error):
+        client.responses.create(**({"model": "tiny", "input": "hi"} | kwargs))
+
+
 # as Llama 3, Qwen3, Gemma 4 and Qwen3.5 call tools; the text before a call is the content
 CALLS = [
     (' {"name": "weather", "parameters": {"city": "Paris"}}', None),
@@ -1158,6 +1236,31 @@ def test_calls_tools(served, model_path):
     (call,) = response.choices[0].message.tool_calls
     assert call.function.name == "weather"
     assert json.loads(call.function.arguments) == {"city": "Paris"}
+
+
+@pytest.mark.gpu
+@pytest.mark.model
+def test_responds_in_a_loop(served, model_path):
+    # an agent's loop through the Responses API, stateless: the model calls a tool, the client
+    # sends back the conversation whole, the call's output too, and the model answers. Whether it
+    # answers with the output is the model's: Qwen3 8B says it snows, Llama 3.1 8B writes out its
+    # tool's definition, of the same prompt as a chat completion's.
+    metadata = GGUF.open(model_path).metadata
+    template = ChatTemplate(metadata, Tokenizer(metadata))
+    question = [{"role": "user", "content": "What is the weather in Paris right now?"}]
+    if template.render(question, tools=[WEATHER]) == template.render(question):
+        pytest.skip("the model's chat template shows no tools")
+    tools: list = [{"type": "function", **WEATHER["function"]}]
+    items: list = list(question)
+    first = served.responses.create(model="real", input=items, tools=tools, temperature=0)
+    calls = [item for item in first.output if item.type == "function_call"]
+    assert calls and calls[0].name == "weather"
+    items += [item.model_dump(exclude_none=True) for item in first.output]
+    items += [{"type": "function_call_output", "call_id": call.call_id,
+               "output": "In Paris it is snowing heavily, at -5 C."} for call in calls]  # fmt: skip
+    second = served.responses.create(model="real", input=items, tools=tools, temperature=0)
+    assert second.status == "completed" and second.output_text
+    assert second.usage.input_tokens > first.usage.input_tokens + first.usage.output_tokens
 
 
 @pytest.mark.gpu

@@ -31,10 +31,11 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import jinja2
 
+from leatengine import responses
 from leatengine.chat import (
     EFFORTS,
     ChatTemplate,
@@ -218,6 +219,8 @@ class _Completion:
     # completions that wait before it, and never into the last slot free
     background: bool = False
     text: bool = False  # of /v1/completions: its reply text alone, as the model writes it
+    # of /v1/responses: what its response says of the request, as responses.echoed() has it
+    response: dict[str, Any] | None = None
     # of how many of the likeliest tokens it gives the log-probabilities with each token's, if it
     # gives any; and those the worker gave so far, as OpenAI's chat completions show each token's
     logprobs: int | None = None
@@ -720,7 +723,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self.path = urllib.parse.urlsplit(self.path).path
         routes = {"/v1/chat/completions": self._complete, "/v1/completions": self._complete_text,
-                  "/v1/models/load": self._load, "/v1/embeddings": self._embeddings}  # fmt: skip
+                  "/v1/responses": self._respond, "/v1/models/load": self._load,
+                  "/v1/embeddings": self._embeddings}  # fmt: skip
         with self._counted(self.path in routes):
             if (route := routes.get(self.path)) is None:
                 return self._error(404, f"there is no POST {self.path}")
@@ -875,6 +879,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _complete_text(self, body: Any) -> None:
         self._generate(body, _text_completion)
 
+    def _respond(self, body: Any) -> None:
+        self._generate(body, _response)
+
     def _generate(
         self, body: Any, asked: Callable[[Any, Server, _Loaded | None], _Completion]
     ) -> None:
@@ -899,6 +906,8 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if completion.text:
                 (self._stream_text if completion.stream else self._reply_text)(completion)
+            elif completion.response is not None:
+                (self._stream_response if completion.stream else self._reply_response)(completion)
             elif completion.stream:
                 self._stream(completion)
             else:
@@ -960,6 +969,96 @@ class _Handler(BaseHTTPRequestHandler):
             usage = {"choices": [], "usage": _usage(c)} | timings
             self._event(self._head(c, "text_completion") | usage)
         self._event("[DONE]")
+
+    def _reply_response(self, c: _Completion) -> None:
+        try:
+            text = c.opened + "".join(c.pieces(self._hung_up))
+            reply = split_reply(text, c.form, c.thinking, done=True)
+        except RuntimeError as e:
+            return self._error(500, str(e))
+        content, calls = _calls(reply, c.tools, c.finish.reason)
+        self._json(200, _response_body(c, responses.output(reply, content, _tool_calls(calls))))
+
+    def _stream_response(self, c: _Completion) -> None:
+        # as OpenAI's Responses API streams: the response begun, each output item added, its
+        # text's deltas, and it done, in turn; the reasoning, then the text, then the calls, once
+        # the reply is done and they are known; then the response done, with its output whole
+        self._events()
+        numbers = itertools.count()
+
+        def event(kind: str, **fields: Any) -> None:
+            self._event({"type": kind, "sequence_number": next(numbers), **fields}, kind)
+
+        begun = _response_body(c, [], done=False)
+        event("response.created", response=begun)
+        event("response.in_progress", response=begun)
+        items: list[dict[str, Any]] = []  # those done
+        thinking, saying = "", ""  # the ids of the reasoning and the message open, if any
+        text, reasoned, sent, reply = c.opened, 0, 0, Reply()
+
+        def opened(item: dict[str, Any]) -> str:
+            event("response.output_item.added", output_index=len(items), item=item)
+            return cast(str, item["id"])
+
+        def done(item: dict[str, Any]) -> None:
+            event("response.output_item.done", output_index=len(items), item=item)
+            items.append(item)
+
+        def open_message() -> str:
+            if thinking:  # the reasoning, as far as it went, ends where the text begins
+                where = {"item_id": thinking, "output_index": len(items), "content_index": 0}
+                event("response.reasoning_text.done", **where, text=reply.reasoning)
+                done(responses.reasoning_item(thinking, reply.reasoning))
+            message = opened(responses.message_item(responses.item_id("msg"), None, "in_progress"))
+            where = {"item_id": message, "output_index": len(items), "content_index": 0}
+            event("response.content_part.added", **where, part=responses.output_text(""))
+            return message
+
+        try:
+            for piece in itertools.chain(c.pieces(self._hung_up), [None]):
+                text += piece or ""
+                reply = split_reply(text, c.form, c.thinking, done=piece is None)
+                if len(reply.reasoning) > reasoned and not saying:
+                    if not thinking:
+                        thinking = opened(responses.reasoning_item(responses.item_id("rs"), ""))
+                    where = {"item_id": thinking, "output_index": len(items), "content_index": 0}
+                    event(
+                        "response.reasoning_text.delta", **where, delta=reply.reasoning[reasoned:]
+                    )
+                    reasoned = len(reply.reasoning)
+                content = reply.content
+                if (end := tool_call_start(content) if c.tools else len(content)) > sent:
+                    saying = saying or open_message()
+                    where = {"item_id": saying, "output_index": len(items), "content_index": 0}
+                    event(
+                        "response.output_text.delta", **where, delta=content[sent:end], logprobs=[]
+                    )
+                    sent = end
+        except RuntimeError as e:
+            return event("error", code="server_error", message=str(e), param=None)
+        content, calls = _calls(reply, c.tools, c.finish.reason)
+        if not saying and (content or not calls):
+            saying = open_message()
+        elif thinking and not saying:
+            where = {"item_id": thinking, "output_index": len(items), "content_index": 0}
+            event("response.reasoning_text.done", **where, text=reply.reasoning)
+            done(responses.reasoning_item(thinking, reply.reasoning))
+        if saying:
+            where = {"item_id": saying, "output_index": len(items), "content_index": 0}
+            if len(content) > sent:
+                event("response.output_text.delta", **where, delta=content[sent:], logprobs=[])
+            event("response.output_text.done", **where, text=content, logprobs=[])
+            event("response.content_part.done", **where, part=responses.output_text(content))
+            done(responses.message_item(saying, content))
+        for call in _tool_calls(calls):
+            item = responses.function_item(call)
+            opened(responses.function_item(call, "") | {"status": "in_progress"})
+            where = {"item_id": item["id"], "output_index": len(items)}
+            event("response.function_call_arguments.delta", **where, delta=item["arguments"])
+            event("response.function_call_arguments.done", **where, arguments=item["arguments"])
+            done(item)
+        body = _response_body(c, items)
+        event(f"response.{body['status']}", response=body)
 
     def _events(self) -> None:
         # the head of a stream of Server-Sent Events
@@ -1057,9 +1156,11 @@ class _Handler(BaseHTTPRequestHandler):
         choice = {"index": 0, "delta": delta, "logprobs": logprobs, "finish_reason": reason}
         self._event(self._head(c, "chat.completion.chunk") | {"choices": [choice]} | (extra or {}))
 
-    def _event(self, data: dict[str, Any] | str) -> None:
+    def _event(self, data: dict[str, Any] | str, name: str | None = None) -> None:
+        # an event's data, and its name, if it has one, as the Responses API's events have
         text = data if isinstance(data, str) else json.dumps(data)
-        self.wfile.write(f"data: {text}\n\n".encode())
+        head = f"event: {name}\n" if name else ""
+        self.wfile.write(f"{head}data: {text}\n\n".encode())
 
     def _json(
         self, status: int, body: dict[str, Any], headers: dict[str, str] | None = None
@@ -1220,6 +1321,39 @@ def _text_completion(body: Any, server: Server, loaded: _Loaded | None) -> _Comp
         id=f"cmpl-{uuid.uuid4().hex}",
         logprobs=body.get("logprobs"),
     )
+
+
+def _response(body: Any, server: Server, loaded: _Loaded | None) -> _Completion:
+    # what a request body of /v1/responses asks for of the `loaded` model: the chat completion it
+    # amounts to, answered as a response
+    completion = _completion(responses.as_chat(body), server, loaded)
+    completion.id, completion.response = f"resp_{uuid.uuid4().hex}", responses.echoed(body)
+    return completion
+
+
+def _response_body(c: _Completion, output: list[dict[str, Any]], done: bool = True) -> dict:
+    # a response as OpenAI's Responses API gives it: once done, completed, or incomplete where
+    # max_output_tokens or the context cut it off, with its usage, and llama.cpp's timings
+    assert c.response is not None
+    status = "in_progress" if not done else "incomplete" if c.finish.reason == "length" else (
+        "completed")  # fmt: skip
+    body = {
+        "id": c.id, "object": "response", "created_at": c.created, "model": c.model,
+        "status": status, "error": None,
+        "incomplete_details": {"reason": "max_output_tokens"} if status == "incomplete" else None,
+        "output": output, "temperature": c.sampling.temperature, "top_p": c.sampling.top_p,
+    } | c.response  # fmt: skip
+    if done:  # a reply's reasoning tokens, which this server does not count apart, as none
+        usage = _usage(c)
+        body["usage"] = {
+            "input_tokens": usage["prompt_tokens"],
+            "input_tokens_details": {"cached_tokens": c.finish.cached},
+            "output_tokens": usage["completion_tokens"],
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": usage["total_tokens"],
+        }
+        body["timings"] = _timings(c)
+    return body
 
 
 def _text_scores(scores: list[dict[str, Any]], at: int) -> dict[str, Any]:
