@@ -65,7 +65,7 @@ def checks(root: Path = Path("/"), run: bool = True) -> list[Check]:
     if gpu is not None:
         render = f"dev/dri/renderD{gpu.render}"
         found.append(_device_file(f"/{render}", root / render))
-        found += _memory(root, gpu, ram)
+        found += [*_memory(root, gpu, ram), _free(root)]
     found.append(clang := _clang())
     if clang.status == "ok":
         found.append(_compile(gpu.arch if gpu is not None else TARGET))
@@ -246,6 +246,15 @@ def _memory(root: Path, gpu: GPU, ram: int | None) -> list[Check]:
         fix = "set the firmware's carve-out small, 0.5 GB, and " + fix
     said += " at most, too little for the largest models"
     return [Check("gpu memory", "warn", said, fix), *limit]
+
+
+def _free(root: Path) -> Check:
+    # what a model has of the GPU's memory now, of which LeatEngine sizes a model's context
+    if (memory := machine.memory("AMD", root)) is None:
+        fix = "a model then takes a short context, unless --max-context gives one"
+        return Check("free memory", "warn", "amdgpu does not say how much is in use", fix)
+    said = f"{_gib(memory.free)} of {memory.pool}, for a model's weights and KV cache: it takes "
+    return Check("free memory", "info", said + "its own context as far as its cache fits")
 
 
 def _clang() -> Check:

@@ -42,9 +42,10 @@ source; confirming it on the machine is part of qualification. A load that does 
 with the size and tensors that failed.
 
 `leatengine doctor` reports the kernel, access to `/dev/kfd` and the render node, the GPU and its
-firmware, the carve-out, GTT and TTM's limit, and clang; it compiles a kernel for the GPU, runs
-one there, and says in which pool a 1 GiB buffer lands. Its report holds most of what the
-qualification records, and what to change where something will not do.
+firmware, the carve-out, GTT and TTM's limit, the memory free for a model's weights and KV cache, of
+which a model takes its context, and clang; it compiles a kernel for the GPU, runs one there, and
+says in which pool a 1 GiB buffer lands. Its report holds most of what the qualification records,
+and what to change where something will not do.
 
 ```bash
 uv sync --locked --python 3.14

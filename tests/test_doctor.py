@@ -37,6 +37,8 @@ def strix(tmp_path, monkeypatch):
         "dev/dri/renderD128": "",
         "sys/class/drm/renderD128/device/mem_info_vram_total": GIB // 2,
         "sys/class/drm/renderD128/device/mem_info_gtt_total": 100 * GIB,
+        "sys/class/drm/renderD128/device/mem_info_vram_used": GIB // 4,
+        "sys/class/drm/renderD128/device/mem_info_gtt_used": 4 * GIB,
         "sys/module/ttm/parameters/pages_limit": 26214400,
     })  # fmt: skip
     return tmp_path
@@ -52,6 +54,10 @@ def test_ready(strix):
     assert found["gpu"].found == "gfx1151, 40 CUs, firmware MEC 37, SDMA 14"
     assert found["gpu memory"].found == (
         "carve-out 0.5 GiB, GTT 100.0 GiB: buffers come from GTT, 100.0 GiB at most"
+    )
+    assert found["free memory"].found == (
+        "96.0 GiB of GTT, for a model's weights and KV cache: it takes its own context as far as "
+        "its cache fits"
     )
     assert found["machine"].found == (
         "Framework Desktop (AMD Ryzen AI Max 300 Series), BIOS 03.03 of 06/12/2026"
