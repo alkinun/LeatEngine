@@ -128,6 +128,13 @@ def test_optional_and_more_properties():
     )
 
 
+def test_enum_of_its_type():
+    # an enum or const beside its type, as Pydantic writes a Literal's, of values of that type
+    matcher = Matcher(Grammar({"type": "string", "enum": ["a", "b"]}))
+    assert takes(matcher, '"a"') and not takes(matcher, '"c"')
+    assert takes(Matcher(Grammar({"type": ["integer", "null"], "const": None})), "null")
+
+
 def test_values_at_the_root():
     # a schema of any value at its root, of a list of types, an array's least items, and a
     # recursive one
@@ -164,6 +171,15 @@ for _ in range(64):
     ({"type": "object", "properties": []}, "a schema's properties are an object of schemas"),
     (DEEP, "the schema nests deeper than 64 levels"),
     ({"type": []}, "a schema's list of types names one at least"),
+    ({"$ref": "#/$defs/a", "maxItems": 1, "$defs": {"a": {"type": "array"}}},
+     "a schema of $ref takes no maxItems beside it"),
+    ({"type": "integer", "enum": [1, "x"]}, 'the schema\'s value "x" is not of its type'),
+    ({"enum": [1], "const": 1}, "a schema gives const or enum, not both"),
+    ({"enum": [1], "items": {}}, "a schema of enum takes no items beside it"),
+    ({"type": "object", "properties": {"a": {"$ref": "#"}}, "required": ["a"]},
+     "the schema has a value that never ends"),
+    ({"type": "array", "items": {"$ref": "#"}, "minItems": 1},
+     "the schema has a value that never ends"),
     ({"$defs": [], "$ref": "#/$defs/a"}, "a schema's $defs is an object of schemas"),
     ({"$defs": {"a": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/b"}]},
                 "b": {"$ref": "#/$defs/a"}}, "$ref": "#/$defs/a"},

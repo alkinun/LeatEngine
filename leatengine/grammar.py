@@ -56,8 +56,8 @@ _ENDS = {_ZERO, _INT, _FRACTION, _EXPONENT}
 class Node:
     """What a JSON value may be: of `kind` object (`properties`, each (key, node, required), and
     `extra`, the node of others, if any), array (`items`, and its `least` and `most`), string,
-    number (`integer` or not), literals (`choices`, the JSON of each), any (any value), or anyOf
-    (`options`). Nodes are a Grammar's by index."""
+    number (`integer` or not), literals (`choices`, the JSON of each), or anyOf (`options`). Nodes
+    are a Grammar's by index."""
 
     kind: str
     properties: tuple[tuple[str, int, bool], ...] = ()
@@ -86,6 +86,22 @@ class Grammar:
         done: set[int] = set()
         for at in range(len(self.nodes)):
             self._grounded(at, set(), done)
+        if len(self._ending()) < len(self.nodes):
+            raise ValueError("the schema has a value that never ends, as one that requires itself")
+
+    def _ending(self) -> set[int]:
+        # the nodes of which a value can end: of an object, all its required properties'; of an
+        # array, its items' unless it may be empty; of an anyOf, one option's
+        ending: set[int] = set()
+        while True:
+            more = {at for at, n in enumerate(self.nodes) if at not in ending and (
+                n.kind in ("string", "number", "literals")
+                or n.kind == "anyOf" and any(o in ending for o in n.options)
+                or n.kind == "object" and all(c in ending for _, c, need in n.properties if need)
+                or n.kind == "array" and (n.least == 0 or n.items in ending))}  # fmt: skip
+            if not more:
+                return ending
+            ending |= more
 
     def _grounded(self, at: int, path: set[int], done: set[int]) -> None:
         # refuses an anyOf that is an option of its own, as {"$ref": "#"} is: its values would
@@ -106,7 +122,7 @@ class Grammar:
 
     def _any(self) -> int:
         # any value: an object or array of any values, or a string, number, boolean or null
-        at = self._add(Node("any"))
+        at = self._add(Node("anyOf"))
         options = (
             self._add(Node("object", extra=at)), self._add(Node("array", items=at)),
             self._add(Node("string")), self._add(Node("number")),
@@ -132,11 +148,20 @@ class Grammar:
         if "$ref" in schema:
             if not isinstance(schema["$ref"], str):
                 raise ValueError("a schema's $ref is a string")
+            if beside := sorted(set(schema) - _NOTES - {"$ref"}):
+                raise ValueError(f"a schema of $ref takes no {beside[0]} beside it")
             return self._ref(schema["$ref"])
         if "const" in schema or "enum" in schema:
+            if "const" in schema and "enum" in schema:
+                raise ValueError("a schema gives const or enum, not both")
+            if beside := sorted(set(schema) - _NOTES - {"const", "enum", "type"}):
+                raise ValueError(f"a schema of {'const' if 'const' in schema else 'enum'} takes "
+                                 f"no {beside[0]} beside it")  # fmt: skip
             values = [schema["const"]] if "const" in schema else schema["enum"]
             if not isinstance(values, list) or not values:
                 raise ValueError("a schema's enum lists its values")
+            if "type" in schema and (odd := [v for v in values if not _of(v, schema["type"])]):
+                raise ValueError(f"the schema's value {json.dumps(odd[0])} is not of its type")
             choices = tuple(json.dumps(v, ensure_ascii=False).encode() for v in values)
             return self._add(Node("literals", choices=tuple(dict.fromkeys(choices))))
         alternatives = schema.get("anyOf", schema.get("oneOf"))
@@ -224,6 +249,17 @@ class Grammar:
         self._refs[ref] = at = self._add(Node("anyOf"))
         self.nodes[at] = Node("anyOf", options=(self._compile(schema),))
         return at
+
+
+def _of(value: Any, kinds: Any) -> bool:
+    # whether a value is of a schema's type, or of one of its list of types
+    if isinstance(kinds, list):
+        return any(_of(value, kind) for kind in kinds)
+    number = isinstance(value, int | float) and not isinstance(value, bool)
+    return {"string": isinstance(value, str), "boolean": isinstance(value, bool),
+            "null": value is None, "object": isinstance(value, dict),
+            "array": isinstance(value, list), "number": number,
+            "integer": number and float(value).is_integer()}.get(kinds, False)  # fmt: skip
 
 
 def _whole(v: Any) -> bool:
@@ -488,7 +524,7 @@ class Tokens:
     which a reply's reasoning takes, and its markers, but its JSON never; and those that end it."""
 
     def __init__(self, spelled: list[bytes], markup: Iterable[int], ends: Iterable[int]):
-        self.ends, self.count = frozenset(ends), len(spelled)
+        self.ends = frozenset(ends)
         self._markup = [(spelled[i], i) for i in sorted(set(markup) - self.ends) if spelled[i]]
         held = {i for _, i in self._markup} | self.ends
         tokens = sorted((b, i) for i, b in enumerate(spelled) if b and i not in held)
