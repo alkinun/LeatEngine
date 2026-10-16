@@ -159,7 +159,8 @@ def test_run(tiny_model, monkeypatch, capsys):
     monkeypatch.setattr("builtins.input", fake_input)
     monkeypatch.setattr("leatengine.chat.ChatTemplate.render", rendered)
     sampling = ["--temperature", "0.5", "--top-k", "5", "--top-p", "0.9", "--min-p", "0.05",
-                "--presence-penalty", "0.5"]  # fmt: skip
+                "--presence-penalty", "0.5", "--frequency-penalty", "0.2",
+                "--repetition-penalty", "1.1"]  # fmt: skip
     main(["run", str(tiny_model[0]), "--max-context", "64", *sampling])
     out = capsys.readouterr().out
     assert "tiny on CPU: a context of 64 tokens, as given\ncompiling... ready." in out
@@ -168,7 +169,14 @@ def test_run(tiny_model, monkeypatch, capsys):
 
 
 @pytest.mark.parametrize(
-    "bad", [["--min-p", "1.5"], ["--temperature", "-1"], ["--top-k", "-1"], ["--top-p", "x"]]
+    "bad",
+    [
+        ["--min-p", "1.5"],
+        ["--temperature", "-1"],
+        ["--top-k", "-1"],
+        ["--top-p", "x"],
+        ["--repetition-penalty", "0"],
+    ],
 )
 def test_run_sampling_bounds(tiny_model, capsys, bad):
     # sampling past the bounds a request's have is refused before the model loads

@@ -78,12 +78,13 @@ def test_mtp_after_a_kept_state(tiny):
 @pytest.mark.usefixtures("reference_ops")
 @pytest.mark.parametrize("arch", ARCHS)
 @pytest.mark.parametrize("sampling", [
-    GREEDY, Sampling(temperature=0.9, top_k=50), Sampling(temperature=0.9, presence_penalty=1.5),
+    GREEDY, Sampling(temperature=0.9, top_k=50),
+    Sampling(temperature=0.9, presence_penalty=1.5, frequency_penalty=0.5, repetition_penalty=1.3),
 ], ids=["greedy", "sampled", "penalized"])  # fmt: skip
 @pytest.mark.parametrize("guessed", ["none", "all", "some"])
 def test_speculative_generates_as_plain(tiny, tiny_assistant, arch, sampling, guessed):
-    # whatever the drafter guesses, the tokens are those plain decoding generates, of a
-    # presence_penalty too, which each draft's own tokens before it change; a drafter that guesses
+    # whatever the drafter guesses, the tokens are those plain decoding generates, of penalties
+    # too, which each draft's own tokens before it change; a drafter that guesses
     # them all has each step keep all its drafts
     path, draft = models(tiny, tiny_assistant, arch)
     plain = list(Engine(path, max_context=CONTEXT).generate(PROMPT, 20, sampling, seed=3))

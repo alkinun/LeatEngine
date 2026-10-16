@@ -49,9 +49,16 @@ placeholder when authentication is disabled). The client library is not a runtim
 
 Supported controls include `messages`, `stream`, `stream_options.include_usage`, `max_tokens`
 or `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`,
-`seed`, `stop`, `tools`, `tool_choice` (`auto` or `none`), `response_format`, `logprobs`, and
-`top_logprobs`. Templates determine which message roles and tool formats a model understands.
+`frequency_penalty`, `repetition_penalty`, `seed`, `stop`, `tools`, `tool_choice` (`auto` or
+`none`), `response_format`, `logprobs`, and `top_logprobs`. Templates determine which message
+roles and tool formats a model understands.
 
+- Penalties lower text tokens alone, never a format's markup, such as `<tool_call>`, which a
+  reply must repeat. `repetition_penalty`, as vLLM's and Hugging Face's, divides a positive logit
+  and multiplies a negative one, of each token of the prompt or of the reply so far; then
+  `presence_penalty` comes off each token of the reply so far, and `frequency_penalty` as many
+  times as it occurs, as OpenAI's. llama.cpp's server counts all three over the last 64 tokens
+  of prompt and reply instead.
 - Streaming uses Server-Sent Events: JSON `data:` records followed by `data: [DONE]` on success.
   Disconnecting cancels the completion and releases its slot.
 - Reasoning is returned as `reasoning_content`. `reasoning_effort` and
@@ -88,9 +95,8 @@ or `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `presence_
 - Replies include usage and a `timings` extension. Cached token counts appear in
   `usage.prompt_tokens_details.cached_tokens`; streamed usage requires `include_usage`.
 
-This is not a complete OpenAI implementation: multiple choices, logit biases, and frequency or
-repetition penalties are unsupported. Responses, audio, file-storage,
-and tool-execution endpoints are not implemented.
+This is not a complete OpenAI implementation: multiple choices and logit biases are
+unsupported. Responses, audio, file-storage, and tool-execution endpoints are not implemented.
 A prompt must fit the configured context; clients manage conversation history.
 
 ## Text completions

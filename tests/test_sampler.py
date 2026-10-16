@@ -9,14 +9,20 @@ LOGITS = [2.0, 1.0, 0.0, -1.0, 0.5]
 
 def draws(
     logits: list[list[float]], sampling: Sampling | list[Sampling], seed: int | list[int],
-    position: int | list[int], seen: list[list[bool]] | None = None,
+    position: int | list[int], seen: list[list[int]] | None = None,
+    prompted: list[list[int]] | None = None,
 ) -> list[int]:  # fmt: skip
-    # one value for every row, or one per row
+    # one value for every row, or one per row; seen, the times each token was generated, and
+    # prompted, the tokens of each prompt
     options = Tensor([s.values() for s in (sampling if isinstance(sampling, list) else [sampling])])
     seeds = Tensor(seed if isinstance(seed, list) else [seed], dtype=dtypes.uint32)
     positions = Tensor(position, dtype=dtypes.int32) if isinstance(position, list) else position
-    marked = None if seen is None else Tensor(seen, dtype=dtypes.bool)
-    return sample(Tensor(logits), options, seeds, positions, marked).numpy().ravel().tolist()
+    counted = None if seen is None else Tensor(seen, dtype=dtypes.int32)
+    words = None
+    if prompted is not None:
+        words = Tensor([[sum(1 << t for t in row)] for row in prompted], dtype=dtypes.uint32)
+    out = sample(Tensor(logits), options, seeds, positions, counted, prompted=words)
+    return out.numpy().ravel().tolist()
 
 
 def frequencies(sampling: Sampling, n: int = 20000, rows: int = 1000) -> np.ndarray:
@@ -68,10 +74,32 @@ def test_top_p_zero_keeps_the_likeliest():
 
 
 def test_presence_penalty():
-    # off the logits of tokens seen, greedy too
-    seen = [[True, False, False, False, False]]
-    assert draws([LOGITS], Sampling(presence_penalty=1.5), 0, 0, seen) == [1]
-    assert draws([LOGITS], Sampling(presence_penalty=0.5), 0, 0, seen) == [0]
+    # off the logits of tokens seen, greedy too, however many times
+    for seen in ([[1, 0, 0, 0, 0]], [[3, 0, 0, 0, 0]]):
+        assert draws([LOGITS], Sampling(presence_penalty=1.5), 0, 0, seen) == [1]
+        assert draws([LOGITS], Sampling(presence_penalty=0.5), 0, 0, seen) == [0]
+
+
+def test_frequency_penalty():
+    # off the logits of tokens seen, as many times as they were
+    assert draws([LOGITS], Sampling(frequency_penalty=0.6), 0, 0, [[1, 0, 0, 0, 0]]) == [0]
+    assert draws([LOGITS], Sampling(frequency_penalty=0.6), 0, 0, [[2, 0, 0, 0, 0]]) == [1]
+    assert draws([LOGITS], Sampling(frequency_penalty=-2), 0, 0, [[0, 1, 0, 0, 0]]) == [1]
+
+
+def test_repetition_penalty():
+    # a repeated token's positive logit divided, a negative one multiplied, of tokens generated
+    # or of the prompt; first, then the other penalties
+    penalized = Sampling(repetition_penalty=2.5)
+    assert draws([LOGITS], penalized, 0, 0, [[1, 0, 0, 0, 0]]) == [1]  # 2 / 2.5 < 1
+    assert draws([LOGITS], penalized, 0, 0, prompted=[[0]]) == [1]
+    assert draws([LOGITS], Sampling(repetition_penalty=1.5), 0, 0, prompted=[[0]]) == [0]
+    negative = [[-1.0, -1.2, -5.0, -5.0, -5.0]]
+    assert draws(negative, penalized, 0, 0, prompted=[[0]]) == [1]  # -1 * 2.5 < -1.2
+    both = Sampling(presence_penalty=0.3, repetition_penalty=1.6)  # 2 / 1.6 - 0.3 < 1
+    assert draws([LOGITS], both, 0, 0, [[1, 0, 0, 0, 0]]) == [1]
+    # and unpenalized, the logits as they are
+    assert draws([[1.0, 1.0 + 2**-20]], Sampling(), 0, 0, [[0, 3]], [[1]]) == [1]
 
 
 def test_seeded():

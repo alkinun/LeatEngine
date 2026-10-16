@@ -102,6 +102,8 @@ _FIELDS: dict[str, tuple[Callable[[Any], bool], str]] = {
     "top_p": _option("top_p"),
     "min_p": _option("min_p"),
     "presence_penalty": _option("presence_penalty"),
+    "frequency_penalty": _option("frequency_penalty"),
+    "repetition_penalty": _option("repetition_penalty"),
     "max_tokens": (lambda v: _integer(v) and v > 0, "a positive integer"),
     "max_completion_tokens": (lambda v: _integer(v) and v > 0, "a positive integer"),
     "seed": (_integer, "an integer"),
@@ -139,8 +141,7 @@ _FIELDS: dict[str, tuple[Callable[[Any], bool], str]] = {
 
 # what leatengine does not implement, each with the value that asks for nothing more
 _UNSUPPORTED = {
-    "n": 1, "frequency_penalty": 0, "repetition_penalty": 1, "logit_bias": {}, "echo": False,
-    "best_of": 1,
+    "n": 1, "logit_bias": {}, "echo": False, "best_of": 1,
 }  # fmt: skip
 _TEXT_TOKENS = 16  # the tokens a text completion makes unless it asks for more, as OpenAI's
 _GRAMMARS = 64  # compiled response formats a loaded model keeps, with their masks

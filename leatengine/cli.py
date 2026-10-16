@@ -45,6 +45,12 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--top-p", type=_option("top_p"), default=1.0)
     run.add_argument("--min-p", type=_option("min_p"), default=0.0)
     run.add_argument("--presence-penalty", type=_option("presence_penalty"), default=0.0)
+    run.add_argument("--frequency-penalty", type=_option("frequency_penalty"), default=0.0)
+    run.add_argument(
+        "--repetition-penalty", type=_option("repetition_penalty"), default=1.0,
+        help="divides a repeated token's positive logit and multiplies a negative one, of the "
+        "prompt's tokens too; 1 changes nothing",
+    )  # fmt: skip
     run.add_argument("--system", help="system prompt")
     run.add_argument(
         "--mmproj", type=Path,
@@ -256,7 +262,10 @@ def _run(args: argparse.Namespace) -> None:
     engine = Engine(args.model, max_context=args.max_context, draft=draft, vision=vision,
                     cache_type=args.cache_type)  # fmt: skip
     chat, tok = ChatTemplate(engine.gguf.metadata, engine.tokenizer), engine.tokenizer
-    sampling = Sampling(args.temperature, args.top_k, args.top_p, args.min_p, args.presence_penalty)
+    sampling = Sampling(
+        args.temperature, args.top_k, args.top_p, args.min_p, args.presence_penalty,
+        args.frequency_penalty, args.repetition_penalty,
+    )  # fmt: skip
     first = [{"role": "system", "content": args.system}] if args.system else []
     messages, pictures, attached = list(first), list[Image](), list[Image]()
     print(f"{engine.gguf.path.stem} on {Device.DEFAULT}: a context of {engine.max_context} "

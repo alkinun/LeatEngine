@@ -400,10 +400,10 @@ def test_completion(server):
     # what a request asks for: OpenAI's fields and vLLM's, top_k of -1 keeping every token as 0
     messages = [{"role": "user", "content": "hi"}]
     body = {"messages": messages, "temperature": 0.5, "top_k": -1, "top_p": 0.9, "min_p": 0.05,
-            "presence_penalty": 1.5, "max_tokens": 9, "max_completion_tokens": 7, "stop": "x",
-            "seed": 3}  # fmt: skip
+            "presence_penalty": 1.5, "frequency_penalty": -0.5, "repetition_penalty": 1.1,
+            "max_tokens": 9, "max_completion_tokens": 7, "stop": "x", "seed": 3}  # fmt: skip
     asked = _asked(body, server)
-    assert asked.sampling == Sampling(0.5, 0, 0.9, 0.05, 1.5)
+    assert asked.sampling == Sampling(0.5, 0, 0.9, 0.05, 1.5, -0.5, 1.1)
     hi = server.loaded.engine.tokenizer.encode("hi")
     assert (asked.prompt, asked.max_tokens, asked.stop, asked.seed) == (hi, 7, ["x"], 3)
     # and by default, OpenAI's temperature of 1, up to the context and without empty stops
@@ -752,7 +752,8 @@ def test_text_is_not_a_tool_call(client, replies_with, stream, text, choice):
     "kwargs, error",
     [
         ({"n": 2}, "n=2 is not supported"),
-        ({"frequency_penalty": 0.5}, "frequency_penalty=0.5 is not supported"),
+        ({"frequency_penalty": 2.5}, "frequency_penalty must be a number from -2 to 2"),
+        ({"extra_body": {"repetition_penalty": 0}}, "repetition_penalty must be a number from 0.1"),
         ({"top_p": 1.5}, "top_p must be a number from 0 to 1"),
         ({"temperature": 3}, "temperature must be a number from 0 to 2"),
         ({"temperature": True}, "temperature must be a number from 0 to 2"),

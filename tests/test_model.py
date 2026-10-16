@@ -784,6 +784,26 @@ def test_presence_penalty(tiny_model):
         i not in special for i in range(len(engine._text.numpy()))]  # fmt: skip
 
 
+@pytest.mark.usefixtures("reference_ops")
+def test_penalties(tiny_model):
+    # greedy tokens under every penalty, each the reference's likeliest once they change its
+    # logits: repetition_penalty of the text tokens of the prompt and those generated, then the
+    # others of those generated, counted; the prompt's whether cached or not
+    path, weights = tiny_model
+    engine = Engine(path, max_context=CONTEXT, prefill_chunk=8)
+    sampling = Sampling(presence_penalty=0.3, frequency_penalty=0.4, repetition_penalty=1.5)
+    out = list(engine.generate(PROMPT, 12, sampling, ignore_eog=True))
+    text = engine._text.numpy()
+    logits = reference_logits(weights, PROMPT + out)[len(PROMPT) - 1 :]
+    for i, token in enumerate(out):
+        row, counts = logits[i].copy(), np.bincount(out[:i], minlength=len(text)) * text
+        repeated = (counts > 0) | np.isin(np.arange(len(text)), PROMPT) & text
+        row = np.where(repeated, np.where(row > 0, row / 1.5, row * 1.5), row)
+        assert token == np.argmax(row - 0.4 * counts - 0.3 * (counts > 0)), i
+    list(engine.generate(PROMPT[:11], 4, ignore_eog=True))  # 11 of its 12 tokens cached
+    assert list(engine.generate(PROMPT, 12, sampling, ignore_eog=True)) == out
+
+
 # ******** constrained replies ********
 
 SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"enum": ["x", "yz"]}},

@@ -25,13 +25,17 @@ EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
 # the options, as a request names them, and what each must be
 OPTIONS: dict[str, tuple[type, float, float]] = {
     "temperature": (float, 0, 2), "top_k": (int, 0, 1 << 20), "top_p": (float, 0, 1),
-    "min_p": (float, 0, 1), "presence_penalty": (float, -2, 2),
+    "min_p": (float, 0, 1), "presence_penalty": (float, -2, 2), "frequency_penalty": (float, -2, 2),
+    "repetition_penalty": (float, 0.1, 4),
 }  # fmt: skip
-# OpenAI's, of what no one recommends otherwise
-OPENAI = {"temperature": 1.0, "top_k": 0, "top_p": 1.0, "min_p": 0.0, "presence_penalty": 0.0}
-# the GGUF keys llama.cpp's converter writes, by the option each is
+# OpenAI's, of what no one recommends otherwise, and vLLM's of repetition_penalty
+OPENAI = {"temperature": 1.0, "top_k": 0, "top_p": 1.0, "min_p": 0.0, "presence_penalty": 0.0,
+          "frequency_penalty": 0.0, "repetition_penalty": 1.0}  # fmt: skip
+# the GGUF keys llama.cpp's converter writes, by the option each is: penalty_repeat of
+# generation_config.json's repetition_penalty, which applies as leatengine's does, to the prompt too
 _KEYS = {"general.sampling.temp": "temperature", "general.sampling.top_k": "top_k",
-         "general.sampling.top_p": "top_p", "general.sampling.min_p": "min_p"}  # fmt: skip
+         "general.sampling.top_p": "top_p", "general.sampling.min_p": "min_p",
+         "general.sampling.penalty_repeat": "repetition_penalty"}  # fmt: skip
 
 Options = dict[str, float]
 # Qwen3.6's cards, "Best Practices", of 27B and 35B A3B alike: thinking for general tasks, and

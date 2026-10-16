@@ -38,6 +38,9 @@ def test_recommended_of_the_file():
     # its float32s as their shortest decimals, as written, the same float32s
     top_p = struct.unpack("<f", struct.pack("<f", 0.95))[0]  # 0.949999988079071, as read
     assert recommended(gemma | {"general.sampling.top_p": top_p})[0]["top_p"] == 0.95
+    # and its repetition_penalty, as LFM2.5's is, 1.05
+    lfm = {"general.architecture": "lfm2moe", "general.sampling.penalty_repeat": 1.0499999523}
+    assert recommended(lfm)[0]["repetition_penalty"] == 1.05
 
 
 def test_checked():
