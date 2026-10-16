@@ -1,4 +1,5 @@
-"""GGUF reader: metadata, tensor index and tensor data.
+"""GGUF reader: metadata, tensor index and tensor data, of one file or of the parts of a split one,
+as llama.cpp's gguf-split writes them.
 
 Spec: https://github.com/ggml-org/ggml/blob/master/docs/gguf.md
 """
@@ -7,6 +8,7 @@ import io
 import math
 import mmap
 import os
+import re
 import struct
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -22,6 +24,8 @@ from leatengine.quant import BLOCK, NATIVE, GGMLType, QTensor
 _SCALAR = dict(enumerate("BbHhIif?")) | {10: "Q", 11: "q", 12: "d"}
 _STRING, _ARRAY = 8, 9
 CHUNK = 1 << 30  # bytes of adjacent tensors `load` reads into one buffer; a larger one has its own
+# a split GGUF's part, as gguf-split names it: its prefix, its number from 1, and their count
+_PART = re.compile(r"(.+)-(\d{5})-of-(\d{5})\.gguf")
 
 
 @dataclass(frozen=True)
@@ -31,6 +35,7 @@ class TensorInfo:
     shape: tuple[int, ...]  # row-major; GGUF itself lists dimensions innermost first
     offset: int  # absolute byte offset in the file
     nbytes: int
+    part: int = 0  # the part of a split GGUF it is in, from 0
 
 
 class _Reader:
@@ -66,23 +71,42 @@ class _Reader:
 
 @dataclass(frozen=True)
 class GGUF:
-    """An opened GGUF file: its metadata and tensor index. Tensor data is read by `load`."""
+    """An opened GGUF: its metadata and tensor index, of a split one its first part's metadata
+    and every part's tensors. Tensor data is read by `load`."""
 
-    path: Path
+    path: Path  # the file, of a split GGUF its first part
     metadata: dict[str, Any]
     tensors: dict[str, TensorInfo]
+    parts: tuple[Path, ...] = ()  # of a split GGUF, every part's file, the first `path`
 
     @staticmethod
     def open(path: str | Path) -> "GGUF":
         path = Path(path)
-        with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            with memoryview(mm) as buf:
-                metadata, tensors = _parse(buf)
-            size = len(mm)
-        for t in tensors.values():
-            if t.offset + t.nbytes > size:
-                raise ValueError(f"{path}: truncated, tensor {t.name!r} ends past the end of file")
-        return GGUF(path, metadata, tensors)
+        metadata, tensors = _opened(path, 0)
+        if (count := metadata.get("split.count", 1)) <= 1:
+            return GGUF(path, metadata, tensors)
+        named = _PART.fullmatch(path.name)
+        if named is None or int(named[3]) != count:
+            raise ValueError(f"{path}: a part of a split GGUF of {count}, not named as one")
+        if (number := metadata.get("split.no", 0)) != 0:
+            raise ValueError(
+                f"{path}: part {number + 1} of a split GGUF of {count}: open the first"
+            )
+        parts = [
+            path.with_name(f"{named[1]}-{i:05d}-of-{count:05d}.gguf") for i in range(1, count + 1)
+        ]
+        for i, part in enumerate(parts[1:], 1):
+            if not part.exists():
+                raise ValueError(
+                    f"{path}: a split GGUF of {count} parts, but {part.name} is not there"
+                )
+            held, more = _opened(part, i)
+            if held.get("split.no") != i:
+                raise ValueError(f"{part}: not part {i + 1} of {path.name}'s split GGUF")
+            tensors |= more
+        if len(tensors) != (expected := metadata.get("split.tensors.count", len(tensors))):
+            raise ValueError(f"{path}: its parts hold {len(tensors)} tensors of {expected}")
+        return GGUF(path, metadata, tensors, tuple(parts))
 
     def load(
         self, device: str | None = None, names: Iterable[str] | None = None
@@ -95,14 +119,28 @@ class GGUF:
         if not tensors:
             return {}
         device = Device.canonicalize(device)
-        runs = _runs(tensors, self.metadata.get("general.alignment", 32))
+        alignment = self.metadata.get("general.alignment", 32)
+        files = self.parts or (self.path,)
+        runs = {i: _runs([t for t in tensors if t.part == i], alignment) for i in range(len(files))}
         # tinygrad's own memory, which a GPU maps to copy from: once, as the buffer lives on
-        largest = max(_end(run[-1]) - run[0].offset for run in runs)
+        largest = max(_end(run[-1]) - run[0].offset for part in runs.values() for run in part)
         host = Tensor.empty(largest, dtype=dtypes.uint8, device="CPU").realize()
         assert isinstance(buffer := host.uop.buffer, Buffer)
         memory = buffer.ensure_allocated().as_memoryview(allow_zero_copy=True)
-        out, loaded = {}, 0
-        with open(self.path, "rb", buffering=0) as f:
+        out: dict[str, QTensor] = {}
+        loaded = 0
+        for path, part in zip(files, runs.values(), strict=True):
+            loaded = self._load(path, part, device, host, memory, out, loaded)
+        return out
+
+    def _load(
+        self, path: Path, runs: list[list[TensorInfo]], device: str, host: Tensor,
+        memory: memoryview, out: dict[str, QTensor], loaded: int,
+    ) -> int:  # fmt: skip
+        # the runs of one file, through the host buffer, into `out`; the bytes loaded then
+        if not runs:
+            return loaded
+        with open(path, "rb", buffering=0) as f:
             for run in runs:
                 start, size = run[0].offset, _end(run[-1]) - run[0].offset
                 _read(f, start, memory[:size])
@@ -111,7 +149,7 @@ class GGUF:
                     Device[device].synchronize()  # before the next run overwrites the host buffer
                 except MemoryError as e:
                     raise MemoryError(
-                        f"{self.path.name}: {device} has no room for {size / 2**30:.2f} GiB more, "
+                        f"{path.name}: {device} has no room for {size / 2**30:.2f} GiB more, "
                         f"of {run[0].name} to {run[-1].name}, with {loaded / 2**30:.2f} GiB "
                         "loaded; see the Strix Halo guide's notes on GPU memory"
                     ) from e
@@ -119,7 +157,31 @@ class GGUF:
                 for t in run:
                     out[t.name] = _view(data[t.offset - start : t.offset - start + t.nbytes], t)
                 loaded += size
-        return out
+        return loaded
+
+
+def model_name(path: Path) -> str:
+    """A model's name, as its file's stem, of a split GGUF's first part without its numbers."""
+    named = _PART.fullmatch(path.name)
+    return named[1] if named else path.stem
+
+
+def later_part(path: Path) -> bool:
+    """Whether a file is a part of a split GGUF after its first, which a model is not of its own."""
+    named = _PART.fullmatch(path.name)
+    return named is not None and int(named[2]) > 1
+
+
+def _opened(path: Path, part: int) -> tuple[dict[str, Any], dict[str, TensorInfo]]:
+    # a file's metadata and tensors, each of `part`, checked to end within it
+    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+        with memoryview(mm) as buf:
+            metadata, tensors = _parse(buf, part)
+        size = len(mm)
+    for t in tensors.values():
+        if t.offset + t.nbytes > size:
+            raise ValueError(f"{path}: truncated, tensor {t.name!r} ends past the end of file")
+    return metadata, tensors
 
 
 def _end(t: TensorInfo) -> int:
@@ -154,7 +216,7 @@ def _view(raw: Tensor, t: TensorInfo) -> QTensor:
     return QTensor(raw.reshape(-1, BLOCK[t.type][1]), t.type, t.shape)
 
 
-def _parse(buf: memoryview) -> tuple[dict[str, Any], dict[str, TensorInfo]]:
+def _parse(buf: memoryview, part: int = 0) -> tuple[dict[str, Any], dict[str, TensorInfo]]:
     r = _Reader(buf)
     if bytes(buf[:4]) != b"GGUF":
         raise ValueError("not a GGUF file")
@@ -189,5 +251,5 @@ def _parse(buf: memoryview) -> tuple[dict[str, Any], dict[str, TensorInfo]]:
             raise ValueError(f"tensor {name!r} has rows of {dims[0]}, not a multiple of {elements}")
         nbytes = math.prod(dims) // elements * block_bytes
         shape = tuple(reversed(dims))
-        tensors[name] = TensorInfo(name, ggml_type, shape, data_start + offset, nbytes)
+        tensors[name] = TensorInfo(name, ggml_type, shape, data_start + offset, nbytes, part)
     return metadata, tensors

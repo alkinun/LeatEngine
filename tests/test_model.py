@@ -37,6 +37,7 @@ from tests.helpers import (
     random_blocks,
     reference_embedding,
     reference_logits,
+    write_tiny_model,
 )
 
 PROMPT = [5, 77, 120, 3, 299, 42, 8, 150, 61, 200, 9, 33]
@@ -413,6 +414,17 @@ def test_generate_matches_reference(tiny, arch):
     assert engine.cached_prefix(longer) == (0 if recurrent else len(PROMPT) + 3)
     again = list(engine.generate(longer, 4))
     assert again == list(Engine(path, max_context=CONTEXT, prefill_chunk=5).generate(longer, 4))
+
+
+def test_split_model(tmp_path):
+    # a model of a GGUF in parts, opened by its first, generates as the whole file does
+    whole, parts = tmp_path / "whole.gguf", tmp_path / "parts" / "m.gguf"
+    parts.parent.mkdir()
+    write_tiny_model(whole)
+    write_tiny_model(parts, split=5)
+    first = sorted(parts.parent.iterdir())[0]
+    expected = list(Engine(whole, max_context=CONTEXT).generate(PROMPT, 6))
+    assert list(Engine(first, max_context=CONTEXT).generate(PROMPT, 6)) == expected
 
 
 @pytest.mark.usefixtures("reference_ops")

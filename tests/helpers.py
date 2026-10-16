@@ -96,10 +96,11 @@ MLP = ("ffn_gate", "ffn_up", "ffn_down")
 MOE = ("ffn_gate_inp", "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps")
 
 
-def write_tiny_model(path: Path, arch: str = "llama") -> dict[str, np.ndarray]:
+def write_tiny_model(path: Path, arch: str = "llama", split: int = 0) -> dict[str, np.ndarray]:
     # a random GGUF of a supported architecture; returns its weights as decoded independently by
     # gguf-py. llama has rope frequency factors, qwen2 biases of q, k and v, qwen3 RMSNorms of q
-    # and k, and qwen3moe also a mixture of experts for MLP.
+    # and k, and qwen3moe also a mixture of experts for MLP. Of the default kinds, `split` tensors
+    # to a file, if given, as gguf-split writes a GGUF's parts, path-00001-of-0000N.gguf on.
     if arch.startswith("gemma4"):
         return _write_gemma4(path, experts=arch == "gemma4")
     if arch == "gemma-embedding2":
@@ -107,7 +108,7 @@ def write_tiny_model(path: Path, arch: str = "llama") -> dict[str, np.ndarray]:
     if arch in _WRITERS:
         return _WRITERS[arch](path)
     # llama's vocab with the tokens of Mistral Small 3's images, as it is of the llama kind
-    w, weights, add = _writer(path, arch, ("[IMG]", "[IMG_END]") if arch == "llama" else ())
+    w, weights, add = _writer(path, arch, ("[IMG]", "[IMG_END]") if arch == "llama" else (), split)
     for key, value in [("block_count", LAYERS),
                        ("embedding_length", D), ("feed_forward_length", HIDDEN),
                        ("attention.head_count", HEADS), ("attention.head_count_kv", KV_HEADS),
@@ -136,13 +137,13 @@ def write_tiny_model(path: Path, arch: str = "llama") -> dict[str, np.ndarray]:
     return weights
 
 
-def _writer(path: Path, arch: str, specials: tuple[str, ...] = ()):
+def _writer(path: Path, arch: str, specials: tuple[str, ...] = (), split: int = 0):
     # a GGUF writer with the tiny tokenizer, its last tokens `specials`, control tokens, its
     # weights, and add(name, shape, type, scale), which writes a random tensor and keeps it decoded:
     # a norm weight by default, an F32 vector uniform from 1 to `scale`, 1.5; other F32 tensors,
     # biases too, normal times `scale`; and else blocks whose f16 fields are up to `scale`
     rng = np.random.default_rng(0)
-    w = gguf.GGUFWriter(path, arch=arch)
+    w = gguf.GGUFWriter(path, arch=arch, split_max_tensors=split)
     w.add_uint32(f"{arch}.context_length", CONTEXT)
     w.add_float32(f"{arch}.attention.layer_norm_rms_epsilon", 1e-5)
     w.add_string("tokenizer.ggml.model", "gpt2")

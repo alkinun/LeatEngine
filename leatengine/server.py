@@ -50,7 +50,7 @@ from leatengine.chat import (
 from leatengine.defaults import OPTIONS, Overrides, recommended
 from leatengine.draft import own_drafter
 from leatengine.engine import TOP_LOGPROBS, Engine, Scored, Sequence
-from leatengine.gguf import GGUF
+from leatengine.gguf import GGUF, model_name
 from leatengine.grammar import Grammar
 from leatengine.keys import Keys
 from leatengine.model import Config
@@ -283,7 +283,7 @@ class Server(ThreadingHTTPServer):
         keys: Keys | None = None, sampling: Overrides | None = None,
         embed: str | Path | None = None, **options: Any,
     ):  # fmt: skip
-        self.models = {Path(path).stem: Path(path) for path in models}
+        self.models = {model_name(Path(path)): Path(path) for path in models}
         self.embed = Path(embed) if embed is not None else None
         self.embedder: Engine | None = None  # once the worker has loaded it
         self.options, self.created, self.keys = options, int(time.time()), keys
@@ -562,13 +562,13 @@ class Server(ThreadingHTTPServer):
             left, file = optional.pop(0)
             gc.collect()  # what the try took, once its traceback is gone, past the except
             said = "decodes without drafting" if left == "draft" else "takes no images"
-            print(f"{path.stem}: the GPU has no room for {file.name} beside it, so it {said}",
-                  file=sys.stderr, flush=True)  # fmt: skip
+            print(f"{model_name(path)}: the GPU has no room for {file.name} beside it, so it "
+                  f"{said}", file=sys.stderr, flush=True)  # fmt: skip
             extras[left] = None
 
     def _warmed(self, path: Path, extras: dict[str, Path | None]) -> tuple[Engine, ChatTemplate]:
         engine = Engine(path, **self.options | extras)
-        print(f"{path.stem}: a context of {engine.max_context} tokens, {engine.fit}",
+        print(f"{model_name(path)}: a context of {engine.max_context} tokens, {engine.fit}",
               file=sys.stderr, flush=True)  # fmt: skip
         chat = ChatTemplate(engine.gguf.metadata, engine.tokenizer)
         engine.warm_up()
@@ -875,7 +875,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._error(500, f"embedding failed: {said!r}")
         data = [{"object": "embedding", "index": i, "embedding": v} for i, v in enumerate(said)]
         used = sum(map(len, tokens))
-        self._json(200, {"object": "list", "data": data, "model": server.embed.stem,
+        self._json(200, {"object": "list", "data": data, "model": model_name(server.embed),
                          "usage": {"prompt_tokens": used, "total_tokens": used}})  # fmt: skip
 
     def _complete(self, body: Any) -> None:

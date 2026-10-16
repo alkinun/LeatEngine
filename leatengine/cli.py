@@ -255,6 +255,7 @@ def _run(args: argparse.Namespace) -> None:
     from leatengine.chat import ChatTemplate, split_reply
     from leatengine.draft import own_drafter
     from leatengine.engine import Engine
+    from leatengine.gguf import model_name
     from leatengine.sampler import Sampling
     from leatengine.vision import Image, beside
 
@@ -268,7 +269,7 @@ def _run(args: argparse.Namespace) -> None:
     )  # fmt: skip
     first = [{"role": "system", "content": args.system}] if args.system else []
     messages, pictures, attached = list(first), list[Image](), list[Image]()
-    print(f"{engine.gguf.path.stem} on {Device.DEFAULT}: a context of {engine.max_context} "
+    print(f"{model_name(engine.gguf.path)} on {Device.DEFAULT}: a context of {engine.max_context} "
           f"tokens, {engine.fit}")  # fmt: skip
     print("compiling...", end="", flush=True)
     engine.warm_up()
@@ -350,6 +351,7 @@ def _serve(args: argparse.Namespace) -> None:
     from tinygrad import Device
 
     from leatengine.draft import mtp
+    from leatengine.gguf import model_name
     from leatengine.server import Server
     from leatengine.vision import projector
 
@@ -381,7 +383,7 @@ def _serve(args: argparse.Namespace) -> None:
     ) as server:
         # served at once, the model loading meanwhile, so that a client asking while it compiles
         # hears it is loading, its completions waiting for it, rather than no answer
-        url, name = _url(args.host, server.server_port), models[0].stem
+        url, name = _url(args.host, server.server_port), model_name(models[0])
         failed: list[Exception] = []
         print(f"{name} on {Device.DEFAULT}, the API at {url}/v1, compiling...", flush=True)
         threading.Thread(target=_start, args=(server, name, failed), daemon=True).start()
@@ -394,11 +396,13 @@ def _serve(args: argparse.Namespace) -> None:
 def _found(directory: Path) -> list[Path]:
     # the GGUFs of a directory of models that run here, saying which do not, as drafters of other
     # engines' kinds beside a model
-    from leatengine.gguf import GGUF
+    from leatengine.gguf import GGUF, later_part
     from leatengine.model import supported
 
     found = []
     for path in sorted(directory.glob("*.gguf")):
+        if later_part(path):  # of a split GGUF, which its first part opens
+            continue
         try:
             arch = GGUF.open(path).metadata.get("general.architecture", "")
         except (OSError, ValueError) as e:  # not a GGUF after all, or truncated
@@ -457,7 +461,7 @@ def _bench(args: argparse.Namespace) -> None:
     from leatengine import bench
     from leatengine.defaults import recommended
     from leatengine.engine import Engine
-    from leatengine.gguf import GGUF
+    from leatengine.gguf import GGUF, model_name
     from leatengine.model import Config
     from leatengine.sampler import GREEDY, Sampling
 
@@ -470,7 +474,7 @@ def _bench(args: argparse.Namespace) -> None:
         args.model, max_context=context, prefill_chunk=args.prompt, slots=n, draft=args.draft,
         cache_type=args.cache_type,
     )  # fmt: skip
-    name = engine.gguf.path.stem
+    name = model_name(engine.gguf.path)
     head = {"model": name, "device": Device.DEFAULT, "cache_type": args.cache_type}
     title = f"{name} on {Device.DEFAULT}, {args.cache_type} KV cache"
     if args.chat:
@@ -499,6 +503,7 @@ def _bench(args: argparse.Namespace) -> None:
 def _perplexity(args: argparse.Namespace) -> None:
     from leatengine import bench
     from leatengine.engine import Engine
+    from leatengine.gguf import model_name
 
     ctx = bench.base_chunk(args.kl_base) if args.kl_base else args.ctx
     # a chunk in one run
@@ -510,7 +515,7 @@ def _perplexity(args: argparse.Namespace) -> None:
         text = args.text.read_bytes().decode()
         result = bench.perplexity(engine, text, args.ctx, args.chunks, args.decode)
     if args.json:
-        print(json.dumps({"model": engine.gguf.path.stem} | asdict(result)))
+        print(json.dumps({"model": model_name(engine.gguf.path)} | asdict(result)))
         return
     print(f"perplexity {result.perplexity:.4f}")
     if result.kl_mean is not None:

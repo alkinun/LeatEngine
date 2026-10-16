@@ -39,7 +39,8 @@ uv tool install --force dist/leatengine-0.0.1-py3-none-any.whl
 ```
 
 The wheel resolves dependencies, including tinygrad at an exact Git commit; it is not an
-offline bundle. Model weights are supplied separately as local GGUF files.
+offline bundle. Model weights are supplied separately as local GGUF files; a GGUF split in parts
+is given by its first, `NAME-00001-of-0000N.gguf`.
 
 ## Run
 

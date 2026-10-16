@@ -14,7 +14,7 @@ from leatengine.cli import _url, main
 from leatengine.engine import Engine
 from leatengine.gguf import GGUF
 from leatengine.tokenizer import Tokenizer
-from tests.helpers import q8_0, reference_logits
+from tests.helpers import q8_0, reference_logits, write_tiny_model
 
 CTX, FIRST = 16, 8  # llama-perplexity scores positions FIRST .. CTX-2 of each chunk
 TEXT = ("the quick brown fox jumps over the lazy dog " * 2)[:64]  # 4 chunks of byte tokens
@@ -210,11 +210,12 @@ def test_run_past_the_context(tiny_model, monkeypatch, capsys):
 
 def test_serve_directories(tiny_model, tmp_path, monkeypatch, capsys):
     # of directories alone, the first file found loads at start, served meanwhile, a model's MTP
-    # layer beside it not a model; a server on every address is browsed at this machine's, and
-    # needs keys; a model that fails to load stops the server
+    # layer beside it not a model, nor a split model's later parts; a server on every address is
+    # browsed at this machine's, and needs keys; a model that fails to load stops the server
     (models := tmp_path / "models").mkdir()
     (models / "mtp-tiny.gguf").symlink_to(tiny_model[0])
     (models / "tiny.gguf").symlink_to(tiny_model[0])
+    write_tiny_model(models / "whole.gguf", split=20)  # whole-00001-of-0000N.gguf on
     other = gguf.GGUFWriter(models / "dflash-tiny.gguf", arch="dflash")  # another engine's drafter
     other.write_header_to_file()
     other.write_kv_data_to_file()
@@ -259,7 +260,8 @@ def test_serve_directories(tiny_model, tmp_path, monkeypatch, capsys):
     printed = capsys.readouterr()
     assert loaded == ["tiny"] and "the API at http://127.0.0.1:8080/v1, compiling..." in printed.out
     assert "skipping dflash-tiny.gguf: its architecture, 'dflash', is not supported" in printed.err
-    assert [f.name for f in served[-1]] == ["tiny.gguf"]
+    assert [f.name for f in served[-1]][:1] == ["tiny.gguf"] and len(served[-1]) == 2
+    assert served[-1][1].name.startswith("whole-00001-of-") and "whole-0000" not in printed.err
     assert keys[-1].path == tmp_path / "keys.json"
     main(["serve", str(models), "--host", "::1"])  # this machine's alone: no keys needed
     assert keys[-1] is None and samplings[-1] is None and engines[-1]["cache_type"] == "f16"

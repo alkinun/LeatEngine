@@ -27,7 +27,9 @@ clients must handle that as well as HTTP errors.
 ## Models
 
 `serve` accepts files or directories containing GGUFs. Model IDs are filename stems. The first
-chat model loads at startup. Recognized projectors and MTP files are excluded from the list.
+chat model loads at startup. Recognized projectors and MTP files are excluded from the list. A
+GGUF split in parts, as llama.cpp's `gguf-split` writes `NAME-00001-of-00003.gguf` and on, is
+given by its first part, its ID `NAME`; a directory's later parts are not models of their own.
 
 ```bash
 curl http://127.0.0.1:8080/v1/models

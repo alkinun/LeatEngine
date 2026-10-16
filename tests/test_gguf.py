@@ -8,7 +8,7 @@ from gguf.quants import dequantize
 from leatengine import gguf as reader
 from leatengine.gguf import GGUF
 from leatengine.quant import GGMLType
-from tests.helpers import random_blocks
+from tests.helpers import random_blocks, write_tiny_model
 
 
 @pytest.fixture
@@ -176,3 +176,29 @@ def test_opens_what_it_cannot_decode(tiny_gguf, tmp_path):
         f.load(names=["q8_0"])["q8_0"].dequant()
     f = patched(tiny_gguf, tmp_path, string("general.name"), 4 + 8, b"ti\xffy")
     assert f.metadata["general.name"] == "ti\ufffdy"
+
+
+def test_split(tmp_path):
+    # a GGUF in parts, as gguf-split writes it: opened from its first part, the first's metadata
+    # and every part's tensors, loaded as whole, and named without the parts' numbers
+    whole, parts = tmp_path / "whole" / "m.gguf", tmp_path / "parts" / "m.gguf"
+    whole.parent.mkdir(), parts.parent.mkdir()
+    write_tiny_model(whole)
+    write_tiny_model(parts, split=5)
+    files = sorted(parts.parent.iterdir())
+    assert len(files) > 2 and files[0].name == f"m-00001-of-{len(files):05d}.gguf"
+    one, split = GGUF.open(whole), GGUF.open(files[0])
+    assert split.parts == tuple(files) and {t.part for t in split.tensors.values()} == set(
+        range(len(files)))  # fmt: skip
+    assert split.metadata["tokenizer.ggml.tokens"] == one.metadata["tokenizer.ggml.tokens"]
+    assert split.tensors.keys() == one.tensors.keys()
+    a, b = one.load("CPU"), split.load("CPU")
+    for name in a:
+        assert (a[name].data.numpy() == b[name].data.numpy()).all(), name
+    assert [reader.model_name(f) for f in (whole, files[0], files[-1])] == ["m"] * 3
+    assert [reader.later_part(f) for f in files] == [False] + [True] * (len(files) - 1)
+    with pytest.raises(ValueError, match="part 2 of a split GGUF of .*: open the first"):
+        GGUF.open(files[1])
+    files[-1].unlink()
+    with pytest.raises(ValueError, match=f"but {files[-1].name} is not there"):
+        GGUF.open(files[0])
