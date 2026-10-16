@@ -185,7 +185,8 @@ def test_run(tiny_model, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "tiny on CPU: a context of 64 tokens, as given\ncompiling... ready." in out
     assert [m["role"] for m in chats[1]] == ["user", "assistant", "user"]
-    assert chats[1][1]["content"] in out and out.count("tok/s]") == 2
+    assert chats[1][1]["content"] in out and out.count("tok/s; the chat holds") == 2
+    assert "of 64 tokens]" in out
 
 
 @pytest.mark.parametrize(
@@ -347,16 +348,44 @@ def test_keys(tmp_path, capsys):
             main(["keys", *args, "--file", file])
 
 
-def test_run_refused_chat(tiny_model, monkeypatch):
-    # a chat the model's template refuses, as Mistral 7B v0.3's does a system prompt, ends the run
-    # with the template's reason rather than a traceback
+def test_run_refused_chat(tiny_model, monkeypatch, capsys):
+    # a chat the model's template refuses, as Mistral 7B v0.3's does a system prompt, drops the
+    # message with the template's reason rather than a traceback, and the chat goes on
     def refuse(self, messages, **kwargs):
-        raise jinja2.TemplateError("Only user and assistant roles are supported!")
+        if any(m["role"] == "system" for m in messages):
+            raise jinja2.TemplateError("Only user and assistant roles are supported!")
+        return "".join(m["content"] for m in messages)
 
+    lines = iter(["hello", "/system", "hello"])
     monkeypatch.setattr("leatengine.chat.ChatTemplate.render", refuse)
-    monkeypatch.setattr("builtins.input", lambda prompt: "hello")
-    with pytest.raises(SystemExit, match="refuses this chat: Only user and assistant"):
+    monkeypatch.setattr("builtins.input", lambda prompt: next(lines))
+    with pytest.raises(StopIteration):  # the lines run out once the chat went on
         main(["run", str(tiny_model[0]), "--max-context", "64", "--system", "Be brief."])
+    out = capsys.readouterr().out
+    assert "[the model's chat template refuses this chat: Only user and assistant roles are " \
+        "supported!; the message is dropped, as /system takes it away]" in out  # fmt: skip
+    assert "[the system prompt is gone]" in out and out.count("tok/s;") == 1
+
+
+def test_run_commands(tiny_model, monkeypatch, capsys):
+    # the chat's commands: its system prompt set, a message of several lines, the chat started
+    # over, a command it has not, a message of a slash, and quitting
+    lines = iter(["/help", "/system Be brief.", '"""one', "two", 'three"""', "/reset", "/nothing",
+                  "//slash", '"""inline"""', "/quit"])  # fmt: skip
+    chats, render = [], ChatTemplate.render
+
+    def rendered(self, messages, **kwargs):
+        chats.append([m["content"] for m in messages])
+        return render(self, messages, **kwargs)
+
+    monkeypatch.setattr("builtins.input", lambda prompt: next(lines))
+    monkeypatch.setattr("leatengine.chat.ChatTemplate.render", rendered)
+    main(["run", str(tiny_model[0]), "--max-context", "64"])
+    out = capsys.readouterr().out
+    assert "/reset        start the chat over" in out and "[the system prompt is set]" in out
+    assert "[the chat starts over]" in out and "[/nothing is no command" in out
+    assert chats[0] == ["Be brief.", "one\ntwo\nthree"]
+    assert chats[1] == ["Be brief.", "/slash"] and chats[2][-1] == "inline"
 
 
 def test_device(tmp_path, monkeypatch):

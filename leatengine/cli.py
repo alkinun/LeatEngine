@@ -316,30 +316,57 @@ def _run(args: argparse.Namespace) -> None:
           f"tokens, {engine.fit}")  # fmt: skip
     print("compiling...", end="", flush=True)
     engine.warm_up()
-    print(f" ready.{' /image PATH attaches an image.' if engine.vision else ''} Ctrl-D quits.")
+    print(' ready. /help lists commands; """ begins and ends a message of lines; Ctrl-D quits.')
     while True:
         try:
-            line = input("> ")
+            line = _read()
         except (EOFError, KeyboardInterrupt):
             print()
             return
-        if line.startswith("/image "):
+        word, _, rest = line.partition(" ")
+        if word in ("/quit", "/exit"):
+            return
+        if word == "/help":
+            print(_HELP)
+            continue
+        if word == "/reset":  # the chat starts over, of its system prompt alone
+            messages, pictures, attached = list(first), [], []
+            print("[the chat starts over]")
+            continue
+        if word == "/system":  # of the chat so far, the system prompt replaced, or with none taken
+            first = [{"role": "system", "content": rest.strip()}] if rest.strip() else []
+            messages = first + [m for m in messages if m["role"] != "system"]
+            print(f"[the system prompt {'is set' if first else 'is gone'}]")
+            continue
+        if word == "/image":
             try:  # shown before the next message's text
-                path = Path(line[7:].strip().strip("'\"")).expanduser()  # as terminals quote one
+                path = Path(rest.strip().strip("'\"")).expanduser()  # as terminals quote one
                 attached.append(engine.image(path.read_bytes()))
             except (OSError, ValueError) as e:  # as of a model without a vision encoder
                 print(f"[no image: {e}]")
+            continue
+        if line.startswith("//"):  # a message that begins with a slash, as /usr's
+            line = line[1:]
+        elif line.startswith("/"):
+            print(f"[{word} is no command: /help lists them; // begins a message of a slash]")
             continue
         n = len(attached)  # the message's images, before its text
         images = [{"type": "image"}] * n + [{"type": "text", "text": line}]
         messages.append({"role": "user", "content": images if n else line})
         pictures, attached = pictures + attached, []
-        prompt, thinking = _prompt(chat, messages, pictures)
-        if len(prompt) >= engine.max_context and len(messages) > len(first) + 1:
-            print(f"[the conversation is {len(prompt)} tokens, over --max-context; starting over]")
-            messages = [*first, messages[-1]]  # from the message just written
-            pictures = pictures[len(pictures) - n :]
+        try:
             prompt, thinking = _prompt(chat, messages, pictures)
+            if len(prompt) >= engine.max_context and len(messages) > len(first) + 1:
+                print(f"[the conversation is {len(prompt)} tokens, over --max-context; starting "
+                      "over]")  # fmt: skip
+                messages = [*first, messages[-1]]  # from the message just written
+                pictures = pictures[len(pictures) - n :]
+                prompt, thinking = _prompt(chat, messages, pictures)
+        except ValueError as e:  # as Mistral 7B v0.3's template refuses a system prompt
+            print(f"[{e}; the message is dropped{', as /system takes it away' if first else ''}]")
+            messages.pop()
+            pictures = pictures[: len(pictures) - n]
+            continue
         if len(prompt) >= engine.max_context:
             print(f"[the message makes {len(prompt)} tokens, over --max-context]")
             messages.pop()
@@ -361,7 +388,9 @@ def _run(args: argparse.Namespace) -> None:
         parts = split_reply(text, chat.form, thinking, done=True)
         _show(parts, shown)
         rate = len(reply) / (time.perf_counter() - start)
-        print(f"\n\033[2m[{len(reply)} tokens, {rate:.1f} tok/s]\033[0m")
+        held = len(prompt) + len(reply)
+        print(f"\n\033[2m[{len(reply)} tokens, {rate:.1f} tok/s; the chat holds {held} of "
+              f"{engine.max_context} tokens]\033[0m")  # fmt: skip
         messages.append({"role": "assistant", "content": parts.content})
 
 
@@ -374,8 +403,32 @@ def _prompt(
     try:
         rendered = chat.render(messages)
     except jinja2.TemplateError as e:  # such as a system prompt the template does not take
-        raise SystemExit(f"the model's chat template refuses this chat: {e}") from None
+        raise ValueError(f"the model's chat template refuses this chat: {e}") from None
     return chat.tokens(rendered, [image.tokens for image in images]), chat.opens_thinking(rendered)
+
+
+_HELP = "\n".join([
+    "/system TEXT  set the system prompt, of the chat so far too; /system alone takes it away",
+    "/reset        start the chat over, of its system prompt alone",
+    "/image PATH   attach an image to the next message, of a model that takes them",
+    "/help         this",
+    "/quit         quit, as Ctrl-D does",
+    '"""           begin a message of several lines, which another """ ends',
+    "//            begin a message that begins with a slash",
+])  # fmt: skip
+
+
+def _read() -> str:
+    # a message: a line, or the lines between two of three quotes, as Ollama's
+    line = input("> ")
+    if not line.startswith('"""'):
+        return line
+    if len(line) > 5 and line.endswith('"""'):
+        return line[3:-3]
+    lines = [line[3:]] if line[3:] else []
+    while not (more := input(". ")).endswith('"""'):
+        lines.append(more)
+    return "\n".join(lines + ([more[:-3]] if more[:-3] else []))
 
 
 def _show(parts: "Reply", shown: tuple[str, str]) -> tuple[str, str]:

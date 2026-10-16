@@ -126,7 +126,7 @@ reference ops, which are slower.
 | Command | Purpose |
 |---|---|
 | `pull` | Download a model from Hugging Face, as `OWNER/NAME:QUANT` |
-| `run` | Chat in the terminal; `/image PATH` attaches an image when supported |
+| `run` | Chat in the terminal: `/help` lists `/system`, `/reset`, `/image PATH`; `"""` wraps lines |
 | `serve` | Serve local GGUF files or directories through HTTP |
 | `keys` | Add, list, and remove API keys |
 | `bench` | Measure prefill and decode throughput |
