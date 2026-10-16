@@ -1,8 +1,9 @@
 # HTTP API and configuration
 
 Start with `leatengine serve MODEL.gguf`. The default address is `http://127.0.0.1:8080`.
-The API implements a subset of OpenAI chat completions and embeddings, plus model-management,
-metrics and health extensions. It serves no HTML, frontend, or browser application.
+The API implements a subset of OpenAI chat and text completions and embeddings, plus
+model-management, metrics and health extensions. It serves no HTML, frontend, or browser
+application.
 
 ## Endpoints
 
@@ -11,6 +12,7 @@ metrics and health extensions. It serves no HTML, frontend, or browser applicati
 | `GET /v1/models` | List configured chat models and their load status |
 | `POST /v1/models/load` | Load a configured model, replacing the current chat model |
 | `POST /v1/chat/completions` | Generate one reply, optionally streamed |
+| `POST /v1/completions` | Continue a prompt, or fill in the middle, optionally streamed |
 | `POST /v1/embeddings` | Embed text using the separately configured embedding model |
 | `GET /metrics` | Prometheus metrics with the `leatengine_` prefix |
 | `GET /health` | `200` once a chat model is loaded and warmed up, `503` until then |
@@ -80,9 +82,26 @@ determine which message roles and tool formats a model understands.
   `usage.prompt_tokens_details.cached_tokens`; streamed usage requires `include_usage`.
 
 This is not a complete OpenAI implementation: multiple choices, log probabilities, logit
-biases, and frequency or repetition penalties are unsupported. Responses,
-legacy text completions, audio, file-storage, and tool-execution endpoints are not implemented.
+biases, and frequency or repetition penalties are unsupported. Responses, audio, file-storage,
+and tool-execution endpoints are not implemented.
 A prompt must fit the configured context; clients manage conversation history.
+
+## Text completions
+
+`POST /v1/completions` continues a prompt as the model writes it, with no chat template, as
+OpenAI's legacy completions and llama.cpp's `/completion` do. `prompt` is a string, whose text of
+control tokens, such as `<|im_start|>`, is read as those tokens, as llama.cpp reads it; a list of
+one string; or a list of token IDs. `max_tokens` defaults to 16, as OpenAI's does.
+
+With `suffix`, the reply fills in the middle, as code-completion clients ask: the prompt and the
+suffix go between the model's fill-in-the-middle tokens, `[FIM_PRE]prompt[FIM_SUF]suffix[FIM_MID]`,
+in llama.cpp's default order, neither's text read as tokens. The tokens are those GGUF metadata names, else those of the texts
+llama.cpp knows, such as Qwen's `<|fim_prefix|>`; a model without them refuses a suffix. Unlike
+llama.cpp's `/infill`, no repository header or other files are added and nothing is cut: the
+prompt must fit the context.
+
+Sampling controls, `stop`, `seed`, `stream`, and `stream_options` work as for chat completions;
+`echo`, `best_of`, and `logprobs` are not supported.
 
 ## Embeddings
 

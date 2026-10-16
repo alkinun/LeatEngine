@@ -291,6 +291,62 @@ def test_stop(client, expected, stream):
     assert reply == (full[: full.index(stops[1])], "stop")
 
 
+def text(client: openai.OpenAI, prompt: str, **kwargs) -> tuple[str, str]:
+    # a text completion's text and finish reason, streamed or whole
+    response = client.completions.create(model="tiny", prompt=prompt, **kwargs)
+    if not kwargs.get("stream"):
+        return response.choices[0].text, response.choices[0].finish_reason
+    choices = [chunk.choices[0] for chunk in response if chunk.choices]
+    return "".join(c.text for c in choices), choices[-1].finish_reason
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_text_completion(client, expected, stream):
+    # the text that goes on from a prompt, as the engine generates it: 16 tokens unless asked for
+    # more, as OpenAI's API has it; or cut where a stop string begins
+    assert text(client, "hello", temperature=0, stream=stream) == (expected("hello", 16), "length")
+    full = expected("stop me", 16)
+    reply = text(client, "stop me", temperature=0, stop=full[6:9], stream=stream)
+    assert reply == (full[: full.index(full[6:9])], "stop")
+
+
+def test_text_completion_usage(client):
+    # as OpenAI's completions say it, with llama.cpp's timings, of a reply whole or streamed
+    response = client.completions.create(model="tiny", prompt="hello", max_tokens=8)
+    assert response.object == "text_completion" and response.id.startswith("cmpl-")
+    assert (response.usage.prompt_tokens, response.usage.completion_tokens) == (5, 8)
+    check_timings(response.model_extra["timings"], response.usage)
+    stream = client.completions.create(
+        model="tiny", prompt="hello", max_tokens=8, stream=True,
+        stream_options={"include_usage": True},
+    )  # fmt: skip
+    *chunks, last = list(stream)
+    assert chunks[-1].choices[0].finish_reason == "length" and last.choices == []
+    assert all(c.object == "text_completion" for c in chunks) and last.usage.completion_tokens == 8
+    check_timings(last.model_extra["timings"], last.usage)
+
+
+def test_text_completion_prompts(server, engine, monkeypatch):
+    # a prompt of text, whose control tokens' text is theirs, as llama.cpp's server reads it; of
+    # tokens; and with a suffix, between the model's fill-in-the-middle tokens, neither's text a
+    # token's, as llama.cpp's /infill puts them
+    tok = engine.tokenizer
+
+    def asked(**body) -> list[int]:
+        return server_module._text_completion(body, server, server.loaded).prompt
+
+    eot = tok.encode("<|eot|>", bos=False, special=True)
+    assert asked(prompt="hi<|eot|>") == tok.encode("hi") + eot
+    assert asked(prompt=["hi"]) == tok.encode("hi") and asked(prompt=[3, 1, 2]) == [3, 1, 2]
+    with pytest.raises(ValueError, match="tiny has no fill-in-the-middle tokens: it takes no"):
+        asked(prompt="a", suffix="b")
+    monkeypatch.setattr(tok, "fim", (7, 8, 9))
+    a, b = tok.encode("a<|eot|>", bos=False), tok.encode("b", bos=False)
+    assert asked(prompt="a<|eot|>", suffix="b") == [7, *a, 8, *b, 9]
+    monkeypatch.setattr(tok, "bos_id", 6)  # first, of a tokenizer that adds one
+    assert asked(prompt=[3], suffix="") == [6, 7, 3, 8, 9]
+
+
 def _asked(body: dict, server: Server) -> _Completion:
     # what a request asks for of the server's loaded model
     return _completion(body, server, server.loaded)
@@ -685,6 +741,26 @@ def test_bad_request(client, kwargs, error):
         client.chat.completions.create(**request)
 
 
+@pytest.mark.parametrize(
+    "body, error",
+    [
+        ({}, "a completion needs prompt"),
+        ({"prompt": []}, "prompt must be a string, a list of one string, or a non-empty list"),
+        ({"prompt": ["a", "b"]}, "prompt must be a string, a list of one string"),
+        ({"prompt": [1, True]}, "prompt must be a string, a list of one string"),
+        ({"prompt": [10**6]}, "the prompt must hold some tokens, each of the"),
+        ({"prompt": "x" * CONTEXT}, "the prompt has 64 tokens, too many for 64 of context"),
+        ({"prompt": "a", "suffix": 1}, "suffix must be a string"),
+        ({"prompt": "a", "echo": True}, "echo=True is not supported"),
+        ({"prompt": "a", "best_of": 2}, "best_of=2 is not supported"),
+        ({"prompt": "a", "logprobs": 2}, "logprobs=2 is not supported"),
+    ],
+)
+def test_bad_text_completion(client, body, error):
+    with pytest.raises(openai.BadRequestError, match=error):
+        client.post("/completions", cast_to=object, body={"model": "tiny"} | body)
+
+
 def test_web_pages_are_refused(server):
     # a page may not make the server generate or load models, even one whose name was made this
     # address's, as DNS rebinding does; a client of no browser may
@@ -701,7 +777,7 @@ def test_web_pages_are_refused(server):
 
 def test_unknown_route(client, server):
     with pytest.raises(openai.NotFoundError):
-        client.completions.create(model="tiny", prompt="hi")
+        client.moderations.create(input="hi")
     url = f"http://127.0.0.1:{server.server_port}"
     with pytest.raises(urllib.error.HTTPError, match="404"):
         urllib.request.urlopen(f"{url}/v1/nothing")

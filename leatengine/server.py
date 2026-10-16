@@ -119,6 +119,12 @@ _FIELDS: dict[str, tuple[Callable[[Any], bool], str]] = {
                           "a string of 256 characters at most"),
     "service_tier": (lambda v: v in ("auto", "default", "flex", "priority"),
                      "one of auto, default, flex and priority"),
+    # of a text completion: its prompt, of text or of tokens, and the suffix of a fill-in-the-middle
+    "prompt": (lambda v: isinstance(v, str) or isinstance(v, list) and (
+                   len(v) == 1 and isinstance(v[0], str)
+                   or bool(v) and all(type(t) is int and t >= 0 for t in v)),
+               "a string, a list of one string, or a non-empty list of token ids"),
+    "suffix": (lambda v: isinstance(v, str), "a string"),
     "response_format": (lambda v: isinstance(v, dict) and (v.get("type") in ("text", "json_object")
                         or v.get("type") == "json_schema" and isinstance(v.get("json_schema"), dict)
                         and isinstance(v["json_schema"].get("schema"), dict)),
@@ -129,7 +135,9 @@ _FIELDS: dict[str, tuple[Callable[[Any], bool], str]] = {
 # what leatengine does not implement, each with the value that asks for nothing more
 _UNSUPPORTED = {
     "n": 1, "frequency_penalty": 0, "repetition_penalty": 1, "logit_bias": {}, "logprobs": False,
+    "echo": False, "best_of": 1,
 }  # fmt: skip
+_TEXT_TOKENS = 16  # the tokens a text completion makes unless it asks for more, as OpenAI's
 _GRAMMARS = 64  # compiled response formats a loaded model keeps, with their masks
 
 
@@ -175,7 +183,8 @@ class _Embedding:
 
 @dataclass(eq=False)
 class _Completion:
-    """A chat completion: what the worker generates, and what the handler answers with.
+    """A completion, of a chat or of text: what the worker generates, and what the handler
+    answers with.
 
     Queued requests have identity, even before their finish state has been populated.
     """
@@ -202,6 +211,7 @@ class _Completion:
     # work no one waits on, of service_tier "flex", as OpenAI's flex processing: started after the
     # completions that wait before it, and never into the last slot free
     background: bool = False
+    text: bool = False  # of /v1/completions: its reply text alone, as the model writes it
     id: str = field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
     created: int = field(default_factory=lambda: int(time.time()))
     # from the worker: pieces of text, then how generation finished or the exception it raised
@@ -601,8 +611,8 @@ class _Metrics:
 
     COUNTERS = {
         "leatengine_requests_total": "Requests answered, by key, path and status.",
-        "leatengine_completions_total": "Chat completions ended, by key and how: stop, length or "
-        "cancelled, as the client hung up.",
+        "leatengine_completions_total": "Completions ended, of chats and of text, by key and how: "
+        "stop, length or cancelled, as the client hung up.",
         "leatengine_prompt_tokens_total": (
             "Prompt tokens of the completions ended, the cached ones too."
         ),
@@ -681,8 +691,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         self.path = urllib.parse.urlsplit(self.path).path
-        routes = {"/v1/chat/completions": self._complete, "/v1/models/load": self._load,
-                  "/v1/embeddings": self._embeddings}  # fmt: skip
+        routes = {"/v1/chat/completions": self._complete, "/v1/completions": self._complete_text,
+                  "/v1/models/load": self._load, "/v1/embeddings": self._embeddings}  # fmt: skip
         with self._counted(self.path in routes):
             if (route := routes.get(self.path)) is None:
                 return self._error(404, f"there is no POST {self.path}")
@@ -832,6 +842,15 @@ class _Handler(BaseHTTPRequestHandler):
                          "usage": {"prompt_tokens": used, "total_tokens": used}})  # fmt: skip
 
     def _complete(self, body: Any) -> None:
+        self._generate(body, _completion)
+
+    def _complete_text(self, body: Any) -> None:
+        self._generate(body, _text_completion)
+
+    def _generate(
+        self, body: Any, asked: Callable[[Any, Server, _Loaded | None], _Completion]
+    ) -> None:
+        # a completion of what the body `asked` for, answered whole or streamed
         server = self.server
         while True:
             server.ready.wait()  # for the model loading, if one is, whose template renders it
@@ -839,7 +858,7 @@ class _Handler(BaseHTTPRequestHandler):
             if loaded is None and server.loading_now():  # a load began since: wait for it
                 continue
             try:
-                completion = _completion(body, server, loaded)
+                completion = asked(body, server, loaded)
             except (ValueError, TypeError, jinja2.TemplateError) as e:
                 return self._error(400, str(e))
             except RecursionError:
@@ -850,7 +869,9 @@ class _Handler(BaseHTTPRequestHandler):
             if server.ask(completion, loaded):
                 break
         try:
-            if completion.stream:
+            if completion.text:
+                (self._stream_text if completion.stream else self._reply_text)(completion)
+            elif completion.stream:
                 self._stream(completion)
             else:
                 self._reply(completion)
@@ -875,11 +896,43 @@ class _Handler(BaseHTTPRequestHandler):
         body = {"choices": [choice], "usage": _usage(c), "timings": _timings(c)}
         self._json(200, self._head(c, "chat.completion") | body)
 
-    def _stream(self, c: _Completion) -> None:
+    def _reply_text(self, c: _Completion) -> None:
+        try:
+            text = "".join(c.pieces(self._hung_up))
+        except RuntimeError as e:
+            return self._error(500, str(e))
+        choice = {"text": text, "index": 0, "logprobs": None, "finish_reason": c.finish.reason}
+        body = {"choices": [choice], "usage": _usage(c), "timings": _timings(c)}
+        self._json(200, self._head(c, "text_completion") | body)
+
+    def _stream_text(self, c: _Completion) -> None:
+        self._events()
+
+        def chunk(text: str, reason: str | None = None) -> dict[str, Any]:
+            choice = {"text": text, "index": 0, "logprobs": None, "finish_reason": reason}
+            return self._head(c, "text_completion") | {"choices": [choice]}
+
+        try:
+            for piece in c.pieces(self._hung_up):
+                self._event(chunk(piece))
+        except RuntimeError as e:
+            return self._event({"error": {"message": str(e), "type": "server_error"}})
+        timings = {"timings": _timings(c)}
+        self._event(chunk("", c.finish.reason) | ({} if c.stream_usage else timings))
+        if c.stream_usage:
+            usage = {"choices": [], "usage": _usage(c)} | timings
+            self._event(self._head(c, "text_completion") | usage)
+        self._event("[DONE]")
+
+    def _events(self) -> None:
+        # the head of a stream of Server-Sent Events
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
+
+    def _stream(self, c: _Completion) -> None:
+        self._events()
         self._chunk(c, {"role": "assistant", "content": ""})
         # what may yet be part of a tool call is held back; the reply is split once more when
         # done, the end that may have begun a marker then its own
@@ -1000,16 +1053,22 @@ def _embedder(path: Path) -> Engine:
     return engine
 
 
-def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completion:
-    # what a request body asks for of the `loaded` model, or a ValueError saying what is wrong
-    if not isinstance(body, dict) or body.get("messages") is None:
-        raise ValueError("a chat completion needs messages")
+def _valid(body: Any, kind: str, needs: str) -> None:
+    # a ValueError unless a request body holds what a `kind` of request `needs`, each field
+    # leatengine reads valid, and asks for nothing it does not implement
+    if not isinstance(body, dict) or body.get(needs) is None:
+        raise ValueError(f"a {kind} needs {needs}")
     for key, (valid, expected) in _FIELDS.items():
         if body.get(key) is not None and not valid(body[key]):
             raise ValueError(f"{key} must be {expected}")
     for key, neutral in _UNSUPPORTED.items():
         if body.get(key) not in (None, neutral):
             raise ValueError(f"{key}={body[key]!r} is not supported")
+
+
+def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completion:
+    # what a request body asks for of the `loaded` model, or a ValueError saying what is wrong
+    _valid(body, "chat completion", "messages")
     if (choice := body.get("tool_choice") or "auto") not in ("auto", "none"):
         raise ValueError(f"tool_choice={choice!r} is not supported, only 'auto' and 'none'")
     if loaded is None:
@@ -1059,6 +1118,50 @@ def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completio
         grammar=grammar,
         preamble=preamble,
         background=body.get("service_tier") == "flex",
+    )
+
+
+def _text_completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completion:
+    # what a request body of /v1/completions asks for of the `loaded` model: the text that goes on
+    # from its prompt, whose control tokens' text is theirs, as llama.cpp's server reads it; or
+    # given a suffix, the text between, after the prompt and the suffix in the model's
+    # fill-in-the-middle tokens, as llama.cpp's /infill puts them, neither's text a token's
+    _valid(body, "completion", "prompt")
+    if loaded is None:
+        raise ValueError("no model is loaded")
+    tok, prompt, suffix = loaded.engine.tokenizer, body["prompt"], body.get("suffix")
+    if isinstance(prompt, list) and isinstance(prompt[0], str):
+        prompt = prompt[0]
+    if suffix is not None:
+        if tok.fim is None:
+            raise ValueError(f"{loaded.name} has no fill-in-the-middle tokens: it takes no suffix")
+        pre, suf, mid = tok.fim
+        start = [tok.bos_id] if tok.add_bos and tok.bos_id is not None else []
+        before = tok.encode(prompt, bos=False) if isinstance(prompt, str) else prompt
+        ids = [*start, pre, *before, suf, *tok.encode(suffix, bos=False), mid]
+    else:
+        ids = tok.encode(prompt, special=True) if isinstance(prompt, str) else prompt
+    vocab = int(loaded.engine.model.output.shape[0])
+    if not ids or max(ids) >= vocab:
+        raise ValueError(f"the prompt must hold some tokens, each of the {vocab} of the vocab")
+    if len(ids) >= (context := loaded.engine.max_context):
+        raise ValueError(f"the prompt has {len(ids)} tokens, too many for {context} of context")
+    stop, given = body.get("stop") or [], {k: v for k, v in body.items() if v is not None}
+    sampling = Sampling(**({k: given.get(k, v) for k, v in _sampling(server, loaded)[1].items()}))
+    return _Completion(
+        ids,
+        loaded.name,
+        max_tokens=body.get("max_tokens") or _TEXT_TOKENS,
+        sampling=dataclasses.replace(sampling, top_k=max(sampling.top_k, 0)),
+        seed=body.get("seed"),
+        stop=[s for s in ([stop] if isinstance(stop, str) else stop) if s],
+        tools=None,
+        stream=bool(body.get("stream")),
+        stream_usage=bool((body.get("stream_options") or {}).get("include_usage")),
+        user=body.get("safety_identifier") or body.get("user") or "",
+        background=body.get("service_tier") == "flex",
+        text=True,
+        id=f"cmpl-{uuid.uuid4().hex}",
     )
 
 

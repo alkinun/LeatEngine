@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import re
 import subprocess
 
 import pytest
@@ -64,6 +65,17 @@ def test_end_of_generation_tokens():
     assert ids(solar, "<|end|>")[0] not in solar.eog_ids
     gemma = with_tokens({"</s>": NORMAL, "<|tool_response>": CONTROL})
     assert gemma.eog_ids == {gemma.eos_id, *ids(gemma, "<|tool_response>")}
+
+
+def test_fill_in_the_middle_tokens():
+    # as llama.cpp finds them: the ids metadata gives, else the tokens of their texts, which become
+    # control tokens; none unless the vocab has all three
+    marks = {"<fim_prefix>": USER_DEFINED, "<fim_middle>": NORMAL, "<fim_suffix>": NORMAL}
+    tok = with_tokens(marks)
+    pre, mid, suf = ids(tok, "<fim_prefix>", "<fim_middle>", "<fim_suffix>")
+    assert tok.fim == (pre, suf, mid) and tok.encode("<fim_prefix>", bos=False) != [pre]
+    assert with_tokens(marks, **{"tokenizer.ggml.fim_pre_token_id": 1}).fim == (1, suf, mid)
+    assert with_tokens({"<|fim_prefix|>": CONTROL, "<|fim_suffix|>": CONTROL}).fim is None
 
 
 def test_reply_markers_decode_as_text():
@@ -209,6 +221,19 @@ def test_vocab_matches_llama_cpp(llama_cpp, tmp_path, name):
 
 def matches_llama_cpp(model_path, llama_cpp, tmp_path):
     tok = Tokenizer(GGUF.open(model_path).metadata)
+    # on the CPU: ggml's CUDA backend, which tokenizing does not need, now and then aborts
+    # starting up beside tinygrad's hold of the GPU
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
+    # the fill-in-the-middle tokens llama.cpp finds, as it says loading the vocab
+    args = [llama_cpp / "llama-tokenize", "-m", model_path, "-p", "x", "--ids", "-v"]
+    # of every token's text, some not UTF-8 alone
+    said = subprocess.run(
+        args, capture_output=True, text=True, errors="replace", check=True, env=env
+    )
+    found = dict(re.findall(r"FIM (PRE|SUF|MID) token\s+= (\d+)", said.stdout + said.stderr))
+    assert tok.fim == (
+        tuple(int(found[k]) for k in ("PRE", "SUF", "MID")) if len(found) == 3 else None
+    )
     rng = random.Random(0)
     for i, text in enumerate(CORPUS + [random_text(rng) for _ in range(10)]):
         (path := tmp_path / f"{i}.txt").write_bytes(text.encode())
@@ -216,9 +241,6 @@ def matches_llama_cpp(model_path, llama_cpp, tmp_path):
             args = [llama_cpp / "llama-tokenize", "-m", model_path, "-f", path, "--ids"]
             args += ["--no-bos", "--no-escape", "--log-disable"]
             args += [] if special else ["--no-parse-special"]
-            # on the CPU: ggml's CUDA backend, which tokenizing does not need, now and then aborts
-            # starting up beside tinygrad's hold of the GPU
-            env = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
             out = subprocess.run(args, capture_output=True, text=True, check=True, env=env).stdout
             got = tok.encode(text, bos=False, special=special)
             assert got == json.loads(out.splitlines()[-1]), (text, special)

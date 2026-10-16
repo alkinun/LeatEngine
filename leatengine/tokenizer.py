@@ -31,6 +31,16 @@ _FIM_EOG = {
     "fim_rep": {"<|fim_repo|>", "<|repo_name|>", "<fim-repo>", "<REPO>", "<reponame>"},
     "fim_sep": {"<|file_sep|>"},
 }
+# fill-in-the-middle's markers of the prefix, the suffix and the middle, each the id metadata gives
+# or else the token of one of these texts, which llama.cpp then makes a control token
+_FIM = {
+    "fim_pre": {"<|fim_prefix|>", "<fim-prefix>", "<fim_prefix>", "<\uff5cfim\u2581begin\uff5c>",
+                "<PRE>", "\u2581<PRE>", "<|code_prefix|>", "<|prefix|>", "<|plamo:fim_prefix|>"},
+    "fim_suf": {"<|fim_suffix|>", "<fim-suffix>", "<fim_suffix>", "<\uff5cfim\u2581hole\uff5c>",
+                "<SUF>", "\u2581<SUF>", "<|code_suffix|>", "<|suffix|>", "<|plamo:fim_suffix|>"},
+    "fim_mid": {"<|fim_middle|>", "<fim-middle>", "<fim_middle>", "<\uff5cfim\u2581end\uff5c>",
+                "<MID>", "\u2581<MID>", "<|code_middle|>", "<|middle|>", "<|plamo:fim_middle|>"},
+}  # fmt: skip
 # the markers of reply formats, which decode as text, whatever their type, so that a reply's
 # reasoning and calls are told apart, as llama.cpp keeps them for its parsers: gpt-oss's harmony
 # channels, as Muse Glimmer's messages have them too, and LFM2's calls. And harmony's ends of a
@@ -196,6 +206,15 @@ class Tokenizer:
                 eog.discard(i)
             elif i in eog:
                 types[i] = CONTROL
+        # fill-in-the-middle's markers, if the vocab has all three: (prefix, suffix, middle)
+        marks = []
+        for kind, texts in _FIM.items():
+            if (mark := metadata.get(f"tokenizer.ggml.{kind}_token_id")) is None:
+                mark = next((i for i, t in enumerate(tokens) if t in texts), None)
+                if mark is not None:
+                    types[mark] = CONTROL
+            marks.append(mark)
+        self.fim = (marks[0], marks[1], marks[2]) if None not in marks else None
         # tokens that text spells out, all of them for SentencePiece as in llama.cpp
         hidden = () if self._scores is not None else (CONTROL, USER_DEFINED)
         self._vocab = {t: i for i, t in enumerate(tokens) if types[i] not in hidden}
