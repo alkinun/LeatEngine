@@ -183,11 +183,10 @@ cached in `usage.prompt_tokens_details.cached_tokens`, and `/metrics` counts the
 
 Size the store by the KV cache a token takes, about what `serve` says the slots' cache takes divided
 by their context: 128 KiB in f16 for Llama 3.1 8B, half that with `--cache-type q8_0`, so that 8
-sessions of 30,000 tokens take about 30 GiB. On an RTX 3090, 8 such sessions of 8,192 tokens over 4
-slots took their next turns' first tokens in 0.37 s on average from the store, against 2.10 s
-prefilling them again; keeping each cost about 0.25 s when its slot was taken. On an APU, as Strix
-Halo's, the GPU's memory and the host's are the same, so the store takes from what the models and
-their caches have.
+sessions of 30,000 tokens take about 30 GiB. Copying a prefix back takes far less than prefilling
+it; copying one to the store, as its slot is taken, takes several times as long as copying it back
+on a GPU of its own memory. On an APU, as Strix Halo's, the GPU's memory and the host's are the
+same, so the store takes from what the models and their caches have.
 
 ## Keys, state, and metrics
 

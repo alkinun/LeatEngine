@@ -50,8 +50,8 @@ layers at full size: `tests/heroes.py` lists, from each GGUF's header, the shape
 layer or two of gpt-oss 120B, of Qwen3 235B A22B at three low-bit quantizations, and of Qwen3.6 35B
 A3B, every expert included, and writes them with random weights. The kernels prefill and decode a
 prompt through each, against the reference ops on the CPU. They take up to 1.7 GB of disk each, and
-a minute on an RTX 3090 or ten on the emulated GPU, so they run only when selected; where `/tmp` is
-in memory, give `--basetemp` a directory on disk.
+minutes, the more on the emulated GPU, so they run only when selected; where `/tmp` is in memory,
+give `--basetemp` a directory on disk.
 
 ```bash
 DEV=NV uv run pytest -m hero --basetemp ~/.cache/leatengine-heroes
