@@ -166,8 +166,14 @@ class Vision:
         n, channels = int(pixels.shape[0]), 3
         mean, std = (Tensor(v).reshape(1, 1, channels) for v in (self.mean, self.std))
         x = ((pixels.float().reshape(n, -1, channels) / 255 - mean) / std).reshape(1, n, -1)
-        x = _linear(x, self.embed, False)
-        return x + self.w["v.patch_embd.bias"].dequant() if "v.patch_embd.bias" in self.w else x
+        return self._biased(_linear(x, self.embed, False), "v.patch_embd")
+
+    def _projected(self, x: Tensor, name: str, half: bool) -> Tensor:
+        # x projected by the weight of `name`, and its bias, if the file has one
+        return self._biased(_linear(x, self.w[f"{name}.weight"], half), name)
+
+    def _biased(self, x: Tensor, name: str) -> Tensor:
+        return x + self.w[f"{name}.bias"].dequant() if f"{name}.bias" in self.w else x
 
     def _encoder(
         self, x: Tensor, mask: Tensor, half: bool,
@@ -432,10 +438,6 @@ class Pixtral(Vision):
     def typical(self) -> int:
         return self.cells + math.isqrt(self.cells) - 1  # with a break ending each row but the last
 
-    def _projected(self, x: Tensor, name: str, half: bool) -> Tensor:
-        out = _linear(x, self.w[f"{name}.weight"], half)
-        return out + self.w[f"{name}.bias"].dequant() if f"{name}.bias" in self.w else out
-
 
 class Qwen3(Vision):
     """Qwen3.5's and Qwen3.6's, Qwen3-VL's merger: the image scaled, its aspect kept, to whole
@@ -471,9 +473,8 @@ class Qwen3(Vision):
         mask = valid.where(0.0, -math.inf).reshape(1, 1, 1, n)
         x = self._encoder(x, mask, half, lambda t: ops.rotary(t, cos, sin, True))
         x = x.reshape(1, n // k**2, -1)  # each cell's patches, which come together, joined
-        x = _linear(x, self.w["mm.0.weight"], half) + self.w["mm.0.bias"].dequant()
-        x = 0.5 * x * (1 + (x / math.sqrt(2)).erf())
-        return (_linear(x, self.w["mm.2.weight"], half) + self.w["mm.2.bias"].dequant())[0]
+        x = self._projected(x, "mm.0", half)
+        return self._projected(0.5 * x * (1 + (x / math.sqrt(2)).erf()), "mm.2", half)[0]
 
     def _image(self, picture: Picture.Image, key: int) -> Image:
         cell = self.patch * self.merge

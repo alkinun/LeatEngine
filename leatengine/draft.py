@@ -57,7 +57,11 @@ def load(path: str | Path, target: Transformer) -> Drafter:
     if arch == "gemma4-assistant":
         return Gemma4Assistant(gguf, target)
     if arch in QWEN35 and _mtp_layer(gguf.metadata, gguf.tensors):
-        if gguf.metadata[f"{arch}.embedding_length"] != target.config.dim:
+        # of the target's width and past its layers, as Qwen35Mtp takes it
+        c, m = target.config, gguf.metadata
+        if c.arch not in QWEN35 or m[f"{arch}.embedding_length"] != c.dim or (
+            _layers(m) != c.n_layers
+        ):  # fmt: skip
             raise ValueError(f"{Path(path).name}'s MTP layer is of another model")
         return Qwen35Mtp(gguf, target)
     if arch in QWEN35:

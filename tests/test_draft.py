@@ -235,9 +235,12 @@ def test_needs(tiny, tiny_assistant):
     assert own is None
 
 
-def test_drafter_needs_its_target(tiny_model, tiny_assistant):
+def test_drafter_needs_its_target(tiny, tiny_model, tiny_assistant):
     with pytest.raises(ValueError, match="drafts for no llama model"):
         Engine(tiny_model[0], max_context=CONTEXT, draft=tiny_assistant[0])
+    # a Qwen3.5 MTP layer of the same width, for a model of another kind
+    with pytest.raises(ValueError, match="tiny.gguf's MTP layer is of another model"):
+        Engine(tiny_model[0], max_context=CONTEXT, draft=tiny("qwen35")[0])
 
 
 @pytest.mark.usefixtures("reference_ops")
