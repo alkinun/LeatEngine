@@ -141,7 +141,9 @@ do with `store: false`. `input` is a string or a list of messages, `function_cal
 reasoning before the calls it made, as gpt-oss's template keeps it. `instructions`, function
 `tools`, `tool_choice`, `text.format` (as `response_format`), `reasoning.effort`,
 `max_output_tokens`, the sampling controls, and `stream` work as for chat completions; `include`
-and `truncation` are ignored. Other tools, such as web search, are refused.
+and `truncation` are ignored. Tools of other kinds, such as OpenAI's hosted web search or a
+`namespace` of tools, are left out, the model not offered them, so that clients that send them by
+default, as Codex CLI does, still work.
 
 A reply's output is a `reasoning` item of its reasoning's text, a `message` of its text, and a
 `function_call` per call. A reply cut off by `max_output_tokens` or the context is `incomplete`.

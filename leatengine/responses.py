@@ -3,8 +3,9 @@ its reply as a response's output items.
 
 A response keeps no state: no previous_response_id or conversation, so a client sends the whole
 conversation as input each time, its past output items too, as stateless clients do with store
-false. Function tools alone; reasoning comes as reasoning items of their text, which a client may
-send back for a model, as gpt-oss, whose template keeps a turn's reasoning with its calls.
+false. Function tools alone, those of other kinds left out; reasoning comes as reasoning items of
+their text, which a client may send back for a model, as gpt-oss, whose template keeps a turn's
+reasoning with its calls.
 """
 
 import uuid
@@ -76,14 +77,15 @@ def as_chat(body: Any) -> dict[str, Any]:
         messages.append(message)
     chat: dict[str, Any] = {"messages": messages}
     tools = body.get("tools") or []
-    if not isinstance(tools, list) or not all(
-        isinstance(t, dict) and t.get("type") == "function" for t in tools
-    ):
-        raise ValueError("tools must be a list of function tools: other kinds are not supported")
-    if tools:
+    if not isinstance(tools, list) or not all(isinstance(t, dict) for t in tools):
+        raise ValueError("tools must be a list of tools")
+    # function tools alone: those of other kinds, as OpenAI's hosted web search, which no server
+    # but OpenAI's runs, or a namespace of tools, as Codex groups its sub-agents' in, are left
+    # out, so that a client that sends them by default still works, the model not offered them
+    if functions := [t for t in tools if t.get("type") == "function"]:
         keys = ("name", "description", "parameters")
         chat["tools"] = [{"type": "function", "function": {k: t[k] for k in keys if k in t}}
-                         for t in tools]  # fmt: skip
+                         for t in functions]  # fmt: skip
     if (form := (body.get("text") or {}).get("format")) is not None:
         if not isinstance(form, dict):
             raise ValueError("text.format must be an object")

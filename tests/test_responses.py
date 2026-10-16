@@ -67,11 +67,12 @@ def test_reasoning_of_its_turn():
 
 
 def test_options():
-    # function tools as chat tools, a text format as a response format, an effort, and the
-    # options both APIs share
+    # function tools as chat tools, others, as web search, left out; a text format as a response
+    # format, an effort, and the options both APIs share
     schema = {"type": "object"}
     chat = as_chat({
-        "input": "Hi", "tools": [WEATHER], "tool_choice": "none", "temperature": 0.2,
+        "input": "Hi", "tools": [WEATHER, {"type": "web_search"}], "tool_choice": "none",
+        "temperature": 0.2,
         "text": {"format": {"type": "json_schema", "name": "x", "schema": schema, "strict": True}},
         "reasoning": {"effort": "low"}, "stream": True, "store": False, "include": [],
     })  # fmt: skip
@@ -96,7 +97,7 @@ def test_options():
     ({"input": [{"type": "item_reference", "id": "x"}]}, "items of type 'item_reference' are not"),
     ({"input": [{"role": "tool", "content": "x"}]}, "an input message's role is user, system,"),
     ({"input": [{"role": "user", "content": [{"type": "input_file"}]}]}, "'input_file' are not"),
-    ({"input": "x", "tools": [{"type": "web_search"}]}, "tools must be a list of function tools"),
+    ({"input": "x", "tools": {"type": "web_search"}}, "tools must be a list of tools"),
     ({"input": "x", "instructions": 1}, "instructions must be a string"),
     ({"input": "x", "text": "json"}, "text must be an object"),
     ({"input": "x", "reasoning": "high"}, "reasoning must be an object"),
