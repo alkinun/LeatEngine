@@ -839,6 +839,50 @@ def test_constrained_kernels(tiny_model):
     check_constrained(Engine(tiny_model[0], max_context=CONTEXT, prefill_chunk=8))
 
 
+def check_logprobs(engine: Engine, weights: dict, tolerance: float) -> None:
+    # each token's log-probability and the likeliest tokens', of the reference's logits as they
+    # are, of two sequences beside each other: one sampled, held to JSON, keeping 5 of the
+    # likeliest, the first of the prompt's last chunk; one greedy keeping none
+    many = engine.start(
+        PROMPT, 6, Sampling(1.0, top_k=3), seed=3, constraint=engine.constrain(Grammar(None)),
+        logprobs=5,
+    )  # fmt: skip
+    engine.step()
+    none = engine.start(PROMPT[::-1], 6, logprobs=0)
+    while engine.active:
+        engine.step()
+    for s, prompt in ((many, PROMPT), (none, PROMPT[::-1])):
+        start = len(prompt) - 1
+        logits = reference_logits(weights, prompt + s.tokens)[start : start + len(s.tokens)]
+        shifted = logits - logits.max(-1, keepdims=True)
+        expected = shifted - np.log(np.exp(shifted).sum(-1, keepdims=True))
+        assert len(s.scores) == len(s.tokens) == 6
+        for row, token, (chosen, likeliest) in zip(expected, s.tokens, s.scores, strict=True):
+            assert chosen == pytest.approx(row[token], abs=tolerance)
+            ids, values = [i for i, _ in likeliest], [v for _, v in likeliest]
+            assert len(ids) == s.logprobs and values == sorted(values, reverse=True)
+            assert values == pytest.approx(row[ids].tolist(), abs=tolerance)
+            assert values == pytest.approx(np.sort(row)[::-1][: s.logprobs].tolist(), abs=tolerance)
+
+
+@pytest.mark.usefixtures("reference_ops")
+def test_logprobs(tiny_model):
+    path, weights = tiny_model
+    check_logprobs(Engine(path, max_context=CONTEXT, prefill_chunk=8, slots=2), weights, 1e-3)
+
+
+@pytest.mark.gpu
+def test_logprobs_kernels(tiny_model):
+    path, weights = tiny_model
+    check_logprobs(Engine(path, max_context=CONTEXT, prefill_chunk=8, slots=2), weights, 0.05)
+
+
+def test_logprobs_of_twenty_at_most(tiny_model):
+    engine = Engine(tiny_model[0], max_context=CONTEXT)
+    with pytest.raises(ValueError, match="logprobs is of 0 to 20 tokens, not 21"):
+        engine.start(PROMPT, 1, logprobs=21)
+
+
 # ******** several sequences at once ********
 
 

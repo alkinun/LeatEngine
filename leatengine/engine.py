@@ -3,6 +3,7 @@
 import array
 import functools
 import itertools
+import math
 import random
 from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass, field
@@ -12,7 +13,7 @@ from typing import Any, cast
 from tinygrad import Device, Tensor, TinyJit, UOp, dtypes
 from tinygrad.device import Buffer
 
-from leatengine import machine
+from leatengine import machine, ops
 from leatengine.draft import Drafter, needs
 from leatengine.draft import load as load_drafter
 from leatengine.gguf import GGUF
@@ -51,6 +52,11 @@ SPECULATIVE_TOKENS = MATVEC_TOKENS
 RESERVE = 2 << 30
 # the most tokens of a default context where the device does not say how much memory it has
 UNKNOWN_CONTEXT = 4096
+# the most of the likeliest tokens a sequence keeps the log-probabilities of with each token's, as
+# OpenAI's top_logprobs
+TOP_LOGPROBS = 20
+# a token's log-probability, and the likeliest tokens', each (id, log-probability), likeliest first
+Scored = tuple[float, list[tuple[int, float]]]
 
 
 @dataclass(eq=False)
@@ -66,6 +72,10 @@ class Sequence:
     slot: int
     images: dict[int, Image] = field(default_factory=dict)
     constraint: Constraint | None = None  # what of the vocab it may take next, if held to less
+    # of how many of the likeliest tokens it keeps the log-probabilities with each token's, if it
+    # keeps any; and those it kept, of each token generated
+    logprobs: int | None = None
+    scores: list[Scored] = field(default_factory=list)
     tokens: list[int] = field(default_factory=list)  # generated so far, the last not yet run
     done: bool = False  # generated all it will, or cancelled
     # its sampling options and seed for the graphs, as (1, 5) and (1,) tensors
@@ -212,6 +222,9 @@ class Engine:
         self._chunk, self._few_chunk = graph(self._step), graph(self._step)
         self._embedding, self._few_embedding = graph(self._embedded), graph(self._embedded)
         self._decode = {n: graph(functools.partial(self._step, decode=True)) for n in self._batches}
+        # of n rows of a step's logits, the log-probabilities of their tokens and of the top
+        # likeliest, each graph made as a sequence first asks for them
+        self._scoring: dict[tuple[int, int], graph[Tensor]] = {}
         self._copy = graph(self._copy_slot)
         if self.drafter is not None:
             # each slot's normed hidden state that gave its last token, from which drafts go on;
@@ -265,6 +278,7 @@ class Engine:
         images: Iterable[Image] = (),
         owner: str = "",
         constraint: Constraint | None = None,
+        logprobs: int | None = None,
     ) -> Generator[int, None, None]:
         """Yields up to `max_tokens` ids; stops early at end of generation or the context limit.
 
@@ -275,7 +289,7 @@ class Engine:
         if self.active:
             raise RuntimeError("another generation is unfinished: exhaust or close it first")
         sequence = self.start(
-            prompt, max_tokens, sampling, seed, ignore_eog, images, owner, constraint
+            prompt, max_tokens, sampling, seed, ignore_eog, images, owner, constraint, logprobs
         )
         try:
             while not sequence.done:
@@ -294,13 +308,19 @@ class Engine:
         images: Iterable[Image] = (),
         owner: str = "",
         constraint: Constraint | None = None,
+        logprobs: int | None = None,
     ) -> Sequence:
         """Starts a generation in a free slot, as generate() would; step() advances it. The
         prompt shows each of `images` with its tokens, and shares cached tokens only of prompts
         of the same `owner`. A `constraint` holds each token it draws to those it allows, as
-        constrain() makes one; such a sequence never decodes speculatively."""
+        constrain() makes one. Given `logprobs`, the sequence keeps in `scores`, with each token
+        it draws, the token's log-probability, of the model's distribution as its logits give
+        it, before any sampling option or constraint, and the `logprobs` likeliest tokens', up to
+        TOP_LOGPROBS. Either kind of sequence never decodes speculatively."""
         if not self.config.causal:
             raise ValueError("an encoder, whose tokens see each other, only embeds")
+        if logprobs is not None and not 0 <= logprobs <= TOP_LOGPROBS:
+            raise ValueError(f"logprobs is of 0 to {TOP_LOGPROBS} tokens, not {logprobs}")
         if max_tokens < 1:
             raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
         if not 0 < len(prompt) < self.max_context:
@@ -315,7 +335,9 @@ class Engine:
             raise RuntimeError(f"all {self.slots} slots are generating")
         seed = random.getrandbits(32) if seed is None else seed % 2**32
         slot = self._claim(prompt, owner)
-        sequence = Sequence(prompt, max_tokens, sampling, seed, ignore_eog, slot, shown, constraint)
+        sequence = Sequence(
+            prompt, max_tokens, sampling, seed, ignore_eog, slot, shown, constraint, logprobs
+        )
         self.active.append(sequence)
         self._mask(sequence)
         return sequence
@@ -552,11 +574,14 @@ class Engine:
         if self._recurrent and len(cached) == mark:
             self._keep(self._slot_vars[0].bind(sequence.slot))
             self._kept[sequence.slot] = list(cached)
-        return int(token.item()) if len(cached) == len(sequence.prompt) else None
+        if len(cached) < len(sequence.prompt):
+            return None
+        self._score([sequence], 1, *token)
+        return int(token[0].item())
 
     def _prefill_image(
         self, image: Image, options: tuple[Tensor, Tensor], row: tuple[UOp, UOp], start: int
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         # runs an image's embeddings in the image chunk's graph, its positions' tokens the one
         # that fills an image, which a drafter takes in; of M-RoPE, each embedding at its time,
         # the image's RoPE position `start`, and that plus its row and column
@@ -623,8 +648,9 @@ class Engine:
         for i, (slot, pos) in enumerate(rows + padding):
             bound += [self._slot_vars[i].bind(slot), self._pos_vars[i].bind(pos)]
         live = self._live.bind(k) if self._live is not None and n in self._padded else None
-        out = self._decode[n](tokens, *options, *bound, live=live)
+        out, logits = self._decode[n](tokens, *options, *bound, live=live)
         self._last[n] = _Batch(list(sequences), out.reshape(1, n), options)
+        self._score(sequences, n, out, logits)
         for s in sequences:
             self._wrote(s.slot, len(self._cached[s.slot]) + 1)
             self._cached[s.slot].append(s.tokens[-1])
@@ -641,7 +667,7 @@ class Engine:
             return room and sequence.max_tokens - len(sequence.tokens) > 1
 
         few = len(sequences) in self._speculated
-        free = all(s.constraint is None for s in sequences)
+        free = all(s.constraint is None and s.logprobs is None for s in sequences)
         return self.drafter is not None and few and free and all(map(each, sequences))
 
     def _speculative(self, sequences: list[Sequence]) -> list[tuple[Sequence, int]]:
@@ -756,6 +782,21 @@ class Engine:
             self.drafter.copy(source, slot)
             self._hidden[slot : slot + 1].assign(self._hidden[source : source + 1]).realize()
 
+    def _score(self, sequences: list[Sequence], n: int, tokens: Tensor, logits: Tensor) -> None:
+        # of the sequences of a step of n rows, each its row's, those that keep log-probabilities
+        # keep their tokens' and the likeliest tokens'
+        if all(s.logprobs is None for s in sequences):
+            return
+        top = TOP_LOGPROBS if any(s.logprobs for s in sequences) else 0
+        if (key := (n, top)) not in self._scoring:
+            self._scoring[key] = graph(functools.partial(_scores, top=top))
+        rows = cast(list[list[float]], self._scoring[key](logits, tokens).tolist())
+        for s, row in zip(sequences, rows, strict=False):
+            if s.logprobs is not None:
+                ids, values = row[1 + top : 1 + top + s.logprobs], row[1 : 1 + s.logprobs]
+                likeliest = zip(ids, values, strict=True)
+                s.scores.append((row[0], [(int(i), v) for i, v in likeliest]))
+
     def _mask(self, sequence: Sequence) -> None:
         # the tokens a sequence may take next, into its slot's mask where they changed: all, or
         # those its constraint allows
@@ -784,11 +825,12 @@ class Engine:
     def _step(
         self, tokens: Tensor, options: Tensor, seed: Tensor, *rows: UOp, live: UOp | None = None,
         decode: bool = False, image: Tensor | None = None, positions: Tensor | None = None,
-    ) -> Tensor:  # fmt: skip
+    ) -> tuple[Tensor, Tensor]:  # fmt: skip
         # rows: the slot and start position of each span, in turn. A single span takes every
         # token, as a chunk of prompt or a decode step of one, or an image's embeddings in place
         # of its tokens; several take one each, as a decode step does, the first `live` of them
-        # its sequences' if given, the rest padding.
+        # its sequences' if given, the rest padding. The tokens sampled, and the logits they were
+        # sampled of, as _score() reads them.
         pairs = list(zip(rows[::2], rows[1::2], strict=True))
         slots = [slot for slot, _ in pairs]
         seen = self._generated(tokens, slots, decode)
@@ -804,13 +846,15 @@ class Engine:
             hidden = self._followed(tokens, hidden, spans, positions)
             logits = self.model.logits(hidden[:, -1, :])
             allowed = self._allowed[slot : slot + 1]
-            return sample(logits, options, seed, start + length, seen, allowed).realize()
+            drawn = sample(logits, options, seed, start + length, seen, allowed)
+            return drawn.realize(logits), logits
         spans = [Span(slot, start) for slot, start in pairs]
         hidden = self._followed(tokens, self.model.run(tokens, spans, live), spans)
         logits = self.model.logits(hidden).reshape(len(pairs), -1)
         positions = Tensor.stack(*(Tensor(start + 1) for _, start in pairs))
         allowed = Tensor.cat(*(self._allowed[slot : slot + 1] for slot in slots))
-        return sample(logits, options, seed, positions, seen, allowed).realize()
+        drawn = sample(logits, options, seed, positions, seen, allowed)
+        return drawn.realize(logits), logits
 
     def _embedded(self, tokens: Tensor, slot: UOp, start: UOp) -> Tensor:
         # runs a chunk of a prompt to embed, causally or as an encoder's: its tokens pooled
@@ -852,6 +896,21 @@ class Engine:
             *(self._seen[s : s + 1].assign(seen[i : i + 1]) for i, s in enumerate(slots))
         )
         return seen
+
+
+def _scores(logits: Tensor, tokens: Tensor, top: int) -> Tensor:
+    # of each row of logits (n, V) and its token (n, 1): the token's log-probability, then the
+    # `top` likeliest tokens', likeliest first, then their ids, exact as float32 below 2^24:
+    # (n, 1 + 2 * top). The likeliest one at a time, as tinygrad's topk sorts the whole row, ten
+    # times slower for Llama 3.1 8B's vocab on the 3090.
+    scores = logits.float().log_softmax(-1)
+    values, ids = [scores.gather(-1, tokens.reshape(-1, 1).cast(dtypes.int32))], []
+    index = Tensor.arange(int(scores.shape[-1]), dtype=dtypes.int32).reshape(1, -1)
+    for _ in range(top):
+        ids.append(best := ops.argmax(scores))
+        values.append(scores.gather(-1, best))
+        scores = (index == best).where(-math.inf, scores)
+    return Tensor.cat(*values, *(i.cast(dtypes.float32) for i in ids), dim=1).realize()
 
 
 class graph[T]:

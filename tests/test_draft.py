@@ -164,6 +164,9 @@ def test_constrained_never_speculates(tiny, tiny_assistant):
     engine._speculative = counted  # type: ignore[method-assign]
     held = list(engine.generate(PROMPT, 12, constraint=engine.constrain(Grammar(None))))
     assert held == expected and steps == 0
+    # nor does one keeping log-probabilities, which the drafts' steps do not give
+    assert list(engine.generate(PROMPT, 12, logprobs=0)) == list(plain.generate(PROMPT, 12))
+    assert steps == 0
 
 
 def wrong(tokens: list[int]) -> list[int]:
