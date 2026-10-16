@@ -299,3 +299,18 @@ def test_calls():
     assert tokens.allowed(qwen, qwen.feed(qwen.start, b"<tool_call>")) is None
     mask = tokens.allowed(qwen, qwen.start)
     assert mask is not None and mask >> VOCAB.index(b"<tool_call>") & 1
+
+
+def test_required_calls():
+    # a grammar of no answer, as of a reply that must call: a call alone, of JSON where the vocab
+    # has no marker of one, else after its marker, after reasoning as before
+    llama = Matcher(Grammar(PERSON, ["weather"], answer=False))
+    assert takes(llama, '{"name": "weather", "parameters": {"city": "Paris"}}')
+    assert not takes(llama, '{"name": "Ada", "age": 36, "height": 1.65, "role": "admin", '
+                            '"nick": null, "pets": []}')  # fmt: skip
+    qwen = Matcher(Grammar(None, ["weather"], answer=False), ("<think>", "</think>"),
+                   ["<tool_call>"])  # fmt: skip
+    call = '<tool_call>\n{"name": "weather", "arguments": {"city": "Paris"}}\n</tool_call>'
+    assert takes(qwen, call) and takes(qwen, "<think>hm</think>\n\n" + call)
+    assert not takes(qwen, '{"name": "weather", "arguments": {"city": "Paris"}}')
+    assert not takes(qwen, "<think>hm</think>\n\n{}")

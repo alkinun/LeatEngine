@@ -54,9 +54,9 @@ placeholder when authentication is disabled). The client library is not a runtim
 
 Supported controls include `messages`, `stream`, `stream_options.include_usage`, `max_tokens`
 or `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`,
-`frequency_penalty`, `repetition_penalty`, `logit_bias`, `seed`, `stop`, `tools`, `tool_choice`
-(`auto` or `none`), `response_format`, `logprobs`, and `top_logprobs`. Templates determine which
-message roles and tool formats a model understands.
+`frequency_penalty`, `repetition_penalty`, `logit_bias`, `seed`, `stop`, `tools`, `tool_choice`,
+`response_format`, `logprobs`, and `top_logprobs`. Templates determine which message roles and
+tool formats a model understands.
 
 - Penalties lower text tokens alone, never a format's markup, such as `<tool_call>`, which a
   reply must repeat. `repetition_penalty`, as vLLM's and Hugging Face's, divides a positive logit
@@ -75,6 +75,13 @@ message roles and tool formats a model understands.
   gpt-oss's harmony messages, and Muse Glimmer's ATEM messages. Arguments written as text are
   typed by the tool's JSON schema. A reply cut off by `max_tokens` or the context keeps
   `finish_reason: "length"` even when it holds complete calls, as a later call may be missing.
+- `tool_choice` is `auto`, `none`, `required`, or a function to call, as
+  `{"type": "function", "function": {"name": "weather"}}`, of which the template is then told
+  alone. A reply of `required` or of a function begins with a call, after any reasoning: the
+  marker of a call of the model's format, as Qwen's `<tool_call>`, then the call as the model
+  writes it, or where its vocab has no such marker, a JSON call as Llama 3's, of a tool's name.
+  gpt-oss's and Muse Glimmer's calls come in their formats' channels, which no reply is held to:
+  of them, `required` and a function are refused.
 - `response_format` of type `json_object` holds the reply's answer to a JSON object, and of
   type `json_schema` to its schema's JSON, `strict` or not: only tokens that can continue it are
   sampled, and the reply ends, `finish_reason: "stop"`, once the JSON is whole. Schemas may use

@@ -94,6 +94,9 @@ def as_chat(body: Any) -> dict[str, Any]:
             chat["response_format"] = {"type": "json_schema", "json_schema": schema}
         else:
             chat["response_format"] = {"type": form.get("type")}
+    if isinstance(choice := body.get("tool_choice"), dict) and "name" in choice:
+        # a function named, {"type": "function", "name": ...}, as chat completions name it
+        chat["tool_choice"] = {"type": "function", "function": {"name": choice["name"]}}
     if (effort := (body.get("reasoning") or {}).get("effort")) is not None:
         chat["reasoning_effort"] = effort
     if body.get("max_output_tokens") is not None:
@@ -101,7 +104,7 @@ def as_chat(body: Any) -> dict[str, Any]:
     shared = ("tool_choice", "temperature", "top_p", "top_k", "min_p", "presence_penalty",
               "frequency_penalty", "repetition_penalty", "seed", "stop", "stream", "user",
               "safety_identifier", "service_tier", "chat_template_kwargs")  # fmt: skip
-    return chat | {k: body[k] for k in shared if body.get(k) is not None}
+    return {k: body[k] for k in shared if body.get(k) is not None} | chat
 
 
 def _content(content: Any) -> str | list[dict[str, Any]]:

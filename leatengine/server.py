@@ -1252,17 +1252,27 @@ def _valid(body: Any, kind: str, needs: str) -> None:
 def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completion:
     # what a request body asks for of the `loaded` model, or a ValueError saying what is wrong
     _valid(body, "chat completion", "messages")
-    if (choice := body.get("tool_choice") or "auto") not in ("auto", "none"):
-        raise ValueError(f"tool_choice={choice!r} is not supported, only 'auto' and 'none'")
+    choice, named = body.get("tool_choice") or "auto", _named(body.get("tool_choice"))
+    if choice not in ("auto", "none", "required") and named is None:
+        raise ValueError(f"tool_choice={choice!r} is not supported: it is 'auto', 'none', "
+                         "'required' or a function to call")  # fmt: skip
     if loaded is None:
         raise _Unloaded("no model is loaded")
     # tool_choice "none" as OpenAI's API has it: the tools still declared, so that the prompt is
     # as of "auto", which the cache may hold, and the reply opened as an answer, as harmony's
-    # final channel opens it, of a format that marks one; else the tools left out
+    # final channel opens it, of a format that marks one; else the tools left out. Of a function
+    # named, its tool alone is declared, and a reply of "required" or of one must call
     declared, opened = body.get("tools") or None, ""
+    if named is not None:
+        declared = [t for t in declared or [] if t["function"]["name"] == named] or None
+        if declared is None:
+            raise ValueError(f"tool_choice names {named!r}, which is none of the tools")
+    if choice == "required" and not declared:
+        raise ValueError("tool_choice='required' needs tools to call")
     if choice == "none" and declared and not (opened := loaded.chat.answer):
         declared = None
-    tools = declared if choice == "auto" else None
+    tools = declared if choice != "none" else None
+    required = choice == "required" or named is not None
     # the reasoning effort, as the template is told it, and options for the template too, such as
     # Qwen3's enable_thinking, as llama.cpp and vLLM take, which a client gives over the effort
     effort = loaded.chat.effort(body["reasoning_effort"]) if body.get("reasoning_effort") else {}
@@ -1281,7 +1291,7 @@ def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completio
         raise ValueError("logprobs of a chat completion must be true or false")
     if body.get("top_logprobs") and not body.get("logprobs"):
         raise ValueError("top_logprobs needs logprobs to be true")
-    grammar, preamble = _format(body.get("response_format"), loaded, text, tools)
+    grammar, preamble = _format(body.get("response_format"), loaded, text, tools, required)
     return _Completion(
         prompt,
         loaded.name,
@@ -1433,32 +1443,49 @@ def _chat_scores(scores: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _format(
-    asked: dict[str, Any] | None, loaded: _Loaded, text: str, tools: list[dict] | None
+    asked: dict[str, Any] | None, loaded: _Loaded, text: str, tools: list[dict] | None,
+    required: bool = False,
 ) -> tuple[tuple[Grammar, dict, tuple[str, ...]] | None, tuple[str, str] | str | None]:  # fmt: skip
     # the JSON a response format holds a reply's answer to, compiled, with the masks it shares and
     # the markers of calls, of the loaded model's, and what goes before its answer; none for
     # text. Of tools it may call, a call may take the JSON's place: of JSON, as Llama 3's, or
-    # after a marker of the model's vocab, as Qwen's <tool_call>
-    if asked is None or asked["type"] == "text":
+    # after a marker of the model's vocab, as Qwen's <tool_call>. Of a call `required`, the call
+    # alone, of a model whose calls a grammar can begin: not harmony's or ATEM's, whose come in
+    # their channels
+    if not required and (asked is None or asked["type"] == "text"):
         return None, None
-    schema = asked["json_schema"]["schema"] if asked["type"] == "json_schema" else None
+    if required and loaded.chat.form in ("harmony", "atem"):
+        raise ValueError(f"{loaded.name} calls tools in its format's channels, which no reply is "
+                         "held to: tool_choice must be 'auto' or 'none'")  # fmt: skip
+    schema = None
+    if asked is not None and asked["type"] == "json_schema":
+        schema = asked["json_schema"]["schema"]
     preamble = loaded.chat.preamble(text)
     names = [t["function"]["name"] for t in tools or []]
     tok = loaded.engine.tokenizer
     markers = tuple(m for m in CALL_MARKERS if names and len(tok.encode(m, False, True)) == 1)
     # of its keys in order, as properties come in order
-    key = json.dumps([schema, preamble, names, markers])
+    key = json.dumps([schema, preamble, names, markers, required])
     with loaded.formats_lock:
         if (found := loaded.formats.get(key)) is not None:
             loaded.formats.move_to_end(key)
             return found, preamble
-    found = Grammar(schema, names), {}, markers
+    found = Grammar(schema, names, answer=not required), {}, markers
     with loaded.formats_lock:
         found = loaded.formats.setdefault(key, found)
         loaded.formats.move_to_end(key)
         while len(loaded.formats) > _GRAMMARS:
             loaded.formats.popitem(last=False)
     return found, preamble
+
+
+def _named(choice: Any) -> str | None:
+    # the function a tool_choice names, as chat completions' {"type": "function", "function":
+    # {"name": ...}} has it, if it names one
+    if isinstance(choice, dict) and choice.get("type") == "function":
+        name = (choice.get("function") or {}).get("name")
+        return name if isinstance(name, str) else None
+    return None
 
 
 class _Unloaded(ValueError):

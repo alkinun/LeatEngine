@@ -86,6 +86,11 @@ def test_options():
     }  # fmt: skip
     assert as_chat({"input": "Hi", "text": {"format": {"type": "json_object"}}})[
         "response_format"] == {"type": "json_object"}  # fmt: skip
+    # a function named, as the Responses API names it, as chat completions do
+    named = as_chat(
+        {"input": "Hi", "tools": [WEATHER], "tool_choice": {"type": "function", "name": "weather"}}
+    )
+    assert named["tool_choice"] == {"type": "function", "function": {"name": "weather"}}
 
 
 @pytest.mark.parametrize("body, error", [

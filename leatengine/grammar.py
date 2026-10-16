@@ -14,7 +14,8 @@ none, a space, or a newline and up to 20 spaces or tabs, so that a reply cannot 
 Before the JSON, a reply may reason, in a block of its format's markers, as Qwen3's <think>, or
 until the marker that opens its answer, as harmony's final channel. Of a request with tools, the
 reply may call one instead: a JSON object of a tool's name and its arguments, as Llama 3 calls,
-or anything after the marker of a call, as Qwen's <tool_call>.
+or anything after the marker of a call, as Qwen's <tool_call>; and of a request that requires a
+call, it must.
 
 Tokens says which tokens a state allows: of each first byte the state takes, those whose bytes it
 takes, walking the vocab's tokens sorted by their bytes; inside a string, the tokens of string bytes
@@ -75,9 +76,13 @@ class Node:
 class Grammar:
     """A schema compiled: its nodes, and its root, the first, or of `calls`, the names of tools a
     reply may call instead, an anyOf of it and a call: an object of a tool's "name" and its
-    "parameters", as Llama 3's template asks, or "arguments"."""
+    "parameters", as Llama 3's template asks, or "arguments"; of no `answer`, a call alone, as
+    of a reply that must call one."""
 
-    def __init__(self, schema: dict[str, Any] | None, calls: Iterable[str] = ()):
+    def __init__(
+        self, schema: dict[str, Any] | None, calls: Iterable[str] = (), answer: bool = True
+    ):  # fmt: skip
+        self.answer = answer
         # of no schema, any object, as OpenAI's json_object has a reply be
         self.nodes: list[Node] = []
         self._refs: dict[str, int] = {}
@@ -101,7 +106,7 @@ class Grammar:
                 self._add(Node("object", properties=(("name", name, True), (key, arguments, True))))
                 for key in ("parameters", "arguments")
             ]
-            self.root = self._add(Node("anyOf", options=(0, *made)))
+            self.root = self._add(Node("anyOf", options=(0, *made) if answer else tuple(made)))
 
     def _ending(self) -> set[int]:
         # the nodes of which a value can end: of an object, all its required properties'; of an
@@ -314,10 +319,12 @@ class Matcher:
         markers: Iterable[str] = (),
     ):  # fmt: skip
         # preamble: an optional block of reasoning, (opens, closes), before the JSON; or text up
-        # to the marker that opens the answer; or none. markers: those of a call in its place
+        # to the marker that opens the answer; or none. markers: those of a call in its place,
+        # which of a grammar of no answer the reply must begin, where the vocab has them
         self.grammar = grammar
-        heads: list[Stack] = [(("value", grammar.root, -1),)]
-        heads += [(("call", m.encode(), 0, -1),) for m in markers]
+        heads: list[Stack] = [(("call", m.encode(), 0, -1),) for m in markers]
+        if grammar.answer or not heads:
+            heads.insert(0, (("value", grammar.root, -1),))
         if isinstance(preamble, str):
             self.start: State = frozenset({(*h, ("until", preamble.encode(), 0)) for h in heads})
         elif preamble is not None:

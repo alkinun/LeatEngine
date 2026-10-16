@@ -605,7 +605,7 @@ def test_response_formats_compiled_once(client, server, monkeypatch):
     compiled = []
     monkeypatch.setattr(server_module, "_GRAMMARS", 2)
     monkeypatch.setattr(
-        server_module, "Grammar", lambda s, calls: compiled.append(s) or Grammar(s, calls)
+        server_module, "Grammar", lambda s, calls, **o: compiled.append(s) or Grammar(s, calls, **o)
     )
     for t in ("integer", "integer", "string", "boolean", "string", "integer"):
         schema = {"type": "object", "properties": {"v": {"type": t}}}
@@ -847,6 +847,27 @@ def test_atem_tool_call(client, replies_with, monkeypatch, stream):
     assert json.loads(call.function.arguments) == {"city": "Paris"}
 
 
+def test_tool_choice_required(client, server, monkeypatch):
+    # sampled replies of the tiny model, its vocab without a call's marker, each a call of JSON, as
+    # Llama 3's, or one cut short; of a function named, of it, its tool alone declared. Not of
+    # harmony, whose calls come in its channels.
+    time = {"type": "function", "function": {"name": "time", "parameters": {"type": "object"}}}
+    called = set()
+    for seed in range(6):
+        for choice in ("required", {"type": "function", "function": {"name": "time"}}):
+            reply = chat(client, "hello", max_tokens=40, temperature=1, seed=seed,
+                         tools=[WEATHER, time], tool_choice=choice).choices[0]  # fmt: skip
+            assert reply.finish_reason in ("tool_calls", "length")
+            if reply.finish_reason == "tool_calls":
+                names = {call.function.name for call in reply.message.tool_calls}
+                assert names <= ({"time"} if isinstance(choice, dict) else {"weather", "time"})
+                called |= names
+    assert called
+    monkeypatch.setattr(ChatTemplate, "form", property(lambda self: "harmony"))
+    with pytest.raises(openai.BadRequestError, match="calls tools in its format's channels"):
+        chat(client, "hello", tools=[WEATHER], tool_choice="required")
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_tool_choice_none(client, server, replies_with, monkeypatch, stream):
     # tool_choice "none" as OpenAI's API has it: of harmony, the tools still declared, so that the
@@ -900,7 +921,12 @@ def test_text_is_not_a_tool_call(client, replies_with, stream, text, choice):
         ({"max_tokens": 0}, "max_tokens must be a positive integer"),
         ({"stop": "x" * 257}, "stop must be a string or a list of 16 strings at most"),
         ({"stop": ["x"] * 17}, "stop must be a string or a list of 16 strings at most"),
-        ({"tools": [WEATHER], "tool_choice": "required"}, "tool_choice='required' is not"),
+        ({"tool_choice": "required"}, "tool_choice='required' needs tools to call"),
+        ({"tools": [WEATHER], "tool_choice": "any"}, "tool_choice='any' is not supported"),
+        (
+            {"tools": [WEATHER], "tool_choice": {"type": "function", "function": {"name": "news"}}},
+            "tool_choice names 'news', which is none of the tools",
+        ),
         ({"messages": []}, "messages must be a non-empty list of objects"),
         ({"messages": [{"role": "user", "content": "x" * CONTEXT}]}, "the prompt has 64 tokens"),
         ({"extra_body": {"chat_template_kwargs": "x"}}, "chat_template_kwargs must be an object"),
