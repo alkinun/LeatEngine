@@ -16,6 +16,7 @@ from leatengine.machine import Memory
 from leatengine.model import (
     CACHE_TILE,
     Config,
+    Rope,
     Transformer,
     _stack,
     cache_bytes,
@@ -263,6 +264,40 @@ def test_rope_scale(scaling, scale):
     # log multiplier, as llama.cpp, mscale(factor, 1) / mscale(factor, multiplier) instead
     cos, sin = rope_table(config("llama", scaling).ropes[0], 8, None)
     np.testing.assert_allclose(np.hypot(cos.numpy(), sin.numpy()), scale, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "rope, factors",
+    [
+        (Rope(1e6, 128), False),  # Qwen's
+        (Rope(500000.0, 128), True),  # Llama 3's, divided by its factors, as LongRoPE's are too
+        (Rope(150000.0, 64, scale=1 / 32, yarn=(4096, 32.0, 1.0)), False),  # gpt-oss's YaRN
+    ],
+)
+def test_rope_long_positions(rope, factors):
+    # cos and sin at positions to 131072 of each angle as llama.cpp and the models' trainers take
+    # it, pos * theta^(-2i/d) in f32, divided and scaled in f32 in its turn; worked out in f64,
+    # as tinygrad's f32 cos and sin are 7e-3 off there
+    length, d = 131072, rope.dims
+    rng = np.random.default_rng(d)
+    divide = rng.uniform(1, 8, d // 2).astype(np.float32) if factors else None
+    cos, sin = rope_table(rope, length, None if divide is None else Tensor(divide))
+    freqs = np.array([rope.theta ** (-2 * i / d) for i in range(d // 2)], dtype=np.float32)
+    angles = np.arange(length, dtype=np.float32)[:, None] * freqs
+    if divide is not None:
+        angles = angles / divide
+    mscale = 1.0
+    if rope.yarn is not None:
+        original, fast, slow = rope.yarn
+        span = (d * math.log(original / (beta * 2 * math.pi)) / (2 * math.log(rope.theta))
+                for beta in (fast, slow))  # fmt: skip
+        low, high = max(0.0, math.floor(next(span))), min(d - 1.0, math.ceil(next(span)))
+        ramp = 1 - np.clip((np.arange(d // 2) - low) / max(0.001, high - low), 0, 1)
+        angles = angles * (rope.scale * (1 - ramp) + ramp).astype(np.float32)
+        mscale = 1 + 0.1 * math.log(1 / rope.scale)
+    wide = angles.astype(np.float64)
+    np.testing.assert_allclose(cos.numpy(), np.cos(wide) * mscale, rtol=0, atol=1e-5)
+    np.testing.assert_allclose(sin.numpy(), np.sin(wide) * mscale, rtol=0, atol=1e-5)
 
 
 def test_stack_alpha_beta():

@@ -917,7 +917,9 @@ def _unfuse(layer: dict[str, QTensor], c: Config, i: int) -> None:
 def rope_table(rope: Rope, length: int, factors: Tensor | None) -> tuple[Tensor, Tensor]:
     # cos and sin (length, dims / 2) of angle = pos * theta^(-2i/d) / factor_i in f32, the order
     # llama.cpp's rope kernels use; scaled, and with YaRN's ramp from the scaled angle to the
-    # unscaled one, as ggml's rope_yarn
+    # unscaled one, as ggml's rope_yarn. Each f32 angle's cos and sin are worked out in f64, as
+    # accurately as the models' trainers' and llama.cpp's: tinygrad's in f32 lose up to 5e-4 past
+    # a few thousand radians, and fused with the angle's product 7e-3 at 131072 positions.
     d = rope.dims
     freqs = Tensor([rope.theta ** (-2 * i / d) for i in range(d // 2)])
     angles = Tensor.arange(length).float().unsqueeze(1) * freqs.unsqueeze(0)
@@ -938,7 +940,8 @@ def rope_table(rope: Rope, length: int, factors: Tensor | None) -> tuple[Tensor,
         mscale *= 1 + 0.1 * math.log(1 / rope.scale)
     elif rope.scale != 1:
         angles = angles * rope.scale
-    cos, sin = angles.cos(), angles.sin()
+    wide = angles.cast(dtypes.float64)
+    cos, sin = wide.cos().cast(dtypes.float32), wide.sin().cast(dtypes.float32)
     if mscale != 1:
         cos, sin = cos * mscale, sin * mscale
     return cos.contiguous().realize(), sin.contiguous().realize()
