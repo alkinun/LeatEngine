@@ -146,14 +146,7 @@ def _writer(path: Path, arch: str, specials: tuple[str, ...] = (), split: int = 
     w = gguf.GGUFWriter(path, arch=arch, split_max_tensors=split)
     w.add_uint32(f"{arch}.context_length", CONTEXT)
     w.add_float32(f"{arch}.attention.layer_norm_rms_epsilon", 1e-5)
-    w.add_string("tokenizer.ggml.model", "gpt2")
-    w.add_string("tokenizer.ggml.pre", "llama-bpe")
-    names = [f"t{i}" for i in range(V - 256 - len(specials))] + list(specials)
-    w.add_array("tokenizer.ggml.tokens", [*_BYTE_CHAR.values()] + names)
-    types = [NORMAL] * (V - len(specials)) + [CONTROL] * len(specials)
-    w.add_array("tokenizer.ggml.token_type", types)
-    w.add_array("tokenizer.ggml.merges", [])
-    w.add_chat_template("{{ prefix | default('') }}{{ messages[-1]['content'] }}")
+    add_vocab(w, specials)
     weights: dict[str, np.ndarray] = {}
 
     def add(name: str, shape: tuple[int, ...], ggml_type=GGMLType.F32, scale: float = 1.5) -> None:
@@ -170,6 +163,19 @@ def _writer(path: Path, arch: str, specials: tuple[str, ...] = (), split: int = 
         w.add_tensor(name, blocks, raw_dtype=gguf.GGMLQuantizationType(ggml_type))
 
     return w, weights, add
+
+
+def add_vocab(w: gguf.GGUFWriter, specials: tuple[str, ...] = ()) -> None:
+    # the tiny tokenizer, of V tokens, its last `specials` control tokens, and a chat template of
+    # the last message
+    w.add_string("tokenizer.ggml.model", "gpt2")
+    w.add_string("tokenizer.ggml.pre", "llama-bpe")
+    names = [f"t{i}" for i in range(V - 256 - len(specials))] + list(specials)
+    w.add_array("tokenizer.ggml.tokens", [*_BYTE_CHAR.values()] + names)
+    types = [NORMAL] * (V - len(specials)) + [CONTROL] * len(specials)
+    w.add_array("tokenizer.ggml.token_type", types)
+    w.add_array("tokenizer.ggml.merges", [])
+    w.add_chat_template("{{ prefix | default('') }}{{ messages[-1]['content'] }}")
 
 
 def _finish(w: gguf.GGUFWriter) -> None:
