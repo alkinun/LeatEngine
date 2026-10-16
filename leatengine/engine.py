@@ -90,7 +90,9 @@ class Engine:
     of SHARED_CHUNK tokens at most while others decode, and then decodes a token of every other
     sequence in one batch, which reads each weight once for all of them. On the reference ops a
     sequence generates as it would alone; the kernels for several tokens round differently from
-    those for one, so a batched sequence may take another token where two are close.
+    those for one, so a batched sequence may take another token where two are close. A sequence
+    holds `max_context` tokens at most, or if none is given the model's own context, as far as the
+    KV cache of the slots fits in the memory free beside the weights, as `fit` says.
 
     With a drafter, sequences decoding decode speculatively, presence_penalty too, as many at
     once as the drafter's `sequences`: it guesses each one's next tokens, DRAFT_TOKENS at most and
