@@ -160,7 +160,7 @@ def main() -> None:
                     text=True,
                     timeout=30,
                 )
-                assert "{run,serve,keys,bench,perplexity,doctor}" in done.stdout, done.stdout
+                assert "{pull,run,serve,keys,bench,perplexity,doctor}" in done.stdout, done.stdout
             # the machine's check runs from the installed package: on a machine without an AMD
             # GPU it reports what is missing, and exits 1, rather than failing to run
             done = subprocess.run([str(venv / "bin/leatengine"), "doctor", "--json"], cwd=work,
