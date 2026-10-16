@@ -91,7 +91,8 @@ leatengine serve /path/to/model.gguf --host 0.0.0.0 --keys
 
 The key is shown once. Clients send it as `Authorization: Bearer KEY`. The server provides HTTP;
 use an appropriate TLS proxy when encrypted transport is needed. See
-[API and configuration](docs/api.md).
+[API and configuration](docs/api.md), and for coding agents and agent frameworks,
+[Agents](docs/agents.md).
 
 ## Supported models
 
@@ -140,7 +141,7 @@ with an optional embedding model alongside it. There is no frontend or applicati
 
 ## Development
 
-[Development and tests](docs/development.md) · [API](docs/api.md) ·
+[Development and tests](docs/development.md) · [API](docs/api.md) · [Agents](docs/agents.md) ·
 [Benchmarks](docs/benchmarks.md) · [Strix Halo](docs/strix-halo.md)
 
 MIT licensed, copyright 2026 alkinun. Extracted with fresh history from
