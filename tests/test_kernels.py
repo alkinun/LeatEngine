@@ -679,7 +679,7 @@ def chunk_len(tokens: int) -> UOp:
 @pytest.mark.parametrize(
     "tokens, start", [(37, 0), (64, 0), (100, 300), (512, 3584), (5, 0), (16, 2000)]
 )
-# of heads of 256, as Qwen3.6's, a block takes one tile of queries
+# of heads of 256, as Qwen3.6's, blocks take half the warps
 @pytest.mark.parametrize(
     "heads, kv_heads, dim", [(32, 8, 128), (28, 4, 128), (32, 32, 96), (16, 2, 256)]
 )

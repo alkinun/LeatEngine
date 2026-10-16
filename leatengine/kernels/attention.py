@@ -329,8 +329,8 @@ def attention(
 QUERIES, KEY_TILE, PART = 16, 32, 256
 STACKED = 16  # warps a block of several tiles of queries holds at most, sharing its keys' tiles
 SPLIT_BLOCKS = 64  # blocks that split one tile of queries' keys aim for
-# the widest heads whose queries WMMA's warps hold in registers for the whole loop, and parts of
-# heads that blocks stack several tiles of queries of
+# the widest heads whose queries WMMA's warps hold in registers for the whole loop, and the
+# widest parts of heads whose blocks take STACKED warps
 HELD = 128
 
 # mma.sync on f16 with f32 accumulation: c (4 f32) + a 16 x 16 tile times a 16 x 8 tile, from the
@@ -672,14 +672,14 @@ def flash_attention(
     shape = _flash_shape(int(cache.shape[3]), int(dim))
     assert shape is not None, "flash_attention needs supports_flash_attention"
     # blocks of several tiles of queries, which share each tile of keys they read, as many as
-    # STACKED warps hold, and the queries need; but of parts wider than HELD, one tile: a warp's
-    # outputs alone take width / 2 registers a lane, and a block of STACKED warps' threads have
-    # 128 at most. Of Qwen3.6's heads of 256, 512 queries after 32768 positions took 50.6 ms on
-    # the 3090 in blocks of 2 tiles, spilling, and 7.4 in blocks of 1.
+    # STACKED warps hold, and the queries need; of parts wider than HELD, half as many warps: a
+    # warp's outputs alone take width / 2 registers a lane, and a block of STACKED warps' threads
+    # have 128 at most, of half, 255. Of Qwen3.6's heads of 256, 512 queries after 32768
+    # positions took 50.6 ms on the 3090 in blocks of 16 warps, spilling, and 7.4 in blocks of 8.
     group = int(heads) // int(cache.shape[2])
     tiles = -(-q.max_shape[2] // QUERIES)
     wide = int(dim) // shape[1] > HELD
-    stack = 1 if wide else max(min(STACKED // group, tiles), 1)
+    stack = max(min((STACKED // 2 if wide else STACKED) // group, tiles), 1)
     count = -(-tiles // stack) * stack * QUERIES
     # in the layout of the projection that made q, where scaling and rounding it is a plain copy
     q = (q.transpose(1, 2).reshape(tokens, heads, dim).float() * (LOG2E * scale)).half()
