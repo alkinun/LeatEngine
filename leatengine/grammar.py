@@ -321,8 +321,8 @@ class Matcher:
         # preamble: an optional block of reasoning, (opens, closes), before the JSON; or text up
         # to the marker that opens the answer; or none. markers: those of a call in its place,
         # which of a grammar of no answer the reply must begin, where the vocab has them
-        self.grammar = grammar
-        heads: list[Stack] = [(("call", m.encode(), 0, -1),) for m in markers]
+        self.grammar, self.markers = grammar, tuple(m.encode() for m in markers)
+        heads: list[Stack] = [(("call", m, 0, -1),) for m in self.markers]
         if grammar.answer or not heads:
             heads.insert(0, (("value", grammar.root, -1),))
         if isinstance(preamble, str):
@@ -344,6 +344,29 @@ class Matcher:
             if len(state) > STACKS:
                 state = frozenset(sorted(state, key=repr)[:STACKS])
         return state
+
+    def deciding(self, state: State) -> bool:
+        """Whether a reply may still begin either its answer or a call's marker, its reasoning
+        done, as its next token after whitespace decides."""
+        tops = {stack[-1][0] for stack in state}
+        calls = any(s[-1][0] == "call" and s[-1][2] == 0 for s in state)
+        return calls and "value" in tops
+
+    def calling(self, state: State) -> bool:
+        """Whether every way a state goes on is a call's, its answer let go."""
+        return bool(state) and all(s[-1][0] in ("call", "free") for s in state)
+
+    def answering(self, state: State) -> State:
+        """The state of a reply that answers rather than calls: without its ways of a call, its
+        value the schema's alone, no call of JSON in its place."""
+        root, answers = self.grammar.root, set()
+        for stack in state:
+            top = stack[-1]
+            if top[0] == "value" and top[1] == root:
+                answers.add((*stack[:-1], ("value", 0, top[2])))
+            elif top[0] not in ("call", "free"):
+                answers.add(stack)
+        return frozenset(answers)
 
     def done(self, state: State) -> bool:
         """Whether the reply may end here: its JSON whole, as a number may be at its end."""
@@ -663,6 +686,18 @@ class Constraint:
         """Takes in a token generated, of these bytes."""
         if token not in self.tokens.ends:
             self.state = self.matcher.feed(self.state, spelled)
+
+    def deciding(self) -> bool:
+        return self.matcher.deciding(self.state)
+
+    def calls(self, spelled: bytes) -> bool:
+        """Whether a token of these bytes, next, would begin a call and let the answer go, as a
+        call's marker does, whole or its first bytes."""
+        return self.matcher.calling(self.matcher.feed(self.state, spelled))
+
+    def answer(self) -> None:
+        """Holds the reply to its answer from here on, no call in its place."""
+        self.state = self.matcher.answering(self.state)
 
     def over(self) -> bool:
         """Whether the reply is whole and nothing but an end may follow it, which a model without

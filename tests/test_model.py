@@ -939,6 +939,32 @@ def test_frequency_counted_once_kernels(tiny_model):
     check_counted_once(Engine(tiny_model[0], max_context=CONTEXT, prefill_chunk=8, slots=2))
 
 
+@pytest.mark.usefixtures("reference_ops")
+def test_calls_only_where_the_model_would(tiny_model):
+    # a reply held to a format that may call a tool in its answer's place: a token that begins a
+    # call drawn where the model's likeliest token would too stays; drawn where it would not, the
+    # answer's likeliest token takes its place, and the call is let go. "ZY" is the marker here,
+    # begun by "Z".
+    path, _ = tiny_model
+    engine = Engine(path, max_context=CONTEXT, prefill_chunk=8)
+    marker, brace, prose = (engine.tokenizer._vocab[t] for t in ("Z", "{", "a"))
+    constraint = engine.constrain(Grammar(None, ["weather"]), markers=["ZY"])
+    sequence = engine.start(PROMPT, 4, constraint=constraint)
+    vocab = int(engine.model.output.shape[0])
+
+    def logits(*likeliest: int) -> Tensor:  # of these the likeliest, in turn
+        row = [0.0] * vocab
+        for i, t in enumerate(likeliest):
+            row[t] = 10.0 - i
+        return Tensor([row])
+
+    assert engine._decided(sequence, marker, logits(marker, brace), 0) == marker
+    assert constraint.deciding()
+    assert engine._decided(sequence, marker, logits(prose, marker, brace), 0) == brace
+    assert not constraint.deciding()
+    engine.cancel(sequence)
+
+
 def test_logit_bias(tiny_model):
     # a token biased up is all a greedy sequence takes, and its slot's next sequence, unbiased,
     # generates as it would have

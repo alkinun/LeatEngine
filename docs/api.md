@@ -93,7 +93,9 @@ tool formats a model understands.
   `tools` it may call, as agent SDKs ask for structured output, a reply may call one in place of
   the JSON: after the marker of a call of the model's format, as Qwen's `<tool_call>`, or as a
   JSON object of a tool's `name` and its `parameters` or `arguments`, as Llama 3 calls; harmony's
-  and ATEM's calls come before the answer, as they would.
+  and ATEM's calls come before the answer, as they would. A reply begins a call only where the
+  model's own likeliest token would, and else answers in the format, as it would have answered
+  without one, rather than call for want of the words it meant to answer in.
 - `logprobs: true` gives each token's log-probability, and `top_logprobs` those of up to 20 of
   the likeliest tokens, in `choices[].logprobs.content`, streamed with the chunks: of the model's
   distribution as its logits give it, before temperature, the other sampling controls and a

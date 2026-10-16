@@ -81,6 +81,12 @@ def sample(
     return ops.argmax((temperature > 0).where(drawn, logits))
 
 
+def likeliest(logits: Tensor, allowed: Tensor) -> Tensor:
+    """The likeliest token of each row of logits (B, V) of those `allowed` (B, V / 32) marks, as
+    sample() reads its words."""
+    return ops.argmax(_marked(allowed, int(logits.shape[-1])).where(logits, -math.inf))
+
+
 def _marked(words: Tensor, vocab: int) -> Tensor:
     # bits (B, V / 32) uint32, token t of word t // 32 by bit t % 32, as bools (B, vocab)
     bits = (words.unsqueeze(-1) >> Tensor.arange(32, dtype=dtypes.uint32)) & 1

@@ -314,3 +314,17 @@ def test_required_calls():
     assert takes(qwen, call) and takes(qwen, "<think>hm</think>\n\n" + call)
     assert not takes(qwen, '{"name": "weather", "arguments": {"city": "Paris"}}')
     assert not takes(qwen, "<think>hm</think>\n\n{}")
+
+
+def test_deciding_to_answer():
+    # a reply that may answer or call decides at its first token past reasoning and whitespace;
+    # held to its answer, the call is let go
+    qwen = Matcher(Grammar(PERSON, ["weather"]), ("<think>", "</think>"), ["<tool_call>"])
+    assert not qwen.deciding(qwen.feed(qwen.start, b"<think>hm"))
+    state = qwen.feed(qwen.start, b"<think>hm</think>\n\n")
+    assert qwen.deciding(state)
+    assert qwen.calling(qwen.feed(state, b"<")) and not qwen.calling(qwen.feed(state, b"{"))
+    answering = qwen.answering(state)
+    assert not qwen.deciding(answering) and not qwen.feed(answering, b"<tool_call>")
+    assert qwen.feed(answering, b'{"name": "Ada"')
+    assert not qwen.feed(answering, b'{"name": "weather", "arguments"')  # nor a call of JSON

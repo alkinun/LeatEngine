@@ -22,7 +22,7 @@ from leatengine.kernels import FEW_TOKENS, MATVEC_TOKENS, VARIABLES
 from leatengine.model import CACHE_TILE, Config, Transformer, cache_bytes, check, zeros
 from leatengine.ops import Span
 from leatengine.prefixes import Prefix, PrefixStore
-from leatengine.sampler import GREEDY, Sampling, sample
+from leatengine.sampler import GREEDY, Sampling, likeliest, sample
 from leatengine.tokenizer import Tokenizer
 from leatengine.vision import Image, Vision, blank
 from leatengine.vision import load as load_vision
@@ -730,8 +730,12 @@ class Engine:
             self._kept[sequence.slot] = list(cached)
         if len(cached) < len(sequence.prompt):
             return None
-        self._score([sequence], 1, *token)
-        return int(token[0].item())
+        drawn, logits = token
+        first = int(drawn.item())
+        if (decided := self._decided(sequence, first, logits, 0)) != first:
+            drawn = Tensor([decided], dtype=dtypes.int32)
+        self._score([sequence], 1, drawn, logits)
+        return decided
 
     def _prefill_image(
         self, image: Image, options: tuple[Tensor, Tensor], row: tuple[UOp, UOp], start: int
@@ -803,12 +807,37 @@ class Engine:
             bound += [self._slot_vars[i].bind(slot), self._pos_vars[i].bind(pos)]
         live = self._live.bind(k) if self._live is not None and n in self._padded else None
         out, logits = self._decode[n](tokens, *options, *bound, live=live)
-        self._last[n] = _Batch(list(sequences), out.reshape(1, n), options)
-        self._score(sequences, n, out, logits)
+        # while the step runs: what the next step of these sequences may take as its tokens, the
+        # output as it is, and the tokens this one ran
+        batch = _Batch(list(sequences), out.reshape(1, n), options)
         for s in sequences:
             self._wrote(s.slot, len(self._cached[s.slot]) + 1)
             self._cached[s.slot].append(s.tokens[-1])
-        return cast(list[int], out.reshape(-1).tolist())[:k]
+        drawn = cast(list[int], out.reshape(-1).tolist())[:k]
+        decided = [self._decided(s, drawn[i], logits, i) for i, s in enumerate(sequences)]
+        if decided == drawn:
+            self._last[n] = batch
+        else:
+            out = _ids(decided + [0] * (n - k), n).reshape(-1)
+        self._score(sequences, n, out, logits)
+        return decided
+
+    def _decided(self, sequence: Sequence, token: int, logits: Tensor, row: int) -> int:
+        # of a reply held to a format that may call a tool in its answer's place, a token drawn
+        # that begins a call where the model's likeliest token, unconstrained, would not: the
+        # answer instead, its likeliest token the format allows, as the model would have answered
+        # without one. The format leaves it none of the words it means to answer in, so that a
+        # call's marker, or its first bytes, would otherwise take the most of what is left: Qwen3
+        # 8B, given a tool's output, called it again and again rather than answer in the format.
+        c, pieces = sequence.constraint, self.tokenizer.pieces
+        if c is None or not c.deciding() or not c.calls(pieces[token]):
+            return token
+        if c.calls(pieces[int(logits[row].argmax().item())]):
+            return token
+        c.answer()
+        self._mask(sequence)
+        allowed = self._allowed[sequence.slot : sequence.slot + 1]
+        return int(likeliest(logits[row : row + 1], allowed).item())
 
     def _speculates(self, sequences: list[Sequence]) -> bool:
         # whether sequences decoding decode speculatively: with a drafter, few enough to draft a
