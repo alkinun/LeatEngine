@@ -102,8 +102,9 @@ def test_models(client):
     assert (model.id, model.status, model.max_context) == ("tiny", "loaded", CONTEXT)
 
 
-def test_load(tiny_model, tmp_path):
-    # models load on request, each in place of the last, and answer whatever model a request names
+def test_load(tiny_model, tmp_path, capsys):
+    # models load on request, each in place of the last, saying its context, and answer whatever
+    # model a request names
     (other := tmp_path / "other.gguf").symlink_to(tiny_model[0])
     with serving(tiny_model[0], other, max_context=CONTEXT) as server:
         client = connect(server)
@@ -116,6 +117,7 @@ def test_load(tiny_model, tmp_path):
             assert statuses == {name: "loaded", unloaded: "unloaded"}
             assert chat(client, "hello", max_tokens=2).model == name
             engines.append(weakref.ref(server.loaded.engine))
+        assert f"other: a context of {CONTEXT} tokens, as given" in capsys.readouterr().err
         # the first is freed before the second loads, as a GPU holds one model at most; loading
         # the second again keeps it
         first, second, again = (engine() for engine in engines)

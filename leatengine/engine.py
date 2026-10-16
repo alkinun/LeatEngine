@@ -9,13 +9,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
-from tinygrad import Tensor, TinyJit, UOp, dtypes
+from tinygrad import Device, Tensor, TinyJit, UOp, dtypes
 
-from leatengine.draft import Drafter
+from leatengine import machine
+from leatengine.draft import Drafter, needs
 from leatengine.draft import load as load_drafter
 from leatengine.gguf import GGUF
 from leatengine.kernels import FEW_TOKENS, MATVEC_TOKENS, VARIABLES
-from leatengine.model import Config, Transformer, zeros
+from leatengine.model import CACHE_TILE, Config, Transformer, cache_bytes, zeros
 from leatengine.ops import Span
 from leatengine.sampler import GREEDY, Sampling, sample
 from leatengine.tokenizer import Tokenizer
@@ -42,6 +43,12 @@ DRAFT_TOKENS = 3
 # each decoded at 0.88 times the speed of plain steps, 4 at 0.77, and drafting 1 each, 1.11 and
 # 1.01 times; faster experts' kernels since took 3 to the 1.16 Qwen35Mtp records.
 SPECULATIVE_TOKENS = MATVEC_TOKENS
+# memory a model's default context leaves free beside its weights and KV cache, for what its graphs
+# compute: on the 3090, warm-up's buffers took 0.1 to 1.1 GiB, Llama 3.1 8B's with 4 slots the
+# most, and prompts of up to 16k tokens took no more
+RESERVE = 2 << 30
+# the most tokens of a default context where the device does not say how much memory it has
+UNKNOWN_CONTEXT = 4096
 
 
 @dataclass(eq=False)
@@ -122,8 +129,8 @@ class Engine:
     """
 
     def __init__(
-        self, path: str | Path, max_context: int = 4096, prefill_chunk: int = 512, slots: int = 1,
-        draft: str | Path | None = None, vision: str | Path | None = None,
+        self, path: str | Path, max_context: int | None = None, prefill_chunk: int = 512,
+        slots: int = 1, draft: str | Path | None = None, vision: str | Path | None = None,
         cache_type: str = "f16",
     ):  # fmt: skip
         if slots < 1:
@@ -153,6 +160,10 @@ class Engine:
         # its drafts
         run = max(prefill_chunk, self.vision.tokens if self.vision else 1,
                   DRAFT_TOKENS + 1 if draft is not None else 1)  # fmt: skip
+        # what was asked for, or of the model's own as far as the memory allows: and why
+        self.fit = "as given"
+        if max_context is None:
+            max_context, self.fit = _fitted(self.config, slots, cache_slots, run, cache_type, draft)
         self.model = Transformer(
             self.config, weights, max_context, cache_slots, saved, run, cache_type
         )
@@ -811,6 +822,45 @@ class graph[T]:
     @property
     def cnt(self) -> int:  # the calls so far, the first counting as two
         return self.jit.cnt
+
+
+def _fitted(
+    config: Config, slots: int, cache_slots: int, run: int, cache_type: str,
+    draft: str | Path | None,
+) -> tuple[int, str]:  # fmt: skip
+    # a model's context where none is given, and why: its own, as far as the KV cache of its slots,
+    # and of its drafter's own if any, fits in the memory free beside its weights, less RESERVE and
+    # the drafter's weights, which load after; UNKNOWN_CONTEXT at most where that memory is unknown
+    own, device = config.context_length, Device.DEFAULT
+    # buffers freed, as a model's before, tinygrad keeps for reuse, which the driver counts in use
+    Device[device].allocator.free_cache()
+    if (memory := machine.memory(device)) is None:
+        context = min(own, UNKNOWN_CONTEXT)
+        return context, f"of the model's {own}, as {device} does not say how much memory is free"
+    weights, own_cache = needs(draft, config) if draft is not None else (0, None)
+
+    def size(context: int) -> int:  # of the caches
+        drafter = cache_bytes(own_cache, context, cache_slots, None, cache_type) if own_cache else 0
+        return cache_bytes(config, context, cache_slots, run, cache_type) + drafter
+
+    slotted = "1 slot's" if slots == 1 else f"{slots} slots'"
+    budget, of = memory.free - RESERVE - weights, f"{slotted} {cache_type} KV cache"
+    free = f"the {_gib(memory.free)} of {memory.pool} free beside the weights"
+    if size(own) <= budget:
+        return own, f"the model's own: its {of} takes {_gib(size(own))} of {free}"
+    tiles, most = 0, own // CACHE_TILE  # the most whole tiles that fit
+    while tiles < most:
+        mid = (tiles + most + 1) // 2
+        tiles, most = (mid, most) if size(mid * CACHE_TILE) <= budget else (tiles, mid - 1)
+    if not tiles:
+        raise MemoryError(f"{free} hold no {of} of {CACHE_TILE} tokens: fewer slots or a q8_0 "
+                          "cache would take less")  # fmt: skip
+    said = f"of the model's {own}: as many as its {of} fits in {_gib(budget)} of {free}"
+    return tiles * CACHE_TILE, said
+
+
+def _gib(n: int) -> str:
+    return f"{n / 2**30:.1f} GiB"
 
 
 def _drafts(sequences: int) -> int:

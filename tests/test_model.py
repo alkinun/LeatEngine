@@ -8,11 +8,20 @@ from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import Context, diskcache_get, diskcache_put
 
-from leatengine import bench, ops
-from leatengine.engine import FEW_TOKENS, KEEP_BACK, Engine, graph
+from leatengine import bench, machine, ops
+from leatengine.engine import FEW_TOKENS, KEEP_BACK, RESERVE, Engine, _fitted, graph
 from leatengine.gguf import GGUF
 from leatengine.kernels import VARIABLES
-from leatengine.model import CACHE_TILE, Config, Transformer, _stack, rope_table, zeros
+from leatengine.machine import Memory
+from leatengine.model import (
+    CACHE_TILE,
+    Config,
+    Transformer,
+    _stack,
+    cache_bytes,
+    rope_table,
+    zeros,
+)
 from leatengine.ops import Span
 from leatengine.quant import GGMLType, QTensor
 from leatengine.sampler import GREEDY, Sampling
@@ -118,6 +127,60 @@ def test_cache_whole_tiles(tiny_model):
     # attention kernels take caches of whole tiles; the model still holds max_context positions
     model = transformer(tiny_model[0], 50)
     assert model.cache[0].shape[3] == CACHE_TILE and model.max_context == 50
+
+
+@pytest.mark.parametrize("arch", ["llama", "gemma3", "gpt-oss", "qwen35", "deepseek2"])
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
+def test_cache_bytes(tiny, arch, cache_type):
+    # what a Transformer allocates of a context, of rings, recurrent layers and MLA too
+    f = GGUF.open(tiny(arch)[0])
+    config = Config.from_gguf(f.metadata)
+    model = Transformer(config, f.load(), 50, 3, run=8, cache_type=cache_type)
+    made = sum(cache.nbytes() for cache in model.cache if cache is not None)
+    assert made == cache_bytes(config, 50, 3, 8, cache_type) > 0
+
+
+@pytest.fixture
+def fit(tiny, monkeypatch):
+    # the context a tiny Qwen3.5 of 100000 tokens fits in a given memory, without its drafter and
+    # with it, as Engine sizes it, of 2 slots, a spare slot beside, and runs of 8
+    path = tiny("qwen35")[0]
+    config = replace(Config.from_gguf(GGUF.open(path).metadata), context_length=100000)
+
+    def fitted(free: int | None, cache_type="f16", draft=None) -> tuple[int, str]:
+        memory = None if free is None else Memory("RAM", 2 * free, free)
+        monkeypatch.setattr(machine, "memory", lambda device: memory)
+        return _fitted(config, 2, 3, 8, cache_type, draft)
+
+    return config, path, fitted
+
+
+def test_default_context(fit):
+    # the model's own, as far as the cache fits in the memory free beside the weights and
+    # RESERVE, in whole tiles; twice as much of q8_0, the drafter's weights and its own cache less
+    config, path, fitted = fit
+    assert fitted(None) == (4096, "of the model's 100000, as CPU does not say how much memory "
+                                  "is free")  # fmt: skip
+    context, why = fitted(RESERVE + 1 << 40)
+    assert context == 100000 and why.startswith("the model's own: its 2 slots' f16 KV cache takes")
+    budget = cache_bytes(config, 10000, 3, 8)  # of 40 whole tiles, 10240 positions
+    context, why = fitted(RESERVE + budget)
+    assert context == 40 * CACHE_TILE
+    assert why.startswith("of the model's 100000: as many as its 2 slots' f16 KV cache fits in")
+    assert cache_bytes(config, context, 3, 8) <= budget < cache_bytes(config, context + 256, 3, 8)
+    assert fitted(RESERVE + budget, "q8_0")[0] > 1.8 * context
+    assert fitted(RESERVE + budget, draft=path)[0] < context
+    with pytest.raises(MemoryError, match="hold no 2 slots' f16 KV cache of 256 tokens"):
+        fitted(RESERVE + cache_bytes(config, CACHE_TILE, 3, 8) - 1)
+
+
+def test_engine_default_context(tiny_model, monkeypatch):
+    # a model of the context it is given, or of its own, as long as it fits: the tiny one's
+    path = tiny_model[0]
+    assert Engine(path, max_context=50).fit == "as given"
+    monkeypatch.setattr(machine, "memory", lambda device: Memory("RAM", 1 << 40, 1 << 39))
+    engine = Engine(path)
+    assert engine.max_context == CONTEXT and engine.fit.startswith("the model's own")
 
 
 def test_bad_models(tiny_model):

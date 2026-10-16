@@ -511,6 +511,8 @@ class Server(ThreadingHTTPServer):
 
     def _warmed(self, path: Path, extras: dict[str, Path | None]) -> tuple[Engine, ChatTemplate]:
         engine = Engine(path, **self.options | extras)
+        print(f"{path.stem}: a context of {engine.max_context} tokens, {engine.fit}",
+              file=sys.stderr, flush=True)  # fmt: skip
         chat = ChatTemplate(engine.gguf.metadata, engine.tokenizer)
         engine.warm_up()
         return engine, chat

@@ -32,7 +32,11 @@ def main(argv: list[str] | None = None) -> None:
 
     run = commands.add_parser("run", help="chat with a model in the terminal")
     run.add_argument("model", type=Path, help="GGUF file")
-    run.add_argument("--max-context", type=_positive, default=4096)
+    run.add_argument(
+        "--max-context", type=_positive,
+        help="tokens the chat holds at most; by default the model's own, as far as its KV cache "
+        "fits in the memory its weights leave",
+    )  # fmt: skip
     _cache_type(run)
     run.add_argument("--temperature", type=_option("temperature"), default=0.7)
     run.add_argument(
@@ -60,7 +64,11 @@ def main(argv: list[str] | None = None) -> None:
     )  # fmt: skip
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=_port, default=8080)
-    serve.add_argument("--max-context", type=_positive, default=4096)
+    serve.add_argument(
+        "--max-context", type=_positive,
+        help="tokens a sequence holds at most; by default each model's own, as far as the KV cache "
+        "of its slots fits in the memory its weights leave",
+    )  # fmt: skip
     serve.add_argument(
         "--slots", type=_positive, default=4,
         help="sequences generating at once, each in a slot of the KV cache that keeps its tokens",
@@ -251,7 +259,9 @@ def _run(args: argparse.Namespace) -> None:
     sampling = Sampling(args.temperature, args.top_k, args.top_p, args.min_p, args.presence_penalty)
     first = [{"role": "system", "content": args.system}] if args.system else []
     messages, pictures, attached = list(first), list[Image](), list[Image]()
-    print(f"{engine.gguf.path.stem} on {Device.DEFAULT}, compiling...", end="", flush=True)
+    print(f"{engine.gguf.path.stem} on {Device.DEFAULT}: a context of {engine.max_context} "
+          f"tokens, {engine.fit}")  # fmt: skip
+    print("compiling...", end="", flush=True)
     engine.warm_up()
     print(f" ready.{' /image PATH attaches an image.' if engine.vision else ''} Ctrl-D quits.")
     while True:
@@ -364,7 +374,7 @@ def _serve(args: argparse.Namespace) -> None:
         # hears it is loading, its completions waiting for it, rather than no answer
         url, name = _url(args.host, server.server_port), models[0].stem
         failed: list[Exception] = []
-        print(f"{name} on {Device.DEFAULT}, the API at {url}/v1, compiling...", end=" ", flush=True)
+        print(f"{name} on {Device.DEFAULT}, the API at {url}/v1, compiling...", flush=True)
         threading.Thread(target=_start, args=(server, name, failed), daemon=True).start()
         with contextlib.suppress(KeyboardInterrupt):
             server.serve_forever()

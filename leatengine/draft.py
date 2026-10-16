@@ -13,7 +13,7 @@ from tinygrad import Tensor, UOp
 
 from leatengine import ops
 from leatengine.gguf import GGUF
-from leatengine.model import QWEN35, Transformer, rope_table
+from leatengine.model import QWEN35, Config, Transformer, rope_table
 from leatengine.ops import Span
 
 PerSequence = list[int | UOp]  # a value for each sequence of a draft
@@ -65,6 +65,18 @@ def load(path: str | Path, target: Transformer) -> Drafter:
     raise ValueError(f"a {arch} model drafts for no {target.config.arch} model")
 
 
+def needs(path: str | Path, config: Config) -> tuple[int, Config | None]:
+    """What the drafter in a GGUF takes beside a target of `config`, before it loads: its weights'
+    bytes, and the config of the cache it keeps, Qwen3.5's MTP layer's, as model.cache_bytes takes
+    it, or None of Gemma 4's assistant, which reads the target's."""
+    gguf = GGUF.open(path)
+    if gguf.metadata["general.architecture"] == "gemma4-assistant":
+        return sum(t.nbytes for t in gguf.tensors.values()), None
+    prefix = f"blk.{config.n_layers}."
+    layer = sum(t.nbytes for name, t in gguf.tensors.items() if name.startswith(prefix))
+    return layer, _mtp_config(config)
+
+
 def mtp(path: Path) -> bool:
     """Whether a GGUF is a model's MTP layer alone, as llama.cpp's converters name it, mtp-*."""
     return path.name.lower().startswith("mtp-")
@@ -99,6 +111,17 @@ def _layers(m: dict) -> int:
 def _mtp_layer(m: dict, tensors: dict) -> bool:
     # whether a Qwen3.5 GGUF holds its MTP layer, past the model's layers
     return f"blk.{_layers(m)}.nextn.eh_proj.weight" in tensors
+
+
+def _mtp_config(c: Config) -> Config:
+    # Qwen3.5's MTP layer as a model of its own: one layer of the shape of its target's attention
+    # layers
+    full = max(i for i in range(c.n_layers) if not c.recurrent[i])
+    one = {
+        f: getattr(c, f)[full : full + 1]
+        for f in ("kv_heads", "head_dims", "windows", "ropes", "scales", "recurrent")
+    }
+    return replace(c, n_layers=1, **one)
 
 
 def _named(name: str) -> str:
@@ -233,19 +256,12 @@ class Qwen35Mtp:
             w.pop(f"nextn.{n}.weight").dequant().realize() for n in ("enorm", "hnorm")
         )
         head_norm = w.pop("nextn.shared_head_norm.weight")
-        # the layer as a model of its own, of the target's attention layers' shape, its output
-        # normed with the shared head's norm
-        full = max(i for i in range(c.n_layers) if not c.recurrent[i])
-        one = {
-            f: getattr(c, f)[full : full + 1]
-            for f in ("kv_heads", "head_dims", "windows", "ropes", "scales", "recurrent")
-        }
+        # the layer as a model of its own, its output normed with the shared head's norm
         weights = {f"blk.0.{n}": t for n, t in w.items()}
         weights |= {"token_embd.weight": target.embed, "output.weight": target.output}
         weights["output_norm.weight"] = head_norm
-        config = replace(c, n_layers=1, **one)
         self.layer = Transformer(
-            config, weights, target.max_context, target.slots, cache_type=target.cache_type
+            _mtp_config(c), weights, target.max_context, target.slots, cache_type=target.cache_type
         )
 
     def draft(

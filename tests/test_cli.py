@@ -158,6 +158,7 @@ def test_run(tiny_model, monkeypatch, capsys):
                 "--presence-penalty", "0.5"]  # fmt: skip
     main(["run", str(tiny_model[0]), "--max-context", "64", *sampling])
     out = capsys.readouterr().out
+    assert "tiny on CPU: a context of 64 tokens, as given\ncompiling... ready." in out
     assert [m["role"] for m in chats[1]] == ["user", "assistant", "user"]
     assert chats[1][1]["content"] in out and out.count("tok/s]") == 2
 

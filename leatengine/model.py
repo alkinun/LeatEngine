@@ -380,8 +380,7 @@ class Transformer:
             )
         if cache_type not in CACHE_TYPES:
             raise ValueError(f"cache_type must be {' or '.join(CACHE_TYPES)}, got {cache_type}")
-        quantized = cache_type == "q8_0"
-        if quantized and (odd := [dim for dim in config.head_dims if dim % 32]):
+        if cache_type == "q8_0" and (odd := [dim for dim in config.head_dims if dim % 32]):
             raise ValueError(f"a q8_0 cache holds heads of a multiple of 32 dimensions, and this "
                              f"model's are of {odd[0]}: use an f16 cache")  # fmt: skip
         self.config, self.max_context, self.slots = config, max_context, slots
@@ -459,17 +458,16 @@ class Transformer:
         # whole tiles of positions, which the attention kernels need; the rest stay unused. A
         # window's ring holds the positions a run's first token sees before it and the run's own,
         # so that a run overwrites none its tokens see.
-        positions = -(-max_context // CACHE_TILE) * CACHE_TILE
+        positions = _positions(max_context)
         self.sizes = tuple(_ring(window, run, positions) for window in config.windows)
         self.rings = tuple(size < positions for size in self.sizes)
         self.cache = [
-            None if recurrent
-            else zeros(2, slots, kv_heads, size, q8_0_row(dim), dtype=dtypes.uint8) if quantized
-            else zeros(2, slots, kv_heads, size, dim, dtype=dtypes.half)
+            None if recurrent else zeros(2, slots, kv_heads, size, width, dtype=dtype)
             for kv_heads, dim, recurrent, size in zip(
                 config.kv_heads, config.head_dims, config.recurrent, self.sizes, strict=True
             )
-        ]  # fmt: skip
+            for width, dtype in (_entry(dim, cache_type),)
+        ]
         # a recurrent layer's state of each slot: of Gated DeltaNet, the last inputs of its
         # convolution, and the recurrence's state of each value head, keys by values; of a short
         # convolution, its last inputs
@@ -810,6 +808,33 @@ def _factors(rope: Rope, weights: dict[str, QTensor], max_context: int) -> Tenso
     if rope.longrope:
         name = f"rope_factors_{'long' if max_context > rope.longrope else 'short'}.weight"
     return weights[name].dequant() if name in weights else None
+
+
+def cache_bytes(
+    config: Config, max_context: int, slots: int, run: int | None = None, cache_type: str = "f16"
+) -> int:  # fmt: skip
+    """The bytes of a Transformer's KV cache of `slots` slots of `max_context` tokens, as it makes
+    it of the most tokens a run stores, `run`, and `cache_type`: what of a model grows with its
+    context."""
+    positions = _positions(max_context)
+    return sum(
+        2 * slots * kv_heads * _ring(window, run, positions) * width * dtype.itemsize
+        for kv_heads, dim, window, recurrent in zip(
+            config.kv_heads, config.head_dims, config.windows, config.recurrent, strict=True
+        )
+        if not recurrent
+        for width, dtype in (_entry(dim, cache_type),)
+    )
+
+
+def _positions(max_context: int) -> int:
+    # the positions a cache holds of a context: whole tiles, which the attention kernels need
+    return -(-max_context // CACHE_TILE) * CACHE_TILE
+
+
+def _entry(dim: int, cache_type: str) -> tuple[int, DType]:
+    # a position's head of keys or values in a cache: dim f16 values, or a q8_0 row of bytes
+    return (q8_0_row(dim), dtypes.uint8) if cache_type == "q8_0" else (dim, dtypes.half)
 
 
 def _ring(window: int, run: int | None, positions: int) -> int:

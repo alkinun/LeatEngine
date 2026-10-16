@@ -4,8 +4,10 @@ import numpy as np
 import pytest
 from tinygrad import Tensor
 
-from leatengine.draft import mtp, own_drafter
+from leatengine.draft import mtp, needs, own_drafter
 from leatengine.engine import DRAFT_TOKENS, KEEP_BACK, Engine
+from leatengine.gguf import GGUF
+from leatengine.model import Config
 from leatengine.sampler import GREEDY, Sampling
 from tests.helpers import CONTEXT, Oracle, reference_drafts, reference_mtp_drafts, split_mtp
 
@@ -188,6 +190,23 @@ def test_speculative_several(tiny, tiny_assistant, arch, guessed):
     engine._speculative = counted  # type: ignore[method-assign]
     assert several(engine, prompts, sampling) == plain
     assert {2, 3} <= set(sizes) and max(sizes) == 3
+
+
+def test_needs(tiny, tiny_assistant):
+    # before it loads, a drafter's weights and the cache of its own: of Qwen3.5's MTP layer, past
+    # the model's layers in its file, of one attention layer of the target's; and Gemma 4's
+    # assistant's whole file, which reads the target's cache
+    path = tiny("qwen35")[0]
+    f = GGUF.open(path)
+    config = Config.from_gguf(f.metadata)
+    weights, own = needs(path, config)
+    prefix = f"blk.{config.n_layers}."
+    assert weights == sum(t.nbytes for n, t in f.tensors.items() if n.startswith(prefix)) > 0
+    assert own is not None and own.n_layers == 1 and own.recurrent == (False,)
+    config = Config.from_gguf(GGUF.open(tiny("gemma4")[0]).metadata)
+    weights, own = needs(tiny_assistant[0], config)
+    assert weights == sum(t.nbytes for t in GGUF.open(tiny_assistant[0]).tensors.values())
+    assert own is None
 
 
 def test_drafter_needs_its_target(tiny_model, tiny_assistant):
