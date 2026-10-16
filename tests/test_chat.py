@@ -83,6 +83,9 @@ def test_openai_messages():
     assert texts.render(messages[1:2]) == "|"
     told = chat("{% for m in messages %}{{ m.content is none }}{% endfor %}")[0]
     assert told.render(messages[1:2]) == "True"
+    # and left out, as the openai client's model_dump(exclude_none=True) of a call leaves it
+    left_out = {k: v for k, v in messages[1].items() if k != "content"}
+    assert texts.render([left_out]) == "|" and told.render([left_out]) == "True"
     for text in ("m.content.split('x')", "m.content + 'x'"):
         both = "{% for m in messages %}{{ m.content is none }}{{ " + text + " }}{% endfor %}"
         assert chat(both)[0].render(messages[1:2]).startswith("False")

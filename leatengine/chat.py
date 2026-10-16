@@ -107,7 +107,7 @@ class ChatTemplate:
                 **_plain(kwargs),
             )
 
-        if self._none and any(m.get("content", "") is None for m in messages):
+        if self._none and any(m.get("content") is None for m in messages):  # or left out
             # a template that reads it as text elsewhere, as Qwen3's splits it
             with contextlib.suppress(TypeError, jinja2.UndefinedError):
                 return rendered(none=True)
@@ -297,7 +297,9 @@ def partial_end(text: str, markers: Sequence[str]) -> int:
 
 
 # Qwen, Gemma 4 and LFM2 mark their tool calls, which may follow other text
-_MARKERS = ("<tool_call>", "<|tool_call>", "<|tool_call_start|>")
+# the markers that begin a call of text: Qwen's and GLM's, Gemma 4's, and LFM2's
+CALL_MARKERS = ("<tool_call>", "<|tool_call>", "<|tool_call_start|>")
+_MARKERS = CALL_MARKERS
 _CALLS = re.compile(
     r"<tool_call>(.*?)</tool_call>|<\|tool_call>call:([^{]+)(\{.*?\})<tool_call\|>"
     r"|<\|tool_call_start\|>(.*?)<\|tool_call_end\|>",
@@ -567,6 +569,7 @@ def _message(message: dict[str, Any], none: bool = False) -> dict[str, Any]:
     # too, it takes the text for their reasoning, and refuses both. Content of None stays None
     # for a template that tells it from text, if `none`.
     message = dict(message)
+    message.setdefault("content", None)  # left out, as a client's of a call may, as null
     if not isinstance(message.get("content"), str | list | None):  # which a template would read
         # as text, and fail on as it may, as Qwen3's slicing an object
         raise ValueError("a message's content must be text, a list of parts, or null")
