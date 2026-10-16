@@ -218,7 +218,7 @@ def _device() -> None:
 
 
 def _data() -> Path:
-    # API keys and sampling overrides, in the XDG application data directory
+    # API keys, sampling overrides and models pulled, in the XDG application data directory
     return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "leatengine"
 
 
@@ -226,7 +226,11 @@ def _pulled(path: Path) -> Path:
     # a model's file: as given, or of a model pulled, OWNER/NAME[:QUANT]
     if path.exists() or pull.parse(str(path)) is None:
         return path
-    if (found := pull.local(_data() / "models", str(path))) is None:
+    try:
+        found = pull.local(_data() / "models", str(path))
+    except ValueError as e:  # as of a split model's part not there, or two of its quantization
+        raise SystemExit(f"{path}: {e}; leatengine pull {path} again") from None
+    if found is None:
         raise SystemExit(f"{path} is no file, nor a model pulled: leatengine pull {path}")
     return found
 

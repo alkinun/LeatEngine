@@ -39,8 +39,8 @@ uv tool install --force dist/leatengine-0.0.1-py3-none-any.whl
 ```
 
 The wheel resolves dependencies, including tinygrad at an exact Git commit; it is not an
-offline bundle. Model weights are supplied separately as local GGUF files; a GGUF split in parts
-is given by its first, `NAME-00001-of-0000N.gguf`.
+offline bundle. Model weights are local GGUF files, given by path or pulled from Hugging Face
+(below); a GGUF split in parts is given by its first, `NAME-00001-of-0000N.gguf`.
 
 ## Run
 
@@ -127,7 +127,7 @@ reference ops, which are slower.
 |---|---|
 | `pull` | Download a model from Hugging Face, as `OWNER/NAME:QUANT` |
 | `run` | Chat in the terminal: `/help` lists `/system`, `/reset`, `/image PATH`; `"""` wraps lines |
-| `serve` | Serve local GGUF files or directories through HTTP |
+| `serve` | Serve local GGUF files, directories of them, or models pulled, through HTTP |
 | `keys` | Add, list, and remove API keys |
 | `bench` | Measure prefill and decode throughput |
 | `perplexity` | Measure perplexity or compare logits with llama.cpp |

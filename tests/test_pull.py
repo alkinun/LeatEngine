@@ -150,6 +150,16 @@ def test_resume(hub, repo, tmp_path):
     assert not (folder / "tiny-Q8_0.gguf.part").exists()
 
 
+def test_whole_part(hub, repo, tmp_path):
+    # a download cut off between its last byte and its rename is kept without asking again
+    folder = tmp_path / "models/owner/repo"
+    folder.mkdir(parents=True)
+    (folder / "tiny-Q8_0.gguf.part").write_bytes(repo["tiny-Q8_0.gguf"])
+    pull.pull("owner/repo:Q8_0", tmp_path / "models", mmproj=False)
+    assert not [r for r in hub.requests if r[0] == "storage"]
+    assert (folder / "tiny-Q8_0.gguf").read_bytes() == repo["tiny-Q8_0.gguf"]
+
+
 def test_checked(hub, tmp_path):
     # a file whose bytes are not those Hugging Face lists is not kept
     hub.broken.add("tiny-Q8_0.gguf")
@@ -221,3 +231,7 @@ def test_cli(hub, tmp_path, monkeypatch, capsys):
         cli._pulled(Path("owner/other"))
     with pytest.raises(SystemExit, match="pull failed: owner/repo has no GGUF of Q5_K_M"):
         cli.main(["pull", "owner/repo:Q5_K_M"])
+    # a split model a part of which is gone, as an interrupted pull leaves one
+    first.with_name("tiny-Q4_K_M-00002-of-00002.gguf").unlink()
+    with pytest.raises(SystemExit, match="a split GGUF of 2 parts lacks some; leatengine pull"):
+        cli._pulled(Path("owner/repo"))

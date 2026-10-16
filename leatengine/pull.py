@@ -216,7 +216,11 @@ def _fetched(repo: str, f: File, path: Path, say: Callable[[str], None]) -> None
         path.unlink()
     partial = path.with_name(path.name + ".part")
     have = partial.stat().st_size if partial.exists() else 0
-    if have > f.size:
+    if have == f.size and _matches(f, _hashed(partial, f)):  # whole, but for its name
+        partial.rename(path)
+        say(f"{f.name}: {f.size / 2**30:.2f} GiB, checked")
+        return
+    if have >= f.size:  # past it, or of other bytes: none of it to keep
         partial.unlink()
         have = 0
     url = f"{_endpoint()}/{repo}/resolve/main/{urllib.parse.quote(f.path)}"
@@ -232,7 +236,7 @@ def _fetched(repo: str, f: File, path: Path, say: Callable[[str], None]) -> None
                 out.write(chunk)
                 hasher.update(chunk)
                 done += len(chunk)
-                _progress(say, f.name, done, f.size, (done - have) / (time.monotonic() - started))
+                _progress(f.name, done, f.size, (done - have) / (time.monotonic() - started))
     print(file=sys.stderr) if sys.stderr.isatty() else None
     if done != f.size or not _matches(f, hasher.hexdigest()):
         partial.unlink()
@@ -267,7 +271,7 @@ def _matches(f: File, digest: str) -> bool:
     return digest == (f.sha256 or f.git_sha1)
 
 
-def _progress(say: Callable[[str], None], name: str, done: int, size: int, rate: float) -> None:
+def _progress(name: str, done: int, size: int, rate: float) -> None:
     # how far a download is, on one line of a terminal, rewritten
     if sys.stderr.isatty():
         print(f"\r{name}: {done / 2**30:.2f} of {size / 2**30:.2f} GiB, "
