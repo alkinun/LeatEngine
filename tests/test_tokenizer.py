@@ -166,6 +166,11 @@ def test_sentencepiece():
     # decoding drops the space it puts before text, as llama.cpp, unless the text starts with BOS
     assert tok.decode(tok.encode("ab ab", bos=False)) == "ab ab"
     assert tok.decode(tok.encode("ab ab")) == " ab ab"
+    # and streamed, but for a text's continuation, which keeps it, as llama.cpp's /completion
+    ids = tok.encode("ab ab", bos=False)
+    for strip, text in ((True, "ab ab"), (False, " ab ab")):
+        step = tok.stream(strip)
+        assert "".join(step(i) for i in ids) == text
 
 
 def test_unsupported():

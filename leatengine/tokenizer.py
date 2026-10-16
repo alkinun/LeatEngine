@@ -287,9 +287,10 @@ class Tokenizer:
         a reply's log-probabilities show it."""
         return self.pieces[i] or self._texts[i].encode()
 
-    def stream(self) -> Callable[[int | None], str]:
+    def stream(self, strip: bool = True) -> Callable[[int | None], str]:
         """Returns a decoder that maps one id at a time to the text it completes. None ends the
-        text, flushing an incomplete character as decode() would."""
+        text, flushing an incomplete character as decode() would. Unless `strip` is False, as of
+        a text's continuation, the space SentencePiece puts before its first piece is dropped."""
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         pieces = itertools.count()
 
@@ -297,7 +298,7 @@ class Tokenizer:
             if i is None:
                 return decoder.decode(b"", final=True)
             piece = self.pieces[i]
-            return decoder.decode(self._lstrip(piece) if next(pieces) == 0 else piece)
+            return decoder.decode(self._lstrip(piece) if strip and next(pieces) == 0 else piece)
 
         return step
 

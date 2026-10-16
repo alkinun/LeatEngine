@@ -592,7 +592,9 @@ class _Writer:
         metrics: "_Metrics",
     ):  # fmt: skip
         self.c, self.tokenizer, self.cached, self.metrics = c, tokenizer, cached, metrics
-        self.decode, self.text, self.sent, self.count = tokenizer.stream(), "", 0, 0
+        # a text completion's continuation keeps the space before its first piece, as llama.cpp's
+        self.decode, self.text = tokenizer.stream(strip=not c.text), ""
+        self.sent, self.count = 0, 0
         self.stopped = False  # by a stop string, the text cut where it begins
         # when generation started, after any wait for a slot, and when the first token came
         self.started, self.first = started, 0.0
@@ -608,7 +610,9 @@ class _Writer:
         if score is not None:
             chosen, likeliest = score
             top = [self._spelled(i) | {"logprob": v} for i, v in likeliest]
-            self.c.out.put([self._spelled(token) | {"logprob": chosen, "top_logprobs": top}])
+            entry = self._spelled(token) | {"logprob": chosen, "top_logprobs": top}
+            # and where its text begins in the reply's, as text completions give it
+            self.c.out.put([entry | {"text_offset": len(self.text)}])
         self.text += self.decode(token)
         # sent text holds no start of a stop string, so one can only begin after it
         if found := [i for s in self.c.stop if (i := self.text.find(s, self.sent)) >= 0]:
@@ -934,7 +938,7 @@ class _Handler(BaseHTTPRequestHandler):
         if calls:
             message |= {"content": content or None, "tool_calls": _tool_calls(calls)}
             reason = _with_calls(reason)
-        scores = None if c.logprobs is None else {"content": c.scores}
+        scores = None if c.logprobs is None else {"content": _chat_scores(c.scores)}
         choice = {"index": 0, "message": message, "logprobs": scores, "finish_reason": reason}
         body = {"choices": [choice], "usage": _usage(c), "timings": _timings(c)}
         self._json(200, self._head(c, "chat.completion") | body)
@@ -944,22 +948,21 @@ class _Handler(BaseHTTPRequestHandler):
             text = "".join(c.pieces(self._hung_up))
         except RuntimeError as e:
             return self._error(500, str(e))
-        scores = None if c.logprobs is None else _text_scores(c.scores, 0)
+        scores = None if c.logprobs is None else _text_scores(c.scores)
         choice = {"text": text, "index": 0, "logprobs": scores, "finish_reason": c.finish.reason}
         body = {"choices": [choice], "usage": _usage(c), "timings": _timings(c)}
         self._json(200, self._head(c, "text_completion") | body)
 
     def _stream_text(self, c: _Completion) -> None:
         self._events()
-        given, at = 0, 0  # the log-probabilities sent, and where the next one's token's text is
+        given = 0  # the log-probabilities sent
 
         def chunk(text: str, reason: str | None = None) -> dict[str, Any]:
             # with the log-probabilities not sent yet, if asked for
-            nonlocal given, at
+            nonlocal given
             scores = None
             if c.logprobs is not None:
-                scores, given = _text_scores(c.scores[given:], at), len(c.scores)
-                at += sum(map(len, scores["tokens"]))
+                scores, given = _text_scores(c.scores[given:]), len(c.scores)
             choice = {"text": text, "index": 0, "logprobs": scores, "finish_reason": reason}
             return self._head(c, "text_completion") | {"choices": [choice]}
 
@@ -1083,7 +1086,7 @@ class _Handler(BaseHTTPRequestHandler):
             if c.logprobs is None:
                 return None
             new, given = c.scores[given:], len(c.scores)
-            return {"content": new}
+            return {"content": _chat_scores(new)}
 
         # what may yet be part of a tool call is held back; the reply is split once more when
         # done, the end that may have begun a marker then its own
@@ -1372,16 +1375,20 @@ def _response_body(c: _Completion, output: list[dict[str, Any]], done: bool = Tr
     return body
 
 
-def _text_scores(scores: list[dict[str, Any]], at: int) -> dict[str, Any]:
+def _text_scores(scores: list[dict[str, Any]]) -> dict[str, Any]:
     # tokens' log-probabilities as OpenAI's text completions give them, of the likeliest tokens
-    # too, by their text; the first token's text at `at` in the reply's
-    offsets = itertools.accumulate((len(s["token"]) for s in scores), initial=at)
+    # too, by their text, and where each token's text begins in the reply's
     return {
         "tokens": [s["token"] for s in scores],
         "token_logprobs": [s["logprob"] for s in scores],
         "top_logprobs": [{t["token"]: t["logprob"] for t in s["top_logprobs"]} for s in scores],
-        "text_offset": list(offsets)[:-1],
+        "text_offset": [s["text_offset"] for s in scores],
     }
+
+
+def _chat_scores(scores: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # as OpenAI's chat completions give them, of no offsets
+    return [{k: v for k, v in s.items() if k != "text_offset"} for s in scores]
 
 
 def _format(

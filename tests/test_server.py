@@ -395,7 +395,9 @@ def test_text_logprobs(client, stream):
     chosen = [v for c in choices if c.logprobs for v in c.logprobs.token_logprobs]
     tops = [t for c in choices if c.logprobs for t in c.logprobs.top_logprobs]
     offsets = [o for c in choices if c.logprobs for o in c.logprobs.text_offset]
-    assert offsets == [sum(map(len, tokens[:i])) for i in range(len(tokens))]
+    # where each token's text begins in the reply's: one of partial UTF-8 none of its own
+    text = "".join(c.text for c in choices)
+    assert offsets[0] == 0 and offsets == sorted(offsets) and offsets[-1] <= len(text)
     likeliest = [sorted(top.items(), key=lambda kv: -kv[1]) for top in tops]
     check_scores(tokens, chosen, likeliest)
 
