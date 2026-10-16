@@ -2,13 +2,16 @@
 GPT-2's or SentencePiece-style over characters as Gemma 4's, and SentencePiece's own, as Mistral's,
 which merges the pair whose token scores highest."""
 
+import bisect
 import codecs
 import functools
 import heapq
 import itertools
 import re
+import threading
 import unicodedata
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 # GPT-2's reversible byte <-> character mapping; vocab entries are spelled in these characters.
@@ -49,6 +52,7 @@ _MARKERS = {"<|channel|>", "<|message|>", "<|start|>", "<|constrain|>", "<|tool_
             "<|tool_call_end|>"}  # fmt: skip
 SPACE = "\u2581"  # how SentencePiece spells a space
 _CACHED = 1 << 24  # characters of words a tokenizer keeps the tokens of, to encode them again
+_PROMPTS = 8  # prompts a tokenizer keeps the tokens of, to encode only what a later one adds
 
 
 @functools.cache
@@ -154,6 +158,16 @@ def _split(patterns: tuple[re.Pattern[str], ...], text: str) -> list[str]:
     return pieces
 
 
+@dataclass(frozen=True)
+class _Prompt:
+    # a prompt prompt() encoded: its text, whether a BOS starts it, its tokens, and where each
+    # special token's text starts and ends in it, with the token's index
+    text: str
+    bos: bool
+    ids: list[int]
+    marks: list[tuple[int, int, int]]
+
+
 class Tokenizer:
     """Encodes text to token ids and back.
 
@@ -243,6 +257,9 @@ class Tokenizer:
         markup = (CONTROL, USER_DEFINED)
         self.special_ids = frozenset(i for i, ty in enumerate(types) if ty in markup)
         self._split_special, self._split_user = _alternation(special), _alternation(user)
+        self._longest = max(map(len, special), default=0)
+        self._prompts: list[_Prompt] = []  # the latest last, which handlers' threads share
+        self._lock = threading.Lock()  # of _prompts
         # the tokens text drops the whitespace after, as llama.cpp's workaround has Phi-3's: its
         # special ones but <unk>, <s> and <|endoftext|>, and </s>
         self._rstrip: set[int] = set()
@@ -261,20 +278,70 @@ class Tokenizer:
         self.eog_ids: set[int] = eog
 
     def encode(self, text: str, bos: bool | None = None, special: bool = False) -> list[int]:
-        ids = (
-            [self.bos_id]
-            if (self.add_bos if bos is None else bos) and self.bos_id is not None
-            else []
-        )
+        ids = self._start(bos)
+        self._extend(ids, text, special)
+        return ids
+
+    def prompt(self, text: str, bos: bool | None = None) -> list[int]:
+        """A prompt's tokens, as encode(special=True) gives them, encoding only what follows the
+        start it shares with one of the last few, as an agent's turn starts as its last did: up to
+        the last special token both hold there, as BPE merges nothing across one, their tokens are
+        the same."""
+        ids, marks, pos = self._start(bos), list[tuple[int, int, int]](), 0
+        with_bos = bool(ids)
+        with self._lock:
+            known = [p for p in self._prompts if p.bos == with_bos]
+        if known:
+            common, p = max(((_common(p.text, text), p) for p in known), key=lambda k: k[0])
+            if (i := self._shared(p, text, common)) is not None:
+                pos, ids, marks = p.marks[i][0], p.ids[: p.marks[i][2]], p.marks[:i]
+        self._extend(ids, text, True, marks, pos)
+        with self._lock:
+            # a prompt this one starts with is of no more use: this one serves whatever it did
+            kept = [p for p in self._prompts if not text.startswith(p.text)][1 - _PROMPTS :]
+            self._prompts = [*kept, _Prompt(text, with_bos, ids, marks)]
+        return ids.copy()
+
+    def _shared(self, p: _Prompt, text: str, common: int) -> int | None:
+        # which of p's special tokens is the last that `text`, which starts with the first `common`
+        # characters of p's text, holds there too, as each text's scan for special tokens finds
+        # them; None if none is. The two scans decide alike at each position from which the
+        # longest special token's text stays within the common start, so `text` is scanned from
+        # the last of those, or from the start of one of p's special tokens that spans it.
+        same = max(0, common - self._longest + 1)
+        i = bisect.bisect_left(p.marks, same, key=lambda m: m[0]) - 1  # p's last one before it
+        if i >= 0 and p.marks[i][1] > same:
+            same, i = p.marks[i][0], i - 1
+        found, starts = i if i >= 0 else None, {m[0]: j for j, m in enumerate(p.marks)}
+        for m in self._split_special.finditer(text, same) if self._split_special else ():
+            if m.start() > common:
+                break
+            found = starts.get(m.start(), found)
+        return found
+
+    def _start(self, bos: bool | None) -> list[int]:
+        # what a text's tokens start with: the BOS, if asked for or by default
+        add = self.add_bos if bos is None else bos
+        return [self.bos_id] if add and self.bos_id is not None else []
+
+    def _extend(
+        self, ids: list[int], text: str, special: bool,
+        marks: list[tuple[int, int, int]] | None = None, pos: int = 0,
+    ) -> None:  # fmt: skip
+        # adds the tokens of text from `pos`, its start or where a special token's text starts in
+        # it, to `ids`, and to `marks` where each special token's text starts and ends, and its
+        # index in `ids`
         split, table = (
             (self._split_special, self._special) if special else (self._split_user, self._user)
         )
-        pos, strip = 0, False
-        for m in split.finditer(text) if split else ():
+        strip = False
+        for m in split.finditer(text, pos) if split else ():
             ids += self._encode_ordinary(text[pos : m.start()], strip)
+            if marks is not None:
+                marks.append((m.start(), m.end(), len(ids)))
             ids.append(token := table[m.group()])
             pos, strip = m.end(), token in self._rstrip
-        return ids + self._encode_ordinary(text[pos:], strip)
+        ids += self._encode_ordinary(text[pos:], strip)
 
     def decode(self, ids: list[int]) -> str:
         pieces = [self.pieces[i] for i in ids]
@@ -358,6 +425,18 @@ class Tokenizer:
                     ids.append(self._vocab[spelled])
                     break
         return ids
+
+
+def _common(a: str, b: str) -> int:
+    # how many characters two texts start with alike, by halves, each comparing in C
+    lo, hi = 0, min(len(a), len(b))
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if a[lo:mid] == b[lo:mid]:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
 
 
 def _pair(merge: str) -> tuple[str, str]:

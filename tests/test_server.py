@@ -228,7 +228,7 @@ def check_timings(timings: dict, usage) -> None:
     # llama.cpp's timings of a reply, as its usage counts its tokens
     prompt = (timings["cache_n"], timings["prompt_n"])
     assert prompt == (usage.prompt_tokens_details.cached_tokens, usage.prompt_tokens - prompt[0])
-    assert timings["predicted_n"] == usage.completion_tokens
+    assert timings["predicted_n"] == usage.completion_tokens and timings["tokenize_ms"] > 0
     for name in ("prompt", "predicted"):
         n, ms = timings[f"{name}_n"], timings[f"{name}_ms"]
         if name == "predicted" and n == 1:  # one token takes no step, of no rate

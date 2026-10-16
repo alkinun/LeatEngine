@@ -180,6 +180,24 @@ def test_unsupported():
         tiny_tokenizer(**{"tokenizer.ggml.pre": "qwen9"})
 
 
+def test_prompts_encode_only_what_is_new(monkeypatch):
+    tok, text = tiny_tokenizer(), "<s>" + "ab" * 50 + "<|eot|><user>hello<|eot|><user>more"
+    tok.prompt(text[: text.index("hello") + 5])
+    full, encoded, ordinary = tok.encode(text, special=True), [], tok._encode_ordinary
+    monkeypatch.setattr(tok, "_encode_ordinary", lambda t, s: encoded.append(t) or ordinary(t, s))
+    # the last special token both hold within 7 characters, the longest's, of the end of their
+    # common start, <user>, and what follows it, encoded again
+    assert tok.prompt(text) == full
+    assert "".join(encoded) == "hellomore"
+
+
+def test_prompts_match_full_encodes():
+    # as special tokens' texts start and end one another, and of Phi-3's, strip what follows them
+    added = {"<user>a": CONTROL, "r>ab": USER_DEFINED, "<|eot|><user>": CONTROL, "t|>": CONTROL}
+    for name in ("Tiny", "Phi3 Mini"):
+        prompts_match_full_encodes(with_tokens(added, **{"general.name": name}), 300)
+
+
 CORPUS = [
     "Hello world! It's 2026.",
     "I'm sure you'RE right, they'll've DONE it'S 'ſ 'K",  # Python's (?i) would fold U+017F into s
@@ -225,6 +243,36 @@ def test_vocab_matches_llama_cpp(llama_cpp, tmp_path, name):
     if not path.exists():
         pytest.skip(f"{path} is not in llama.cpp's checkout")
     matches_llama_cpp(path, llama_cpp, tmp_path)
+
+
+@pytest.mark.parametrize("name", ["qwen2", "llama-bpe", "gemma-4", "llama-spm", "phi-3"])
+def test_vocab_prompts_match_full_encodes(llama_cpp, name):
+    path = llama_cpp.parents[1] / "models" / f"ggml-vocab-{name}.gguf"
+    if not path.exists():
+        pytest.skip(f"{path} is not in llama.cpp's checkout")
+    prompts_match_full_encodes(Tokenizer(GGUF.open(path).metadata), 200)
+
+
+def prompts_match_full_encodes(tok: Tokenizer, turns: int) -> None:
+    # prompt()'s tokens against a full encode's, of random conversations that go on and diverge as
+    # agents' do: each prompt an earlier one, or its start cut anywhere, a special token's text
+    # too, with more of special tokens' texts, their starts and text of every kind after it
+    rng, specials = random.Random(0), sorted(tok._special)
+
+    def piece() -> str:
+        if rng.random() < 0.4:
+            special = rng.choice(specials)
+            return special if rng.random() < 0.7 else special[: rng.randrange(1, len(special))]
+        return rng.choice([*CORPUS, random_text(rng)])[: rng.randrange(1, 80)]
+
+    texts = [""]
+    for _ in range(turns):
+        text = rng.choice(texts)
+        text = text[: rng.randint(0, len(text))] if rng.random() < 0.5 else text
+        text += "".join(piece() for _ in range(rng.randint(0, 8)))
+        bos = rng.choice([None, False, True])
+        assert tok.prompt(text, bos) == tok.encode(text, bos, special=True), text
+        texts.append(text)
 
 
 def matches_llama_cpp(model_path, llama_cpp, tmp_path):

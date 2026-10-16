@@ -233,6 +233,7 @@ class _Completion:
     logprobs: int | None = None
     scores: list[dict[str, Any]] = field(default_factory=list)
     logit_bias: dict[int, float] | None = None  # what it adds to the logits of the tokens named
+    tokenize_time: float = 0.0  # seconds its prompt took to tokenize
     id: str = field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
     created: int = field(default_factory=lambda: int(time.time()))
     # from the worker: pieces of text, and before their text, tokens' log-probabilities if asked
@@ -1262,7 +1263,9 @@ def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completio
     if (files := images(body["messages"])) and loaded.engine.vision is None:
         raise ValueError(f"{loaded.name} takes no images: it has no vision encoder")
     shown = [loaded.engine.image(data) for data in files]
+    started = time.perf_counter()
     prompt = loaded.chat.tokens(text, [image.tokens for image in shown])
+    tokenized = time.perf_counter() - started
     if len(prompt) >= (context := loaded.engine.max_context):
         raise ValueError(f"the prompt has {len(prompt)} tokens, too many for {context} of context")
     if body.get("logprobs") is not None and not isinstance(body["logprobs"], bool):
@@ -1282,6 +1285,7 @@ def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completio
         grammar=grammar,
         preamble=preamble,
         logprobs=(body.get("top_logprobs") or 0) if body.get("logprobs") else None,
+        tokenize_time=tokenized,
         # what the request asks for of its sampling, else the model's, as it reasons or not
         **_shared(body, server, loaded, reasons=_reasons(loaded.chat, options)),
     )
@@ -1300,6 +1304,7 @@ def _text_completion(body: Any, server: Server, loaded: _Loaded | None) -> _Comp
     if loaded is None:
         raise _Unloaded("no model is loaded")
     tok, prompt, suffix = loaded.engine.tokenizer, body["prompt"], body.get("suffix")
+    started = time.perf_counter()
     if isinstance(prompt, list) and isinstance(prompt[0], str):
         prompt = prompt[0]
     if suffix is not None:
@@ -1310,7 +1315,8 @@ def _text_completion(body: Any, server: Server, loaded: _Loaded | None) -> _Comp
         before = tok.encode(prompt, bos=False) if isinstance(prompt, str) else prompt
         ids = [*start, pre, *before, suf, *tok.encode(suffix, bos=False), mid]
     else:
-        ids = tok.encode(prompt, special=True) if isinstance(prompt, str) else prompt
+        ids = tok.prompt(prompt) if isinstance(prompt, str) else prompt
+    tokenized = time.perf_counter() - started
     vocab = int(loaded.engine.model.output.shape[0])
     if not ids or max(ids) >= vocab:
         raise ValueError(f"the prompt must hold some tokens, each of the {vocab} of the vocab")
@@ -1324,6 +1330,7 @@ def _text_completion(body: Any, server: Server, loaded: _Loaded | None) -> _Comp
         text=True,
         id=f"cmpl-{uuid.uuid4().hex}",
         logprobs=body.get("logprobs"),
+        tokenize_time=tokenized,
         **_shared(body, server, loaded, reasons=False),
     )
 
@@ -1552,9 +1559,10 @@ def _timings(c: _Completion) -> dict[str, Any]:
     # start of generation, after any wait for a slot, to the first token; and the reply's tokens,
     # timed from the first to the last: the first comes of the prompt's last step, so that time
     # holds one step fewer than there are tokens, and of a reply of one token, no rate. Rates are
-    # over all the tokens nonetheless, as llama.cpp's are.
+    # over all the tokens nonetheless, as llama.cpp's are. And LeatEngine's own: the prompt's
+    # tokenizing, before any of that.
     f = c.finish
-    timings: dict[str, Any] = {"cache_n": f.cached}
+    timings: dict[str, Any] = {"cache_n": f.cached, "tokenize_ms": 1e3 * c.tokenize_time}
     parts = (("prompt", len(c.prompt) - f.cached, f.prefill_time, True),
              ("predicted", f.tokens, f.decode_time, f.tokens > 1))  # fmt: skip
     for name, n, seconds, timed in parts:

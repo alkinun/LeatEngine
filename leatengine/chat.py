@@ -125,9 +125,9 @@ class ChatTemplate:
         first, *rest = text.split(IMAGE)
         if len(rest) != len(images):
             raise ValueError(f"the prompt shows {len(rest)} images, {len(images)} are given")
-        ids = self._tokenizer.encode(first, bos=bos, special=True)
+        ids = self._tokenizer.prompt(first, bos=bos)
         for image, piece in zip(images, rest, strict=True):
-            ids += image + self._tokenizer.encode(piece, bos=False, special=True)
+            ids += image + self._tokenizer.prompt(piece, bos=False)
         return ids
 
     @property

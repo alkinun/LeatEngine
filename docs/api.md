@@ -101,8 +101,11 @@ message roles and tool formats a model understands.
   Clients sharing a key must supply distinct identifiers when their prompt caches should be
   separate.
 - `stop` takes a string or up to 16 strings, each of 256 characters at most.
-- Replies include usage and a `timings` extension. Cached token counts appear in
-  `usage.prompt_tokens_details.cached_tokens`; streamed usage requires `include_usage`.
+- Replies include usage and a `timings` extension, as llama.cpp's server gives it, with
+  `tokenize_ms`, the time the prompt took to tokenize: of a prompt that starts as one of the
+  last 8 did, as an agent's turn starts as its last, only what follows their last control token in
+  common is tokenized. Cached token counts appear in `usage.prompt_tokens_details.cached_tokens`;
+  streamed usage requires `include_usage`.
 
 This is not a complete OpenAI implementation: multiple choices (`n` above 1) are unsupported.
 Audio, file-storage, and tool-execution endpoints are not implemented. A prompt must fit the
