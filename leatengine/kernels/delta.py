@@ -14,13 +14,13 @@ from leatengine.kernels.common import (
     LOG2E,
     WARP,
     carry_all,
-    fast_reciprocal,
     fast_rsqrt,
     lane_range,
     on_gpu,
     opaque,
     pick,
     shfl_xor,
+    sigmoid,
     warp_sum,
 )
 
@@ -114,7 +114,7 @@ def _recurrence_kernel(
     qs, ks = ([shared[n, share * keys + i].load() for i in range(keys)] for n in (0, 1))
     # the decay exp(a * softplus(alpha + bias)) and the update's gain sigmoid(beta)
     decayed = _exp(rate * _softplus(gates[at, head].load() + offset))
-    gain = _sigmoid(gates[at, heads + head].load())
+    gain = sigmoid(gates[at, heads + head].load(), fast=True)
     by_key = _column_sum(_chains([s * x for s, x in zip(old, ks, strict=True)]))
     by_query = _column_sum(_chains([s * x for s, x in zip(old, qs, strict=True)]))
     delta = gain * (conved[at, (2 * k_heads + head) * dims + dim].load() - decayed * by_key)
@@ -164,12 +164,8 @@ def _chains(values: list[UOp]) -> UOp:
     return _sum([_sum(values[c::CHAINS]) for c in range(min(CHAINS, len(values)))])
 
 
-def _sigmoid(x: UOp) -> UOp:
-    return fast_reciprocal(1 + (x * -LOG2E).exp2())
-
-
 def _silu(x: UOp) -> UOp:
-    return x * _sigmoid(x)
+    return x * sigmoid(x, fast=True)
 
 
 def supports_delta_net(mixed: Tensor, state: Tensor) -> bool:

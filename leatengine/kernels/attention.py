@@ -29,6 +29,7 @@ from leatengine.kernels.common import (
     q8,
     q8_scale,
     register,
+    results,
     shfl_xor,
     turns,
     warp_max,
@@ -212,8 +213,7 @@ def _held(
     view = cache.flatten().bitcast(dtypes.uint32 if size == 4 else dtypes.uint16)
     at_word = (start + first) // size
     words = load_words(view, at_word, count // size) if count > size else (view[at_word].load(),)
-    ints = [((w.cast(dtypes.uint32) >> (8 * i) & 0xFF) ^ 0x80).cast(dtypes.int32) - 0x80
-            for w in words for i in range(size)]  # fmt: skip
+    ints = [x for w in words for x in _int8s(w, size)]
     as_f16 = cache.flatten().bitcast(dtypes.half)
 
     def scale(d: int | UOp) -> UOp:  # dimension d's
@@ -244,13 +244,7 @@ def _chunks(length: int | UOp, window: int) -> int | UOp:
 
 def _most(lengths: tuple[int | UOp, ...], window: int) -> int | UOp:
     # the most chunks any row's keys take
-    return functools.reduce(_larger, (_chunks(n, window) for n in lengths))
-
-
-def _larger(a: int | UOp, b: int | UOp) -> int | UOp:
-    if isinstance(a, UOp):
-        return a.maximum(b)
-    return b.maximum(a) if isinstance(b, UOp) else max(a, b)
+    return functools.reduce(at_least, (_chunks(n, window) for n in lengths))
 
 
 def _per_block(group: int, dim: int) -> int:
@@ -360,10 +354,13 @@ _WMMA_F16 = (
 
 
 def _products(code: str, a: list[UOp], b: list[UOp], c: list[UOp]) -> list[UOp]:
-    d = UOp.alloc((len(c),), dtypes.float32, addrspace=AddrSpace.REG)
-    product = UOp(Ops.CUSTOM, src=(d[0], *a, *b, *c), arg=(code, dtypes.float32))
-    d = d.after(d[0].store(product))
-    return [d[i].load() for i in range(len(c))]
+    return results(code, dtypes.float32, len(c), *a, *b, *c)
+
+
+def _int8s(word: UOp, count: int) -> list[UOp]:
+    # a word's `count` bytes, low first, as the int8s of a q8_0 row
+    w = word.cast(dtypes.uint32)
+    return [((w >> (8 * i) & 0xFF) ^ 0x80).cast(dtypes.int32) - 0x80 for i in range(count)]
 
 
 def _f16_pair(lo: UOp, hi: UOp) -> UOp:
@@ -551,10 +548,9 @@ def _flash_attention_kernel(
         start = (((kind * slots + slot) * kv_heads + kv_head) * positions + position) * stride
         if cache.dtype == dtypes.half:
             return cache.flatten().bitcast(dtypes.uint32)[start // 2 + w].load()
-        both = cache.flatten().bitcast(dtypes.uint16)[start // 2 + w].load().cast(dtypes.uint32)
+        both = cache.flatten().bitcast(dtypes.uint16)[start // 2 + w].load()
         scale = cache.flatten().bitcast(dtypes.half)[(start + dim) // 2 + w // 16].load().float()
-        ints = [((both >> (8 * i) & 0xFF) ^ 0x80).cast(dtypes.int32) - 0x80 for i in (0, 1)]
-        return _halves_word(*((x.float() * scale).cast(dtypes.half) for x in ints))
+        return _halves_word(*((x.float() * scale).cast(dtypes.half) for x in _int8s(both, 2)))
 
     keys = UOp.alloc((key_tile, words + 4), dtypes.uint32, addrspace=AddrSpace.LOCAL)
     values = UOp.alloc((width, key_tile // 2 + 4), dtypes.uint32, addrspace=AddrSpace.LOCAL)
@@ -647,6 +643,8 @@ def supports_flash_attention(q: Tensor, cache: Tensor) -> bool:
     # one sequence's queries, and heads the kernel's tiles fit, of an f16 or q8_0 cache
     positions, dim = cache.shape[3], q.shape[3]
     if not on_matrix_cores(q) or cache.dtype not in (dtypes.half, dtypes.uint8):
+        return False
+    if q.shape[1] // cache.shape[2] > 1024 // WARP:  # a warp per query head of a block's kv head
         return False
     if not isinstance(positions, int) or not isinstance(dim, int):
         return False

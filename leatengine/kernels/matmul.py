@@ -44,6 +44,7 @@ from leatengine.kernels.common import (
     one_sequence,
     opaque,
     register,
+    results,
     storage_words,
     table16,
     turns,
@@ -57,7 +58,7 @@ TILE_ROWS = (256, 192, 128, 96, 64)  # the heights tiles may have, warps of 32 r
 FEW_TOKENS = 16  # tokens per tile where there are at most that many
 WARP_ROWS = 32  # a warp per 32 rows of the tile, and a thread per row to load its scales
 STEP = 128  # weights per row per step
-SUBTILES_M = WARP_ROWS // 16  # of 16 rows per warp, by subtiles of 8 tokens
+SUBTILES_M = WARP_ROWS // 16  # of 16 rows per warp, by subtiles of the fragments' tokens
 FIXUP_THREADS = 256
 # the groups of a step, as _groups binds them on RDNA: a graph replays with the value the call
 # binds, which a graph that runs the kernels must take as one of its arguments
@@ -100,16 +101,8 @@ _EXIT = (
 )
 
 
-def _results(code: str, count: int, *srcs: UOp) -> list[UOp]:
-    # the `count` int32 results of an instruction whose code writes all but the first through {0}
-    c = UOp.alloc((count,), dtypes.int32, addrspace=AddrSpace.REG)
-    product = UOp(Ops.CUSTOM, src=(c[0], *srcs), arg=(code, dtypes.int32))
-    c = c.after(c[0].store(product))
-    return [c[i].load() for i in range(count)]
-
-
 def _wmma(a: list[UOp], b: list[UOp], c: list[UOp] | None = None) -> list[UOp]:
-    return _results(_WMMA, 8, *a, *b, *(c or [UOp.const(0, dtypes.int32)] * 8))
+    return results(_WMMA, dtypes.int32, 8, *a, *b, *(c or [UOp.const(0, dtypes.int32)] * 8))
 
 
 class _MmaFragments:
@@ -136,8 +129,8 @@ class _MmaFragments:
     def dot(self, a: list[UOp], b: list[UOp], halves: bool) -> list[list[UOp]]:
         # the results of the group's 32 products, or of each half's 16
         if halves:
-            return [_results(_MMA[16], 4, *a[2 * h : 2 * h + 2], b[h]) for h in (0, 1)]
-        return [_results(_MMA[32], 4, *a, *b)]
+            return [results(_MMA[16], dtypes.int32, 4, *a[2 * h : 2 * h + 2], b[h]) for h in (0, 1)]
+        return [results(_MMA[32], dtypes.int32, 4, *a, *b)]
 
 
 class _WmmaFragments(_MmaFragments):
@@ -948,7 +941,7 @@ def _matmul_kernel(
     later = put([buf.after(done) for buf in bufs], where(*upcoming)[2], staged_words)
     summed = acc.after(UOp.group(computed, *later).end(at))
 
-    def results(token0: UOp, row0: UOp, ends: UOp | None = None) -> list[UOp]:
+    def outputs(token0: UOp, row0: UOp, ends: UOp | None = None) -> list[UOp]:
         # the stores of a tile's outputs; scheduled, those of an item that `ends` its sums: a
         # whole tile's outputs, or a left tile's sums of a chunk to their part
         stores = []
@@ -989,12 +982,12 @@ def _matmul_kernel(
 
     info = KernelInfo(name=f"matmul_{ggml_type.name.lower()}_{n}_{cols}", opts_to_apply=())
     if not schedule[0]:
-        stores = results(token_tile * tile_tokens, row_tile * out_rows)
+        stores = outputs(token_tile * tile_tokens, row_tile * out_rows)
         return UOp.group(*stores).end(*ranges).sink(arg=info)
     # after an item that ends its sums, they go out and start again from 0
     ends = items.ends(item)
     token_tile, row_tile, _ = where(item, zero)
-    flushes = results(token_tile * tile_tokens, row_tile * out_rows, ends)
+    flushes = outputs(token_tile * tile_tokens, row_tile * out_rows, ends)
     held = acc.after(summed, *flushes)
     zeroed = held.store(UOp.stack(*(ends.where(0.0, held[k].load()) for k in range(len(vals)))))
     return zeroed.end(item).end(*ranges).sink(arg=info)
@@ -1175,7 +1168,7 @@ def routed_products(
 ) -> Tensor:  # fmt: skip
     """The products of quantized activations and the experts that (token, slot) pairs are routed
     to, a row per pair, slot p % used of token p // used: ws stack experts (experts, rows, cols),
-    and `order` (experts, n) and `counts` list each expert's pairs. The activations have a row per
+    and `order` (experts * n,) and `counts` list each expert's pairs. The activations have a row per
     token if by_token, else per pair. Two matrices are gate and up, combined as common.glu has
     the kind; fused, one stack holds both, each expert's gate rows first. biases, if given, are
     each matrix's (experts * rows), added before gate and up combine."""

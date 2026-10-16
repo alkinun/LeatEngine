@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from tinygrad import Device, Tensor, UOp, dtypes
-from tinygrad.dtype import AddrSpace
+from tinygrad.dtype import AddrSpace, DType
 from tinygrad.uop.ops import AxisType, Ops
 
 from leatengine import grids
@@ -315,8 +315,14 @@ def fifth_bits(bits: UOp) -> UOp:
     return ((bits & 1) | ((bits & 2) << 7) | ((bits & 4) << 14) | ((bits & 8) << 21)) << 4
 
 
+def sigmoid(x: UOp, scale: float = 1.0, fast: bool = False) -> UOp:
+    # 1 / (1 + e^(-scale x)), of a fast reciprocal if `fast`, as tinygrad's silu writes it
+    denominator = 1 + (x * (-scale * LOG2E)).exp2()
+    return fast_reciprocal(denominator) if fast else denominator.reciprocal()
+
+
 def silu(x: UOp) -> UOp:
-    return x * (1 + (x * -LOG2E).exp2()).reciprocal()  # as tinygrad's silu
+    return x * sigmoid(x)
 
 
 def glu(kind: str) -> Callable[[UOp, UOp], UOp]:
@@ -331,13 +337,13 @@ def glu(kind: str) -> Callable[[UOp, UOp], UOp]:
 def _oai(g: UOp, u: UOp) -> UOp:
     # min(g, 7) * sigmoid(1.702 * min(g, 7)) * (clamp(u, -7, 7) + 1), as ggml's swiglu_oai
     g, u = g.minimum(OAI_LIMIT), u.maximum(-OAI_LIMIT).minimum(OAI_LIMIT)
-    return g * (1 + (g * (-OAI_ALPHA * LOG2E)).exp2()).reciprocal() * (u + 1)
+    return g * sigmoid(g, OAI_ALPHA) * (u + 1)
 
 
 def _gelu(x: UOp) -> UOp:
     # tanh's approximation, as ggml's and tinygrad's: x * sigmoid(2 sqrt(2/pi) (x + 0.044715 x^3))
     z = x * (1 + 0.044715 * x * x) * (2 * math.sqrt(2 / math.pi))
-    return x * (1 + (z * -LOG2E).exp2()).reciprocal()
+    return x * sigmoid(z)
 
 
 def pick(row: UOp, values: tuple[int | UOp, ...]) -> UOp:
@@ -361,12 +367,26 @@ def opaque(x: UOp) -> UOp:
     return UOp(Ops.CUSTOMI, src=(x.cast(dtypes.int32),), arg=("{0}", dtypes.int32))
 
 
-def at_most(a: int | UOp, b: int) -> int | UOp:
-    return a.minimum(b) if isinstance(a, UOp) else min(a, b)
+def at_most(a: int | UOp, b: int | UOp) -> int | UOp:
+    # the smaller of two sizes, either of them bound
+    if isinstance(a, UOp):
+        return a.minimum(b)
+    return b.minimum(a) if isinstance(b, UOp) else min(a, b)
 
 
-def at_least(a: int | UOp, b: int) -> int | UOp:
-    return a.maximum(b) if isinstance(a, UOp) else max(a, b)
+def at_least(a: int | UOp, b: int | UOp) -> int | UOp:
+    if isinstance(a, UOp):
+        return a.maximum(b)
+    return b.maximum(a) if isinstance(b, UOp) else max(a, b)
+
+
+def results(code: str, dtype: DType, count: int, *srcs: UOp) -> list[UOp]:
+    # the `count` results of a custom instruction, of `dtype`, whose code returns the first and
+    # writes the others through {0}
+    out = UOp.alloc((count,), dtype, addrspace=AddrSpace.REG)
+    first = UOp(Ops.CUSTOM, src=(out[0], *srcs), arg=(code, dtype))
+    out = out.after(out[0].store(first))
+    return [out[i].load() for i in range(count)]
 
 
 def carry(t: Tensor, value: int | UOp) -> tuple[Tensor, int | UOp]:

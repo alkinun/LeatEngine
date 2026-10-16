@@ -28,6 +28,7 @@ from leatengine.kernels.common import (
     one_sequence,
     popcount,
     register,
+    sigmoid,
     storage_words,
     warp_argmax,
     warp_sum,
@@ -143,13 +144,13 @@ def _route_kernel(
     # bias, if given, and the winners' sigmoids, normalized to sum to 1 if `normalize`. Either way
     # times `scale`. Values of -inf or NaN count as the least finite one, below a winner taken
     # out, which so is never taken again.
-    sigmoid, normalize, scale = routing
+    by_sigmoid, normalize, scale = routing
     token, lane = UOp.range(tokens, 0, AxisType.GLOBAL), lane_range()
     ats = [(lane + WARP * j).cast(dtypes.int32) for j in range(int(scores.shape[1]) // WARP)]
     least = UOp.const(-3.4028234663852886e38, dtypes.float32)  # float32's least finite value
     values = [scores[token, at].load() for at in ats]
-    if sigmoid:
-        values = [_sigmoid(v) for v in values]
+    if by_sigmoid:
+        values = [sigmoid(v) for v in values]
         if bias:
             values = [v + bias[0][at].load() for v, at in zip(values, ats, strict=True)]
     values = [(v > least).where(v, least) for v in values]
@@ -163,14 +164,14 @@ def _route_kernel(
             at.eq(best[-1][1]).where(-math.inf, value)
             for value, at in zip(values, ats, strict=True)
         ]
-    if sigmoid:  # each winner's own sigmoid, without the bias
-        exps = [_sigmoid(scores[token, index].load()) for _, index in best]
+    if by_sigmoid:  # each winner's own sigmoid, without the bias
+        exps = [sigmoid(scores[token, index].load()) for _, index in best]
     else:
         exps = [((top - best[0][0]) * LOG2E).exp2() for top, _ in best]
     total = sum(exps[1:], exps[0])
-    if sigmoid and normalize:  # over at least f16's least normal number, as llama.cpp's
+    if by_sigmoid and normalize:  # over at least f16's least normal number, as llama.cpp's
         total = total.maximum(6.103515625e-5)
-    elif sigmoid:
+    elif by_sigmoid:
         total = UOp.const(1.0, dtypes.float32)
     stores = []
     for i, ((_, index), e) in enumerate(zip(best, exps, strict=True)):
@@ -179,10 +180,6 @@ def _route_kernel(
         stores += [ids[at].store(index), weights[at].store(weight)]
     info = KernelInfo(name=f"route_{used}", opts_to_apply=())
     return UOp.group(*stores).end(token, lane).sink(arg=info)
-
-
-def _sigmoid(x: UOp) -> UOp:
-    return (1 + (x * -LOG2E).exp2()).reciprocal()
 
 
 def route(scores: Tensor, used: int, routing: Routing = SOFTMAX) -> tuple[Tensor, Tensor]:
@@ -224,7 +221,7 @@ def _bucket_kernel(order: UOp, counts: UOp, ids: UOp, pairs: int | UOp) -> UOp:
 
 
 def _bucket(ids: Tensor, experts: int, per: int, pairs: int | UOp) -> tuple[Tensor, Tensor]:
-    # each expert's pairs, the first `pairs` of ids, as order (experts, per) and counts (experts,)
+    # each expert's pairs, the first `pairs` of ids, as order (experts * per,) and counts (experts,)
     order = Tensor.empty(experts * per, dtype=dtypes.int32, device=ids.device)
     counts = Tensor.empty(experts, dtype=dtypes.int32, device=ids.device)
     ids, pairs = carry(ids, pairs)

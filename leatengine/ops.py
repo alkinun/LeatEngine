@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from tinygrad import Tensor, UOp, dtypes
 
 from leatengine import kernels
-from leatengine.kernels.common import OAI_ALPHA, OAI_LIMIT, SOFTMAX, Routing
+from leatengine.kernels.common import OAI_ALPHA, OAI_LIMIT, SOFTMAX, Routing, at_most
 from leatengine.quant import NATIVE, QTensor, from_q8_0, to_q8_0
 
 
@@ -99,8 +99,8 @@ def mixture(
     # (experts, rows, cols), with biases (experts, rows) of gate, up and down if given; where up is
     # None, gate stacks both, the gate's rows first in each. Only the chosen experts are read, but
     # by the reference ops for more pairs of tokens and experts than experts, which read every one.
-    # Tokens past the first `live`, if given, pad a batch: the kernels give them no experts, rather
-    # than reading experts of their own, and the reference ops theirs.
+    # Tokens past the first `live`, if given, pad a batch: the matrix-vector kernels give them no
+    # experts, rather than reading experts of their own, and the reference ops theirs.
     if _fast() and kernels.supports_mixture(x, gate, up, down):
         args = (used, norm, kind, scales, residual, biases, live, routing)
         return kernels.mixture(x, scores, gate, up, down, *args)
@@ -293,19 +293,12 @@ def _rotate(
     # they are scheduled with a drafter's reads of the cache before them.
     n = int(cache.shape[3])
     at = start_pos % n
-    first = _smaller(n - at, T)
+    first = at_most(n - at, T)
     for rows, tokens in (((at, at + first), (0, first)), ((0, T - first), (first, T))):
         if isinstance(size := rows[1] - rows[0], UOp) or size:
             held = cache.shrink((None, (slot, slot + 1), None, rows, None))
             held.assign(new.shrink((None, None, None, tokens, None))).realize()
     return q, cache
-
-
-def _smaller(a: int | UOp, b: int | UOp) -> int | UOp:
-    # the smaller of two sizes, either bound
-    if isinstance(a, UOp):
-        return a.minimum(b)
-    return b.minimum(a) if isinstance(b, UOp) else min(a, b)
 
 
 Rows = list[int | UOp] | int | UOp  # one per token, or one for a single span's tokens
@@ -340,7 +333,9 @@ def attention(
     # tokens of a span more. Returns (1, T, H * D), the layout the output projection reads.
     # a token per row: of a single span of one, or of several spans, each token its own row
     rows = _rows(spans) if len(spans) > 1 or _tokens(spans) else None
-    if _fast() and rows is not None and kernels.supports_attention(q, cache):
+    # the kernel's attention of tokens of several spans is causal, as each one's of a span is
+    causal = all(s.causal or s.length == 1 for s in spans)
+    if _fast() and rows is not None and causal and kernels.supports_attention(q, cache):
         slots, positions = (r if isinstance(r, list) else [r] for r in rows)
         lengths = [pos + 1 for pos in positions]
         # spans of several tokens: the rows of each one's last
@@ -379,7 +374,7 @@ def _attention(
     else:
         # the positions up to the span's end, within the cache's, as a span ends where the context
         # does at the latest, though its start's and its length's bounds add to more
-        end = _smaller(start_pos + T, int(cache.shape[3]))
+        end = at_most(start_pos + T, int(cache.shape[3]))
         k, v = (_held(cache[i, slot : slot + 1, :, :end], int(D)).cast(q.dtype) for i in (0, 1))
     if not ring and (window or causal):
         full = Tensor.full((1, 1, T, k.shape[2]), float("-inf"), dtype=q.dtype)
