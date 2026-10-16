@@ -1,8 +1,10 @@
-"""Checks a machine end to end in one command, on a new inference host: the GPU tests, speed
-against llama.cpp on the same files, speculative decoding over chat prompts, and the server
-answering a streamed chat. Writes a Markdown report to reports/, or --out, and prints it.
+"""Checks a machine end to end in one command, on a new inference host: the GPU tests, agreement
+with llama.cpp and speed against it on the same files, speculative decoding over chat prompts,
+and the server answering a streamed chat. Writes a Markdown report to reports/, or --out, and
+prints it.
 
     uv run python scripts/validate_hardware.py MODEL.gguf|DIR ... [--llama-cpp BIN [BIN ...]]
+        [--wikitext wiki.test.raw]
 
 Every model runs in a process of its own, so each has the GPU's memory to itself. DEV picks the
 device, AMD by default for Strix Halo. A drafter is found for each model of an MTP layer
@@ -11,6 +13,12 @@ a Gemma 4 assistant's GGUF among the files given. --quick runs fewer repetitions
 batched and chat runs. --llama-cpp takes several builds' bin directories, as of Vulkan and of HIP
 from scripts/build_llama_cpp.py: each runs, and the report gives the better per model and measure,
 and which build it was.
+
+Agreement, given wikitext-2's test set (`wiki.test.raw`, as llama.cpp's
+scripts/get-wikitext-2.sh fetches it) and llama.cpp: each build's logits of its first 8 chunks of
+512 tokens, from `llama-perplexity --kl-divergence-base`, and LeatEngine's KL divergence from them
+and top-1 agreement, as prompts, one token at a time as generation runs, and with a q8_0 KV cache.
+scripts/agreement.py measures it alone.
 """
 
 import argparse
@@ -35,6 +43,9 @@ ROOT = Path(__file__).resolve().parent.parent
 # a reply to this, streamed from the server, shows the model loads, generates and detokenizes
 SERVER_PROMPT = "Name three primary colors, one per line."
 
+# how LeatEngine scores llama.cpp's logits: the flags of `leatengine perplexity` of each way
+AGREEMENT = {"prompts": (), "one at a time": ("--decode",), "q8_0 cache": ("--cache-type", "q8_0")}
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -43,6 +54,9 @@ def main() -> None:
         "--llama-cpp", type=Path, nargs="+", default=[],
         help="llama.cpp's build/bin, or several builds', to compare against the better of",
     )  # fmt: skip
+    parser.add_argument(
+        "--wikitext", type=Path, help="wikitext-2's wiki.test.raw: with --llama-cpp, agreement too"
+    )
     parser.add_argument("--quick", action="store_true", help="one repetition, no batch or chat")
     parser.add_argument("--no-tests", action="store_true", help="skip the GPU tests")
     parser.add_argument("--out", type=Path, default=ROOT / "reports", help="report directory")
@@ -58,6 +72,8 @@ def main() -> None:
     for model in models:
         print(f"== {model.name}", file=sys.stderr, flush=True)
         row: dict = {"model": model.stem}
+        if args.wikitext and args.llama_cpp:
+            row["agreement"] = _agreement(env, model, args.llama_cpp, args.wikitext, args.out)
         row["leatengine"] = _leatengine(env, "bench", model, "-r", reps)
         if args.llama_cpp:
             row["llama.cpp"] = _best(
@@ -89,8 +105,9 @@ def main() -> None:
 class Report:
     """The report's sections, in Markdown, and the raw results at its end."""
 
-    def __init__(self, device: str):
-        self.device, self.sections, self.raw = device, dict[str, str](), dict[str, object]()
+    def __init__(self, device: str, kind: str = "validate"):
+        self.device, self.kind = device, kind
+        self.sections, self.raw = dict[str, str](), dict[str, object]()
         self.rows: list[dict] = []
         self.started = datetime.datetime.now()
 
@@ -121,16 +138,48 @@ class Report:
     def text(self) -> str:
         head = f"# leatengine on {self.device}, {self.started:%Y-%m-%d %H:%M}"
         raw = "## Raw\n\n```json\n" + json.dumps(self.raw, indent=1) + "\n```\n"
-        self.sections["speed"] = self._speed()
-        order = ("machine", "tests", "speed", "server")
+        if any("agreement" in r for r in self.rows):
+            self.sections["agreement"] = self._agreement()
+        if any("leatengine" in r for r in self.rows):
+            self.sections["speed"] = self._speed()
+        if errors := self._errors():
+            self.sections["errors"] = "## Errors\n\n" + "\n".join(errors)
+        order = ("machine", "tests", "agreement", "speed", "errors", "server")
         return "\n\n".join([head, *(self.sections[k] for k in order if k in self.sections), raw])
 
     def write(self, directory: Path) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
         host = socket.gethostname()
-        path = directory / f"validate-{host}-{self.device}-{self.started:%Y%m%d-%H%M}.md"
+        path = directory / f"{self.kind}-{host}-{self.device}-{self.started:%Y%m%d-%H%M}.md"
         path.write_text(self.text())
         return path
+
+    def _agreement(self) -> str:
+        # of each model and build of llama.cpp, both perplexities, and KL and top-1 of each way
+        def way(result: dict) -> str:
+            if "kl_mean" not in result:
+                return ""
+            return f"{result['kl_mean']:.4f}, p99 {result['kl_p99']:.4f}, {result['top1']:.1%}"
+
+        def perplexity(result: dict) -> str:
+            return f"{result['perplexity']:.3f}" if "perplexity" in result else ""
+
+        lines = [
+            "## Agreement with llama.cpp\n",
+            "wikitext-2's first 8 chunks of 512 tokens: both engines' perplexity, and LeatEngine's "
+            "KL divergence from each llama.cpp build's next-token distributions, mean and 99th "
+            "percentile, and how often both pick the same token. Lower KL is closer.\n",
+            "| | llama.cpp | llama.cpp perplexity | LeatEngine perplexity | "
+            f"{' | '.join(AGREEMENT)} |",
+            "|---|---|---:|---:" + "|---:" * len(AGREEMENT) + "|",
+        ]
+        for r in self.rows:
+            for build, result in r.get("agreement", {}).items():
+                ways = [result.get(name, {}) for name in AGREEMENT]
+                cells = [f"{build} {result.get('commit', '')}", perplexity(result),
+                         perplexity(ways[0]), *map(way, ways)]  # fmt: skip
+                lines.append(f"| {r['model']} | " + " | ".join(cells) + " |")
+        return "\n".join(lines)
 
     def _speed(self) -> str:
         # tokens per second: one sequence, four at once, and chat replies speculative or not
@@ -166,11 +215,20 @@ class Report:
                     f"| {at(r, 'chat draft', 'per_step')} | {at(r, 'chat 2', 'decode')} "
                     f"| {at(r, 'chat draft 2', 'decode')} |"
                 )
+        return "\n".join(lines)
+
+    def _errors(self) -> list[str]:
+        # each run that failed, agreement's of each build and way among them
         errors = [(r["model"], k, v["error"]) for r in self.rows for k, v in r.items()
                   if isinstance(v, dict) and "error" in v]  # fmt: skip
-        if errors:
-            lines += ["\nErrors:\n"] + [f"- {m}, {k}: `{e}`" for m, k, e in errors]
-        return "\n".join(lines)
+        for r in self.rows:
+            for build, result in r.get("agreement", {}).items():
+                errors += [(r["model"], f"agreement, {build}, {name}", v["error"])
+                           for name, v in result.items()
+                           if isinstance(v, dict) and "error" in v]  # fmt: skip
+                if "error" in result:
+                    errors.append((r["model"], f"agreement, {build}", result["error"]))
+        return [f"- {m}, {k}: `{e}`" for m, k, e in errors]
 
 
 def _ggufs(paths: list[Path]) -> list[Path]:
@@ -268,6 +326,35 @@ def _best(builds: dict[str, dict]) -> dict:
     if "prefill" not in best and "decode" not in best:  # every build failed
         best["error"] = "; ".join(f"{name}: {r['error']}" for name, r in builds.items())
     return best
+
+
+def _agreement(env: dict, model: Path, builds: list[Path], wikitext: Path, out: Path) -> dict:
+    """Of each build of llama.cpp, its perplexity of wikitext's first 8 chunks of 512 tokens and
+    its commit, and LeatEngine's scores of its logits of them, each way of AGREEMENT's."""
+    out.mkdir(parents=True, exist_ok=True)
+    base, results = out / f".{model.stem}.kld", {}
+    for bin_dir in builds:
+        result = _llama_perplexity(bin_dir, model, wikitext, base)
+        if "error" not in result:
+            for name, flags in AGREEMENT.items():
+                result[name] = _leatengine(env, "perplexity", model, "--kl-base", base, *flags)
+        base.unlink(missing_ok=True)  # hundreds of MB
+        results[_name(bin_dir)] = result
+    return results
+
+
+def _llama_perplexity(bin_dir: Path, model: Path, text: Path, base: Path) -> dict:
+    # llama.cpp's perplexity of the text's first 8 chunks of 512, its logits saved to base
+    args = [str(bin_dir / "llama-perplexity"), "-m", str(model), "-f", str(text), "-c", "512",
+            "--chunks", "8", "-ngl", "99", "-fa", "on",
+            "--kl-divergence-base", str(base)]  # fmt: skip
+    done = _run(args, os.environ.copy(), 3600)
+    found = re.search(r"Final estimate: PPL = ([\d.]+)", done["out"] + done["err"])
+    if not done["ok"] or found is None:
+        return {"error": _last_line(done)}
+    version = _run([args[0], "--version"], os.environ.copy(), 60)
+    commit = re.search(r"commit (\w+)", version["out"] + version["err"])
+    return {"perplexity": float(found.group(1)), "commit": commit.group(1) if commit else "?"}
 
 
 def _llama_batched(bin_dir: Path, model: Path) -> dict:

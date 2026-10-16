@@ -53,13 +53,17 @@ uv run leatengine doctor
 DEV=AMD uv run python -c "from tinygrad import Device; print(Device['AMD'].arch)"
 DEV=AMD uv run pytest -m gpu
 uv run python scripts/build_llama_cpp.py
+(cd ~/.cache/leatengine && sh llama.cpp/src/scripts/get-wikitext-2.sh)
 DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp \
-  ~/.cache/leatengine/llama.cpp/build-vulkan/bin ~/.cache/leatengine/llama.cpp/build-hip/bin
+  ~/.cache/leatengine/llama.cpp/build-vulkan/bin ~/.cache/leatengine/llama.cpp/build-hip/bin \
+  --wikitext ~/.cache/leatengine/wikitext-2-raw/wiki.test.raw
 ```
 
 `build_llama_cpp.py` builds llama.cpp at one commit for Vulkan and for HIP with rocWMMA's flash
 attention, for gfx1151; it needs the Vulkan headers and glslc, and ROCm's `hipconfig`.
-`--dry-run` shows its commands.
+`--dry-run` shows its commands. `get-wikitext-2.sh`, from llama.cpp's source, fetches
+wikitext-2, whose test set the report's agreement with each build is measured on
+([agreement](benchmarks.md#agreement-with-llamacpp)).
 
 Run the real-GPU tests in a single process. Start with a model that comfortably fits memory,
 then increase model size, context, and simultaneous sequences. Test vision, embeddings, and

@@ -107,7 +107,10 @@ uv run leatengine bench MODEL.gguf --chat --draft DRAFTER.gguf --json
 uv run leatengine perplexity MODEL.gguf --text wiki.test.raw --ctx 512 --json
 uv run leatengine perplexity MODEL.gguf --kl-base BASE.kld --json
 uv run python scripts/build_llama_cpp.py  # llama.cpp for Vulkan and for HIP
-DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp BUILD/bin [BUILD/bin ...]
+DEV=AMD uv run python scripts/agreement.py /models --llama-cpp BUILD/bin [BUILD/bin ...] \
+  --wikitext wiki.test.raw
+DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp BUILD/bin [BUILD/bin ...] \
+  --wikitext wiki.test.raw
 ```
 
 - `bench -s N` decodes N sequences at once; `bench --chat` decodes replies to chat prompts,
@@ -116,14 +119,18 @@ DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp BUILD/bin
   add `--decode` for the decode path and `--chunks N` to score fewer chunks.
 - `bench` and `perplexity` take `--cache-type q8_0` for a KV cache of q8_0 rather than f16, as
   llama.cpp's `-ctk q8_0 -ctv q8_0`; `bench --json` gives the cache it ran with.
-- `scripts/validate_hardware.py` runs the GPU tests, speed against llama.cpp, chat replies with
-  and without a drafter, and a streamed HTTP request, and writes a report under the ignored
-  `reports/` directory. Its batched columns time 4 sequences decoding 128 tokens each after
-  1-token prompts, on both engines. `--quick` runs one repetition and skips the batched and chat
-  runs; `--no-tests` skips the GPU tests. Given several llama.cpp builds, as
-  `scripts/build_llama_cpp.py`'s of Vulkan and of HIP at one commit, it runs each and reports
-  the better per model and measure, naming the build. Its process exit status is not a verdict:
-  read the failures in its report.
+- `scripts/agreement.py` measures the agreement table above for each model and llama.cpp build:
+  `llama-perplexity --kl-divergence-base` with `-fa on`, then `perplexity --kl-base` as prompts,
+  with `--decode`, and with `--cache-type q8_0`. `wiki.test.raw` is wikitext-2's test set, as
+  llama.cpp's `scripts/get-wikitext-2.sh` fetches it.
+- `scripts/validate_hardware.py` runs the GPU tests, agreement as `agreement.py` does when given
+  `--wikitext`, speed against llama.cpp, chat replies with and without a drafter, and a streamed
+  HTTP request, and writes a report under the ignored `reports/` directory. Its batched columns
+  time 4 sequences decoding 128 tokens each after 1-token prompts, on both engines. `--quick` runs
+  one repetition and skips the batched and chat runs; `--no-tests` skips the GPU tests. Given
+  several llama.cpp builds, as `scripts/build_llama_cpp.py`'s of Vulkan and of HIP at one commit,
+  it runs each and reports the better per model and measure, naming the build. Its process exit
+  status is not a verdict: read the failures in its report.
 
 Record the engine and tinygrad commits, the llama.cpp commit and build options, the model file and
 quantization, the KV cache's type, the hardware, driver and compiler, the context, prompt and output
