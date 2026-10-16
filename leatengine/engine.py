@@ -10,11 +10,13 @@ from pathlib import Path
 from typing import Any, cast
 
 from tinygrad import Device, Tensor, TinyJit, UOp, dtypes
+from tinygrad.device import Buffer
 
 from leatengine import machine
 from leatengine.draft import Drafter, needs
 from leatengine.draft import load as load_drafter
 from leatengine.gguf import GGUF
+from leatengine.grammar import Constraint, Grammar, Matcher, Tokens
 from leatengine.kernels import FEW_TOKENS, MATVEC_TOKENS, VARIABLES
 from leatengine.model import CACHE_TILE, Config, Transformer, cache_bytes, zeros
 from leatengine.ops import Span
@@ -63,6 +65,7 @@ class Sequence:
     ignore_eog: bool
     slot: int
     images: dict[int, Image] = field(default_factory=dict)
+    constraint: Constraint | None = None  # what of the vocab it may take next, if held to less
     tokens: list[int] = field(default_factory=list)  # generated so far, the last not yet run
     done: bool = False  # generated all it will, or cancelled
     # its sampling options and seed for the graphs, as (1, 5) and (1,) tensors
@@ -185,6 +188,12 @@ class Engine:
         # reply must write again and again, and which, lowered, it would garble or leave out
         vocab = int(self.model.output.shape[0])
         self._seen = zeros(cache_slots, vocab, dtype=dtypes.bool)
+        # the tokens each slot's sequence may take next, a bit each, all but where a constraint
+        # holds it to fewer; and the mask each holds, None for all
+        self._allowed = zeros(cache_slots, -(-vocab // 32), dtype=dtypes.uint32) - 1
+        self._allowed.realize()
+        self._masks: list[int | None] = [None] * cache_slots
+        self._vocab: Tokens | None = None  # its bytes, sorted, once a constraint needs them
         special = self.tokenizer.special_ids
         self._text = Tensor([i not in special for i in range(vocab)]).realize()
         self.max_context, self.prefill_chunk, self.slots = max_context, prefill_chunk, slots
@@ -255,6 +264,7 @@ class Engine:
         ignore_eog: bool = False,
         images: Iterable[Image] = (),
         owner: str = "",
+        constraint: Constraint | None = None,
     ) -> Generator[int, None, None]:
         """Yields up to `max_tokens` ids; stops early at end of generation or the context limit.
 
@@ -264,7 +274,9 @@ class Engine:
         """
         if self.active:
             raise RuntimeError("another generation is unfinished: exhaust or close it first")
-        sequence = self.start(prompt, max_tokens, sampling, seed, ignore_eog, images, owner)
+        sequence = self.start(
+            prompt, max_tokens, sampling, seed, ignore_eog, images, owner, constraint
+        )
         try:
             while not sequence.done:
                 for _, token in self.step():
@@ -281,10 +293,12 @@ class Engine:
         ignore_eog: bool = False,
         images: Iterable[Image] = (),
         owner: str = "",
+        constraint: Constraint | None = None,
     ) -> Sequence:
         """Starts a generation in a free slot, as generate() would; step() advances it. The
         prompt shows each of `images` with its tokens, and shares cached tokens only of prompts
-        of the same `owner`."""
+        of the same `owner`. A `constraint` holds each token it draws to those it allows, as
+        constrain() makes one; such a sequence never decodes speculatively."""
         if not self.config.causal:
             raise ValueError("an encoder, whose tokens see each other, only embeds")
         if max_tokens < 1:
@@ -301,9 +315,22 @@ class Engine:
             raise RuntimeError(f"all {self.slots} slots are generating")
         seed = random.getrandbits(32) if seed is None else seed % 2**32
         slot = self._claim(prompt, owner)
-        sequence = Sequence(prompt, max_tokens, sampling, seed, ignore_eog, slot, shown)
+        sequence = Sequence(prompt, max_tokens, sampling, seed, ignore_eog, slot, shown, constraint)
         self.active.append(sequence)
+        self._mask(sequence)
         return sequence
+
+    def constrain(
+        self, grammar: Grammar, preamble: tuple[str, str] | str | None = None,
+        masks: dict | None = None,
+    ) -> Constraint:  # fmt: skip
+        """A constraint of a reply to a grammar, after its preamble, for start(): what reasoning
+        goes before the JSON, as grammar.Matcher takes it. Constraints of the same grammar and
+        preamble may share their `masks`, which they cache by state."""
+        if self._vocab is None:
+            tok = self.tokenizer
+            self._vocab = Tokens(tok.pieces, tok.special_ids, tok.eog_ids)
+        return Constraint(Matcher(grammar, preamble), self._vocab, masks)
 
     def step(self) -> list[tuple[Sequence, int]]:
         """Advances the active sequences: a chunk of the first one's prompt still to prefill, then
@@ -311,6 +338,9 @@ class Engine:
         the end of its prompt; sequences that are done leave `active`."""
         decoding = [s for s in self.active if s.tokens]
         speculating = bool(decoding) and self._speculates(decoding)
+        for sequence in self.active:  # of those it holds to fewer, the tokens they may take
+            if sequence.constraint is not None:
+                self._mask(sequence)
         out = []
         prefilling = next((s for s in self.active if not s.tokens), None)
         size = min(self.prefill_chunk, SHARED_CHUNK) if decoding else self.prefill_chunk
@@ -321,6 +351,8 @@ class Engine:
             out += zip(decoding, tokens, strict=True)
         for sequence, token in out:
             sequence.tokens.append(token)
+            if sequence.constraint is not None:
+                sequence.constraint.advance(token, self.tokenizer.pieces[token])
             self._check(sequence)
         if speculating:
             out += self._speculative(decoding)
@@ -609,7 +641,8 @@ class Engine:
             return room and sequence.max_tokens - len(sequence.tokens) > 1
 
         few = len(sequences) in self._speculated
-        return self.drafter is not None and few and all(map(each, sequences))
+        free = all(s.constraint is None for s in sequences)
+        return self.drafter is not None and few and free and all(map(each, sequences))
 
     def _speculative(self, sequences: list[Sequence]) -> list[tuple[Sequence, int]]:
         # a speculative step of the sequences: of each, the drafts it keeps, those the target
@@ -723,11 +756,29 @@ class Engine:
             self.drafter.copy(source, slot)
             self._hidden[slot : slot + 1].assign(self._hidden[source : source + 1]).realize()
 
+    def _mask(self, sequence: Sequence) -> None:
+        # the tokens a sequence may take next, into its slot's mask where they changed: all, or
+        # those its constraint allows
+        slot, constraint = sequence.slot, sequence.constraint
+        mask = None if constraint is None else constraint.mask()
+        if mask == self._masks[slot]:
+            return
+        # copied straight into the slot's row, as Tensor.tolist() copies out: an assign() would
+        # be scheduled anew each time, 3.4 ms of a token's 7 on the 3090
+        size = 4 * int(self._allowed.shape[1])
+        data = ((1 << 8 * size) - 1 if mask is None else mask).to_bytes(size, "little")
+        assert isinstance(buffer := self._allowed.uop.buffer, Buffer)
+        host = Buffer("NPY", size, opaque=memoryview(bytearray(data)))
+        buffer.view(size, size * slot).ensure_allocated().copy_from(host)
+        self._masks[slot] = mask
+
     def _check(self, sequence: Sequence) -> None:
-        # ends a sequence at end of generation, at max_tokens, or with the cache full
+        # ends a sequence at end of generation, at max_tokens, with the cache full, or where its
+        # constraint takes nothing more
         token, held = sequence.tokens[-1], len(self._cached[sequence.slot])
         eog = token in self.tokenizer.eog_ids and not sequence.ignore_eog
-        if eog or len(sequence.tokens) == sequence.max_tokens or held >= self.max_context:
+        over = sequence.constraint is not None and sequence.constraint.over()
+        if eog or over or len(sequence.tokens) == sequence.max_tokens or held >= self.max_context:
             self.cancel(sequence)
 
     def _step(
@@ -752,12 +803,14 @@ class Engine:
                 hidden = self.model.forward(image, spans, positions=positions)
             hidden = self._followed(tokens, hidden, spans, positions)
             logits = self.model.logits(hidden[:, -1, :])
-            return sample(logits, options, seed, start + length, seen).realize()
+            allowed = self._allowed[slot : slot + 1]
+            return sample(logits, options, seed, start + length, seen, allowed).realize()
         spans = [Span(slot, start) for slot, start in pairs]
         hidden = self._followed(tokens, self.model.run(tokens, spans, live), spans)
         logits = self.model.logits(hidden).reshape(len(pairs), -1)
         positions = Tensor.stack(*(Tensor(start + 1) for _, start in pairs))
-        return sample(logits, options, seed, positions, seen).realize()
+        allowed = Tensor.cat(*(self._allowed[slot : slot + 1] for slot in slots))
+        return sample(logits, options, seed, positions, seen, allowed).realize()
 
     def _embedded(self, tokens: Tensor, slot: UOp, start: UOp) -> Tensor:
         # runs a chunk of a prompt to embed, causally or as an encoder's: its tokens pooled

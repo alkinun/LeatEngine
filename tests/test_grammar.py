@@ -39,7 +39,7 @@ def takes(matcher: Matcher, text: str) -> bool:
 
 @pytest.mark.parametrize("text", [
     '{}', '{"a": 1}', '{"a":-0.5e+10,"b":[true,false,null,"x\\"y\\u00e9"]}', ' {"k": {}}',
-    '{\n  "a": [\n    1,\n    {}\n  ]\n}', '{"é": "ü😀"}', '{"a": 1}\n',
+    '{\n  "a": [\n    1,\n    {}\n  ]\n}', '{"é": "ü😀"}',
 ])  # fmt: skip
 def test_json(text):
     assert takes(Matcher(Grammar(None)), text)
@@ -48,11 +48,11 @@ def test_json(text):
 @pytest.mark.parametrize("text", [
     '[]', '"x"', '{"a": 01}', '{"a" 1}', '{"a": 1,}', '{"a": tru}', '{"a": "x\ny"}',
     '{"a": 1.}', '{"a": .5}', '{"a": "\\x"}', '{"a": "\\u12g4"}', "{'a': 1}", '{"a": 1}}',
-    '{  "a": 1}', '{\n' + ' ' * 21 + '"a": 1}', '{"a": ' + '9' * 17 + '}',
+    '{  "a": 1}', '{\n' + ' ' * 21 + '"a": 1}', '{"a": ' + '9' * 17 + '}', '{"a": 1}\n',
 ])  # fmt: skip
 def test_not_json(text):
     # neither JSON, nor whitespace as llama.cpp's JSON grammar takes it, nor a number's digits
-    # past DIGITS
+    # past DIGITS, nor anything after the JSON
     assert not takes(Matcher(Grammar(None)), text)
 
 
@@ -139,6 +139,11 @@ def test_values_at_the_root():
     assert takes(Matcher(Grammar(tree)), '{"kids": [{"kids": []}, {"kids": [{"kids": []}]}]}')
 
 
+DEEP: dict = {"type": "null"}
+for _ in range(64):
+    DEEP = {"type": "array", "items": DEEP}
+
+
 @pytest.mark.parametrize("schema, said", [
     ({"type": "string", "pattern": "a+"}, "the schema's pattern is not supported"),
     ({"type": "string", "format": "date"}, "the schema's format is not supported"),
@@ -150,6 +155,16 @@ def test_values_at_the_root():
     ({"$ref": "other.json"}, "the schema's $ref other.json is not supported"),
     ({"type": "text"}, "a schema's type is one of object"),
     ({"enum": []}, "a schema's enum lists its values"),
+    ({"$ref": "#"}, "the schema refers to itself before a value of its own"),
+    ({"$ref": 1}, "a schema's $ref is a string"),
+    ({"type": "array", "minItems": 2, "maxItems": 1}, "minItems and maxItems are whole numbers"),
+    ({"type": "array", "minItems": "1"}, "minItems and maxItems are whole numbers"),
+    ({"type": "object", "required": "a"}, "a schema's required lists the names"),
+    ({"type": "object", "properties": []}, "a schema's properties are an object of schemas"),
+    (DEEP, "the schema nests deeper than 64 levels"),
+    ({"$defs": {"a": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/b"}]},
+                "b": {"$ref": "#/$defs/a"}}, "$ref": "#/$defs/a"},
+     "the schema refers to itself before a value of its own"),
 ])  # fmt: skip
 def test_refused(schema, said):
     # a keyword that would hold more of a value than the grammar holds is refused, not ignored

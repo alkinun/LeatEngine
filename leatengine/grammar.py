@@ -29,6 +29,7 @@ from typing import Any
 # whitespace between a value's parts: none, a space, or a newline and up to INDENT spaces or tabs
 INDENT = 20
 DIGITS = 16  # most digits of a number's integer part, and of its fraction
+NESTING = 64  # most levels a schema nests, well within Python's recursion
 # the keywords a schema may hold that hold nothing more of a value, which are ignored
 _NOTES = {"title", "description", "examples", "default", "$schema", "$id", "$comment",
           "deprecated", "readOnly", "writeOnly", "$defs", "definitions"}  # fmt: skip
@@ -71,12 +72,28 @@ class Grammar:
         # of no schema, any object, as OpenAI's json_object has a reply be
         self.nodes: list[Node] = []
         self._refs: dict[str, int] = {}
-        self._root = schema
+        self._root, self._depth = schema, 0
         if schema is None:
             self._add(Node("object"))
             self.nodes[0] = Node("object", extra=self._any())
         else:
             self._compile(schema)
+        done: set[int] = set()
+        for at in range(len(self.nodes)):
+            self._grounded(at, set(), done)
+
+    def _grounded(self, at: int, path: set[int], done: set[int]) -> None:
+        # refuses an anyOf that is an option of its own, as {"$ref": "#"} is: its values would
+        # begin with one of its own, never ending
+        if at in path:
+            raise ValueError("the schema refers to itself before a value of its own")
+        if at in done or self.nodes[at].kind != "anyOf":
+            return
+        path.add(at)
+        for option in self.nodes[at].options:
+            self._grounded(option, path, done)
+        path.remove(at)
+        done.add(at)
 
     def _add(self, node: Node) -> int:
         self.nodes.append(node)
@@ -94,11 +111,22 @@ class Grammar:
         return at
 
     def _compile(self, schema: Any) -> int:
+        self._depth += 1
+        try:
+            if self._depth > NESTING:
+                raise ValueError(f"the schema nests deeper than {NESTING} levels")
+            return self._node(schema)
+        finally:
+            self._depth -= 1
+
+    def _node(self, schema: Any) -> int:
         if not isinstance(schema, dict):
             raise ValueError(f"a schema is an object, not {json.dumps(schema)}")
         if unknown := sorted(set(schema) - _KEYWORDS):
             raise ValueError(f"the schema's {unknown[0]} is not supported")
         if "$ref" in schema:
+            if not isinstance(schema["$ref"], str):
+                raise ValueError("a schema's $ref is a string")
             return self._ref(schema["$ref"])
         if "const" in schema or "enum" in schema:
             values = [schema["const"]] if "const" in schema else schema["enum"]
@@ -138,6 +166,8 @@ class Grammar:
             at = self._add(Node("array"))
             items = self._compile(schema["items"]) if "items" in schema else self._any()
             least, most = schema.get("minItems", 0), schema.get("maxItems")
+            if not _whole(least) or most is not None and not (_whole(most) and most >= least):
+                raise ValueError("a schema's minItems and maxItems are whole numbers, least first")
             self.nodes[at] = Node("array", items=items, least=least, most=most)
             return at
         if kinds in ("boolean", "null"):
@@ -147,10 +177,14 @@ class Grammar:
 
     def _object(self, schema: dict[str, Any]) -> int:
         at = self._add(Node("object"))
-        required = set(schema.get("required", []))
+        named, defined = schema.get("required", []), schema.get("properties", {})
+        if not isinstance(named, list) or not all(isinstance(key, str) for key in named):
+            raise ValueError("a schema's required lists the names of its properties")
+        if not isinstance(defined, dict):
+            raise ValueError("a schema's properties are an object of schemas")
+        required = set(named)
         properties = tuple(
-            (key, self._compile(value), key in required)
-            for key, value in schema.get("properties", {}).items()
+            (key, self._compile(value), key in required) for key, value in defined.items()
         )
         if unknown := required - {key for key, _, _ in properties}:
             raise ValueError(f"the schema requires {sorted(unknown)[0]}, which it does not define")
@@ -182,6 +216,10 @@ class Grammar:
         return at
 
 
+def _whole(v: Any) -> bool:
+    return type(v) is int and v >= 0
+
+
 Frame = tuple[Any, ...]
 Stack = tuple[Frame, ...]
 State = frozenset[Stack]
@@ -206,7 +244,7 @@ class Matcher:
     ("literals", choices): of choices, each (bytes still to come, the frame its end goes on with
         or None);
     ("until", marker, matched): text up to and through a marker, as reasoning before the JSON;
-    ("done", ws): the reply's JSON whole, and whitespace after it.
+    ("done",): the reply's JSON whole, which nothing follows.
     """
 
     def __init__(self, grammar: Grammar, preamble: tuple[str, str] | str | None = None):
@@ -258,9 +296,7 @@ class Matcher:
             return self._literals(top, rest, b)
         if kind == "until":
             return self._until(top, rest, b)
-        if (ws := _spaced(top[1], b)) is not None:  # done: whitespace after the JSON
-            return [(("done", ws),)]
-        return []
+        return []  # done: nothing follows the JSON
 
     def _value(self, at: int, rest: Stack, b: int) -> list[Stack]:
         # the first byte of a value of node `at`
@@ -294,7 +330,7 @@ class Matcher:
         if then is not None:
             return [(*rest, then)]
         if not rest:
-            return [(("done", 0),)]
+            return [(("done",),)]
         parent, below = rest[-1], rest[:-1]
         if parent[0] == "object":
             return [(*below, ("object", parent[1], parent[2], "after", 0, None))]
@@ -467,6 +503,8 @@ class Tokens:
         if any(stack[-1][0] == "until" for stack in state):
             return None
         mask = sum(1 << i for i in self.ends) if matcher.done(state) else 0
+        if not state:
+            return mask
         if any(frame[0] == "until" for stack in state for frame in stack):  # a marker's opening
             mask |= sum(1 << i for b, i in self._markup if matcher.feed(state, b))
         if all(stack[-1][0] == "string" and stack[-1][1] == 0 for stack in state):
@@ -529,3 +567,11 @@ class Constraint:
         """Takes in a token generated, of these bytes."""
         if token not in self.tokens.ends:
             self.state = self.matcher.feed(self.state, spelled)
+
+    def over(self) -> bool:
+        """Whether the reply is whole and nothing but an end may follow it, which a model without
+        one cannot write."""
+        if not self.matcher.done(self.state):
+            return False
+        mask = self.mask()
+        return mask is not None and not mask & ~sum(1 << i for i in self.tokens.ends)

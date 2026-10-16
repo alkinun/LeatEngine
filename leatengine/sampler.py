@@ -30,11 +30,12 @@ GREEDY = Sampling()
 
 def sample(
     logits: Tensor, options: Tensor, seed: Tensor, position: Tensor | int | UOp,
-    seen: Tensor | None = None,
+    seen: Tensor | None = None, allowed: Tensor | None = None,
 ) -> Tensor:  # fmt: skip
     """Picks one token per row of `logits` (B, V), each row a sequence of its own, as its
     Sampling.values() in `options` float32 (B, 5) say; seen (B, V) bool marks the tokens each has
-    generated, those presence_penalty lowers.
+    generated, those presence_penalty lowers; allowed uint32 (B, V / 32, whole words) the tokens
+    each may take, token t of word t // 32 by bit t % 32, as a constrained reply's grammar has it.
 
     `options` and `seed` uint32 hold a row per row, or one for all, (1, 5) and (1,); they are
     tensors so one compiled graph serves every value. A row's draw depends only on its logits,
@@ -45,6 +46,9 @@ def sample(
     partly cached can tip a near tie apart, at its first token too.
     """
     temperature, top_k, top_p, min_p, presence = (options[:, i : i + 1] for i in range(5))
+    if allowed is not None:
+        bits = (allowed.unsqueeze(-1) >> Tensor.arange(32, dtype=dtypes.uint32)) & 1
+        logits = (bits.flatten(1)[:, : logits.shape[-1]] == 1).where(logits, -math.inf)
     if seen is not None:
         logits = logits - seen.where(presence, 0.0)
     scores = logits / temperature.maximum(1e-6)

@@ -211,7 +211,8 @@ class Tokenizer:
         self._cache: dict[str, tuple[int, ...]] = {}  # words' tokens, of _CACHED characters
         self._cached = 0
 
-        self._bytes = [_spell(t, ty, self._byte_level) for t, ty in zip(tokens, types, strict=True)]
+        # the bytes each token decodes to, of control tokens none
+        self.pieces = [_spell(t, ty, self._byte_level) for t, ty in zip(tokens, types, strict=True)]
         # tokens special text spells, as llama.cpp's: <unk> too, which plain text never matches
         special = {
             t: i for i, t in enumerate(tokens) if types[i] in (CONTROL, USER_DEFINED, UNKNOWN)
@@ -256,7 +257,7 @@ class Tokenizer:
         return ids + self._encode_ordinary(text[pos:], strip)
 
     def decode(self, ids: list[int]) -> str:
-        pieces = [self._bytes[i] for i in ids]
+        pieces = [self.pieces[i] for i in ids]
         if pieces and ids[0] != self.bos_id:
             pieces[0] = self._lstrip(pieces[0])
         return b"".join(pieces).decode("utf-8", errors="replace")
@@ -270,7 +271,7 @@ class Tokenizer:
         def step(i: int | None) -> str:
             if i is None:
                 return decoder.decode(b"", final=True)
-            piece = self._bytes[i]
+            piece = self.pieces[i]
             return decoder.decode(self._lstrip(piece) if next(pieces) == 0 else piece)
 
         return step

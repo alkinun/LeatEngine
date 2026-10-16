@@ -1040,13 +1040,16 @@ def test_argmax(rows, n):
 
 
 @pytest.mark.parametrize("rows, n", [(1, 248320), (5, 32000), (2, 300)])
-def test_cutoff(rows, n):
+@pytest.mark.parametrize("masked", [False, True])
+def test_cutoff(rows, n, masked):
     # within a step below the exact cuts, of top_k alone, top_p alone or both; top_k 0 keeps
     # every token, which the kernel takes as the step of its grid RANGE below the top, and top_p
-    # 0 the top one
+    # 0 the top one; of all tokens, or of 50 a constraint leaves, the others -inf
     rng = np.random.default_rng(n)
     x = (rng.standard_normal((rows, n)) * 2.5).astype(np.float32)
     x[:, : n // 100] += 9  # a head of likely tokens
+    if masked:
+        x[:, rng.permutation(n)[50:]] = -np.inf
     top_k, top_p = np.array([20, 0, 5, 1, 0][:rows]), np.array([0.95, 0.9, 1.0, 0.5, 0.0][:rows])
     options = (Tensor(o.reshape(-1, 1).astype(np.float32)) for o in (top_k, top_p))
     assert kernels.supports_cutoff(Tensor(x))

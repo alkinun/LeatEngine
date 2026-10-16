@@ -7,6 +7,7 @@ from tinygrad import Tensor
 from leatengine.draft import mtp, needs, own_drafter
 from leatengine.engine import DRAFT_TOKENS, KEEP_BACK, Engine
 from leatengine.gguf import GGUF
+from leatengine.grammar import Grammar
 from leatengine.model import Config
 from leatengine.sampler import GREEDY, Sampling
 from tests.helpers import CONTEXT, Oracle, reference_drafts, reference_mtp_drafts, split_mtp
@@ -142,6 +143,27 @@ def test_drafters_take_a_q8_0_cache(tiny, tiny_assistant, arch):
 
     engine._speculative = counted  # type: ignore[method-assign]
     assert list(engine.generate(PROMPT, 12)) == plain and steps > 0
+
+
+@pytest.mark.usefixtures("reference_ops")
+def test_constrained_never_speculates(tiny, tiny_assistant):
+    # a sequence held to a grammar decodes plainly beside a drafter, whose guesses each step's
+    # mask would not check: as it would without one
+    path, draft = models(tiny, tiny_assistant, "gemma4")
+    options = {"max_context": CONTEXT, "prefill_chunk": 8}
+    plain = Engine(path, **options)
+    expected = list(plain.generate(PROMPT, 12, constraint=plain.constrain(Grammar(None))))
+    engine, steps = Engine(path, draft=draft, **options), 0
+    speculative = engine._speculative
+
+    def counted(sequences):
+        nonlocal steps
+        steps += 1
+        return speculative(sequences)
+
+    engine._speculative = counted  # type: ignore[method-assign]
+    held = list(engine.generate(PROMPT, 12, constraint=engine.constrain(Grammar(None))))
+    assert held == expected and steps == 0
 
 
 def wrong(tokens: list[int]) -> list[int]:

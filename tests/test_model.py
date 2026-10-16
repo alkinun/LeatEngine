@@ -1,3 +1,4 @@
+import json
 import math
 import subprocess
 from dataclasses import replace
@@ -11,6 +12,7 @@ from tinygrad.helpers import Context, diskcache_get, diskcache_put
 from leatengine import bench, machine, ops
 from leatengine.engine import FEW_TOKENS, KEEP_BACK, RESERVE, Engine, _fitted, graph
 from leatengine.gguf import GGUF
+from leatengine.grammar import Grammar
 from leatengine.kernels import VARIABLES
 from leatengine.machine import Memory
 from leatengine.model import (
@@ -780,6 +782,61 @@ def test_presence_penalty(tiny_model):
     special = engine.tokenizer.special_ids
     assert special and engine._text.numpy().tolist() == [
         i not in special for i in range(len(engine._text.numpy()))]  # fmt: skip
+
+
+# ******** constrained replies ********
+
+SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"enum": ["x", "yz"]}},
+          "required": ["a", "b"], "additionalProperties": False}  # fmt: skip
+
+
+def constrained(engine: Engine, grammar: Grammar, n: int, seed: int) -> tuple[list[int], bool]:
+    # a sampled reply held to a grammar, and whether its JSON is whole
+    constraint = engine.constrain(grammar)
+    out = list(engine.generate(PROMPT, n, Sampling(1.0), seed=seed, constraint=constraint))
+    return out, constraint.matcher.done(constraint.state)
+
+
+def check_constrained(engine: Engine) -> None:
+    # sampled replies held to a schema: each a JSON value of it where whole, ended there, as the
+    # tiny model has no end token, and a prefix of one where max_tokens cut it
+    grammar, whole = Grammar(SCHEMA), 0
+    for seed in range(6):
+        out, done = constrained(engine, grammar, 40, seed)
+        if not done:
+            assert len(out) == 40
+            continue
+        value = json.loads(engine.tokenizer.decode(out))
+        assert isinstance(value["a"], int) and value["b"] in ("x", "yz") and len(value) == 2
+        whole += 1
+    assert whole
+
+
+@pytest.mark.usefixtures("reference_ops")
+def test_constrained(tiny_model):
+    check_constrained(Engine(tiny_model[0], max_context=CONTEXT, prefill_chunk=8))
+
+
+@pytest.mark.usefixtures("reference_ops")
+def test_constrained_beside_free(tiny_model):
+    # a constrained sequence leaves those decoding beside it as they would be alone, and its slot,
+    # once it ends, free to the next
+    path, _ = tiny_model
+    engine = Engine(path, max_context=CONTEXT, prefill_chunk=8, slots=2)
+    constraint = engine.constrain(Grammar(None))
+    held = engine.start(PROMPT, 12, Sampling(1.0), seed=1, constraint=constraint)
+    free = engine.start(PROMPT[::-1], 12, Sampling(1.0), seed=2)
+    while engine.active:
+        engine.step()
+    assert held.tokens and free.tokens == generated(path, PROMPT[::-1], 12, Sampling(1.0), 2)
+    again = list(engine.generate(PROMPT, 12, Sampling(1.0), seed=3))
+    assert again == generated(path, PROMPT, 12, Sampling(1.0), 3)
+
+
+@pytest.mark.gpu
+def test_constrained_kernels(tiny_model):
+    # through the kernels, the cutoff's too, of the few tokens a grammar leaves
+    check_constrained(Engine(tiny_model[0], max_context=CONTEXT, prefill_chunk=8))
 
 
 # ******** several sequences at once ********
