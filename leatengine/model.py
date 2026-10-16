@@ -554,6 +554,23 @@ class Transformer:
         if states := [state for states in self.states if states for state in states]:
             Tensor.realize(*(s[slot : slot + 1].assign(s[source : source + 1]) for s in states))
 
+    def tile(self, slot: int | UOp, tile: int | UOp) -> list[Tensor]:
+        """Slot `slot`'s keys and values at a tile of CACHE_TILE positions, the `tile`-th, of each
+        layer whose cache holds every position: views, which the prefix store reads and writes."""
+        at = tile * CACHE_TILE
+        return [cache[:, slot : slot + 1, :, at : at + CACHE_TILE]
+                for cache, ring in zip(self.cache, self.rings, strict=True)
+                if cache is not None and not ring]  # fmt: skip
+
+    def held(self, slot: int | UOp) -> list[Tensor]:
+        """The rest of what slot `slot` holds: its rings whole, and its recurrent states and the
+        copy of them kept: views, which the prefix store reads and writes."""
+        rings = [cache[:, slot : slot + 1]
+                 for cache, ring in zip(self.cache, self.rings, strict=True)
+                 if cache is not None and ring]  # fmt: skip
+        return rings + [s[slot : slot + 1] for group in (self.states, self.kept)
+                        for states in group if states for s in states]  # fmt: skip
+
     def holds(self, written: int, position: int) -> bool:
         """Whether a slot that ran the positions before `position`, and whose rings any run has
         written up to `written` at most since it last started from position 0, still holds the

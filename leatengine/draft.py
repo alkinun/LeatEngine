@@ -23,6 +23,12 @@ class Drafter(Protocol):
     # sequences it drafts for at once at most, past which plain steps decode faster
     sequences: int
 
+    @property
+    def own(self) -> Transformer | None:
+        """Its layers as a Transformer of their own, if they keep keys and values of their own in
+        each slot, which the prefix store takes with the target's."""
+        ...
+
     def draft(
         self, tokens: Tensor, hidden: Tensor, slots: PerSequence, positions: PerSequence, count: int
     ) -> Tensor:
@@ -150,6 +156,7 @@ class Gemma4Assistant:
     # for Gemma 4 26B A4B on the 3090, 2 sequences decoded at 1.11 times the speed of plain steps,
     # and 3 at 1.04
     sequences = 3
+    own = None  # it reads the target's keys and values
 
     def __init__(self, gguf: GGUF, target: Transformer):
         arch, c = gguf.metadata["general.architecture"], target.config
@@ -264,7 +271,7 @@ class Qwen35Mtp:
         weights = {f"blk.0.{n}": t for n, t in w.items()}
         weights |= {"token_embd.weight": target.embed, "output.weight": target.output}
         weights["output_norm.weight"] = head_norm
-        self.layer = Transformer(
+        self.layer = self.own = Transformer(
             _mtp_config(c), weights, target.max_context, target.slots, cache_type=target.cache_type
         )
 

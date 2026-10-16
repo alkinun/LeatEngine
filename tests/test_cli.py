@@ -297,7 +297,9 @@ def test_serve_directories(tiny_model, tmp_path, monkeypatch, capsys):
     main(["serve", str(models), "--host", "::1"])  # this machine's alone: no keys needed
     assert keys[-1] is None and samplings[-1] is None and engines[-1]["cache_type"] == "f16"
     main(["serve", str(models), "--cache-type", "q8_0"])
-    assert engines[-1]["cache_type"] == "q8_0"
+    assert engines[-1]["cache_type"] == "q8_0" and engines[-1]["prefix_store"] == 0
+    main(["serve", str(models), "--prefix-store", "1.5"])
+    assert engines[-1]["prefix_store"] == 3 << 29
     # an operator's sampling, read as it starts, which a file of none or a broken one stops
     sampling = tmp_path / "sampling.json"
     with pytest.raises(SystemExit, match="cannot be read"):
@@ -329,6 +331,9 @@ def test_serve_directories(tiny_model, tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit):
         main(["serve", "--cache-type", "q4_0", str(models)])
     assert "--cache-type: invalid choice: 'q4_0'" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        main(["serve", "--prefix-store", "-1", str(models)])
+    assert "must be 0 or more, got -1" in capsys.readouterr().err
 
 
 def test_url():

@@ -21,6 +21,7 @@ from leatengine.grammar import Constraint, Grammar, Matcher, Tokens
 from leatengine.kernels import FEW_TOKENS, MATVEC_TOKENS, VARIABLES
 from leatengine.model import CACHE_TILE, Config, Transformer, cache_bytes, check, zeros
 from leatengine.ops import Span
+from leatengine.prefixes import Prefix, PrefixStore
 from leatengine.sampler import GREEDY, Sampling, sample
 from leatengine.tokenizer import Tokenizer
 from leatengine.vision import Image, Vision, blank
@@ -132,6 +133,12 @@ class Engine:
     again where the cache holds it. Of M-RoPE, as Qwen3.5's, an image takes fewer of RoPE's
     positions than of the cache's: each slot's RoPE moves on by as many as the images before.
 
+    With a prefix store of `prefix_store` bytes of host memory, what a slot held when another
+    prompt takes it goes there, of a tile of positions or more, the least recently used let go
+    first: a later prompt that starts as one of them did takes it back into a slot, copying it
+    rather than prefilling it again, as agents' sessions, more of them than there are slots, each
+    go on from their last turn.
+
     A sliding-window layer's cache holds its window and the most tokens a step runs of a sequence
     more, its chunk of prompt, image or speculative tokens, as a ring, rather than the whole
     context. A slot's rings hold only the last positions its runs wrote, as many as their size: it
@@ -147,7 +154,7 @@ class Engine:
     def __init__(
         self, path: str | Path, max_context: int | None = None, prefill_chunk: int = 512,
         slots: int = 1, draft: str | Path | None = None, vision: str | Path | None = None,
-        cache_type: str = "f16",
+        cache_type: str = "f16", prefix_store: int = 0,
     ):  # fmt: skip
         if slots < 1:
             raise ValueError(f"slots must be at least 1, got {slots}")
@@ -276,6 +283,15 @@ class Engine:
         self._used = [0] * slots  # when each slot last started a generation
         self._clock = itertools.count(1)
         self.active: list[Sequence] = []  # in the order they started
+        # the prefix store, if any, and what moves a slot's data to it and back: a tile of its
+        # positions' keys and values at a time, and the rest of what it holds
+        self.store = PrefixStore(prefix_store) if prefix_store else None
+        self._tile = UOp.variable("tile", 0, -(-max_context // CACHE_TILE) - 1)
+        self._tile_out, self._tile_in = graph(self._tile_block), graph(self._put_tile)
+        self._held_out, self._held_in = graph(self._held_block), graph(self._put_held)
+        # whether slots hold more than their positions' keys and values: rings, recurrent states,
+        # a drafter's
+        self._more = bool(self._held_parts(self._slot_vars[0]))
 
     def generate(
         self,
@@ -458,6 +474,11 @@ class Engine:
             self._restore(self._slot_vars[0].bind(0))
         if self._mrope:  # and moving a slot's RoPE on
             self._shift(self._slot_vars[0].bind(0), self._offset.bind(0))
+        if self.store is not None:  # and moving a slot's data to the store and back
+            row = self._slot_vars[0].bind(0)
+            self._tile_in(row, self._tile.bind(0), self._tile_out(row, self._tile.bind(0)))
+            if self._more:
+                self._held_in(row, self._held_out(row))
         if self.vision is not None:  # and encoding an image, and its chunk
             image = self.image(blank())
             if len(image.tokens) < self.max_context:
@@ -506,11 +527,13 @@ class Engine:
     def cached_prefix(self, prompt: list[int], owner: str = "") -> int:
         """How many leading tokens of `prompt` the cache holds for its `owner`, as start() takes
         them: generation prefills the rest. Of a model with recurrent state, those of a slot's or
-        of a free slot's kept state."""
-        busy = {s.slot for s in self.active}
-        kept = [len(self._kept[s]) for s in range(self.slots)
-                if s not in busy and self._resumes(prompt, s, owner)]  # fmt: skip
-        return max(self._shared(prompt, owner) + kept)
+        of a free slot's kept state; of the prefix store's, if it holds more."""
+        return max(self._in_slots(prompt, owner), self._stored(prompt, owner)[0])
+
+    def stored_prefix(self, prompt: list[int], owner: str = "") -> int:
+        """How many of those cached_prefix() counts the prefix store holds, which start() copies
+        back to a slot: those of a stored prefix that holds more than any slot does, else 0."""
+        return self._stored(prompt, owner)[0]
 
     def reset(self) -> None:
         """Forgets every cached prefix, so the next prompt is prefilled from scratch, and ends
@@ -521,12 +544,16 @@ class Engine:
         self._kept = [[] for _ in range(self.slots)]
         self._owners = [""] * self.slots
         self._written = [0] * self.slots
+        if self.store is not None:
+            self.store.clear()
 
     def _claim(self, prompt: list[int], owner: str) -> int:
         # a free slot for the prompt, made to hold the longest prefix of it that any slot of its
-        # owner's holds; another's slot it takes starts anew
+        # owner's holds, or the prefix store; another's slot it takes starts anew, what it held
+        # going to the store
         busy = {s.slot for s in self.active}
         free = [s for s in range(self.slots) if s not in busy]
+        self._swap_in(prompt, owner, free)
         if self._recurrent:
             self._resume(prompt, free, owner)
         shared = self._shared(prompt, owner)
@@ -535,6 +562,8 @@ class Engine:
             slot = max(extended, key=lambda s: shared[s])
         else:
             slot = min(free, key=lambda s: self._used[s])
+        if shared[slot] < len(self._cached[slot]):
+            self._swap_out(slot)
         source = max(range(self.slots), key=lambda s: shared[s])
         if (prefix := shared[source]) > shared[slot]:
             self._cached[slot], self._kept[slot] = [], []  # while the copy overwrites it
@@ -558,23 +587,116 @@ class Engine:
             self._restore(self._slot_vars[0].bind(slot))
             self._cached[slot] = list(self._kept[slot])
 
+    def _in_slots(self, prompt: list[int], owner: str) -> int:
+        # how many leading tokens of the prompt the slots hold for its owner, as _claim takes them
+        busy = {s.slot for s in self.active}
+        kept = [len(self._kept[s]) for s in range(self.slots)
+                if s not in busy and self._resumes(prompt, s, owner)]  # fmt: skip
+        return max(self._shared(prompt, owner) + kept)
+
     def _shared(self, prompt: list[int], owner: str) -> list[int]:
-        # how many leading tokens of the prompt each slot holds that generation may start from:
-        # none of another owner's slot, and of a slot with recurrent state, all its tokens or none
-        shared = [_common_prefix(prompt, cached) if self._owners[s] == owner else 0
-                  for s, cached in enumerate(self._cached)]  # fmt: skip
-        if self._recurrent:
-            shared = [n if n == len(c) else 0 for n, c in zip(shared, self._cached, strict=True)]
-        # and of a slot whose rings no longer hold the window before it, none
-        return [n if self.model.holds(self._written[s], n) else 0 for s, n in enumerate(shared)]
+        # how many leading tokens of the prompt each slot holds that generation may start from
+        return [self._sharing(prompt, owner, self._owners[s], cached, self._written[s])
+                for s, cached in enumerate(self._cached)]  # fmt: skip
+
+    def _sharing(
+        self, prompt: list[int], owner: str, of: str, cached: list[int], written: int
+    ) -> int:  # fmt: skip
+        # how many leading tokens of the prompt a slot's tokens, `cached`, of `of`'s, hold that
+        # generation may start from: none of another owner's, and of a slot with recurrent state,
+        # all its tokens or none; and none where its rings, written up to `written`, no longer
+        # hold the window before them
+        n = _common_prefix(prompt, cached) if of == owner else 0
+        if self._recurrent and n != len(cached):
+            n = 0
+        return n if self.model.holds(written, n) else 0
 
     def _resumes(self, prompt: list[int], slot: int, owner: str) -> bool:
-        # whether a prompt of the owner's may go on from a slot's kept state: the slot's tokens
-        # are the owner's, and the prompt shares all those before it, whose window the slot's
-        # rings still hold
-        kept = self._kept[slot]
-        held = self.model.holds(self._written[slot], len(kept))
-        return self._owners[slot] == owner and _extends(prompt, kept) and held
+        # whether a prompt of the owner's may go on from a slot's kept state
+        of, kept = self._owners[slot], self._kept[slot]
+        return self._resuming(prompt, owner, of, kept, self._written[slot])
+
+    def _resuming(
+        self, prompt: list[int], owner: str, of: str, kept: list[int], written: int
+    ) -> bool:  # fmt: skip
+        # whether a prompt of the owner's may go on from a state kept after `kept`, of `of`'s: the
+        # tokens are the owner's, and the prompt shares all of them, whose window the rings,
+        # written up to `written`, still hold
+        return of == owner and _extends(prompt, kept) and self.model.holds(written, len(kept))
+
+    def _stored(self, prompt: list[int], owner: str) -> tuple[int, Prefix | None]:
+        # the owner's stored prefix that holds the most of the prompt, and how many of its tokens,
+        # as a slot would hold them, where more than the slots do; else (0, None)
+        if self.store is None:
+            return 0, None
+        found = [(self._sharing(prompt, owner, p.owner, p.cached, p.written), p)
+                 for p in self.store.of(owner)]  # fmt: skip
+        if self._recurrent:
+            found += [(len(p.kept), p) for p in self.store.of(owner)
+                      if self._resuming(prompt, owner, p.owner, p.kept, p.written)]  # fmt: skip
+        n, prefix = max(found, key=lambda f: f[0], default=(0, None))
+        return (n, prefix) if n > self._in_slots(prompt, owner) else (0, None)
+
+    def _swap_in(self, prompt: list[int], owner: str, free: list[int]) -> None:
+        # the owner's stored prefix that holds more of the prompt than the slots do, if any, into
+        # the least recently used free slot, as the slot it was taken from, after what that slot
+        # held goes to the store. Without recurrent state, the slot holds just the tokens the
+        # prompt shares, so that the prompt goes on in it rather than copying them to another.
+        n, prefix = self._stored(prompt, owner)
+        if self.store is None or prefix is None:
+            return
+        slot = min(free, key=lambda s: self._used[s])
+        self._swap_out(slot)
+        row, device = self._slot_vars[0].bind(slot), Device.DEFAULT
+        for t, block in enumerate(prefix.tiles):
+            self._tile_in(row, self._tile.bind(t), block.to(device))
+        if prefix.rest is not None:
+            self._held_in(row, prefix.rest.to(device))
+        self._cached[slot] = list(prefix.cached) if self._recurrent else prompt[:n]
+        self._kept[slot], self._owners[slot] = list(prefix.kept), owner
+        self._written[slot] = prefix.written
+        self.store.take(prefix)
+
+    def _swap_out(self, slot: int) -> None:
+        # what a slot holds, to the store, before another prompt takes the slot: unless less than a
+        # tile of positions, whose room it would take, or held there already
+        cached, owner = self._cached[slot], self._owners[slot]
+        if self.store is None or len(cached) < CACHE_TILE or self.store.holds(owner, cached):
+            return
+        # copies of the graphs' outputs, whose buffers their next runs overwrite
+        row = self._slot_vars[0].bind(slot)
+        tiles = [self._tile_out(row, self._tile.bind(t)).clone("CPU").realize()
+                 for t in range(-(-len(cached) // CACHE_TILE))]  # fmt: skip
+        rest = self._held_out(row).clone("CPU").realize() if self._more else None
+        size = sum(t.nbytes() for t in tiles) + (rest.nbytes() if rest is not None else 0)
+        kept = list(self._kept[slot])
+        self.store.add(Prefix(owner, list(cached), kept, self._written[slot], tiles, rest, size))
+
+    def _tile_parts(self, slot: UOp, tile: UOp) -> list[Tensor]:
+        # a slot's keys and values at a tile of positions, the target's and its drafter's own
+        own = self.drafter.own if self.drafter is not None else None
+        return [t for m in (self.model, own) if m is not None for t in m.tile(slot, tile)]
+
+    def _held_parts(self, slot: UOp) -> list[Tensor]:
+        # the rest of what a slot holds, the target's and its drafter's own, and the hidden states
+        # its drafts go on from
+        own = self.drafter.own if self.drafter is not None else None
+        parts = [t for m in (self.model, own) if m is not None for t in m.held(slot)]
+        if self.drafter is not None:
+            parts += [self._hidden[slot : slot + 1], self._kept_hidden[slot : slot + 1]]
+        return parts
+
+    def _tile_block(self, slot: UOp, tile: UOp) -> Tensor:
+        return _packed(self._tile_parts(slot, tile))
+
+    def _put_tile(self, slot: UOp, tile: UOp, block: Tensor) -> None:
+        _unpack(self._tile_parts(slot, tile), block)
+
+    def _held_block(self, slot: UOp) -> Tensor:
+        return _packed(self._held_parts(slot))
+
+    def _put_held(self, slot: UOp, block: Tensor) -> None:
+        _unpack(self._held_parts(slot), block)
 
     def _wrote(self, slot: int, end: int) -> None:
         # a run wrote slot `slot`'s positions up to `end`
@@ -1038,6 +1160,21 @@ def _ids(tokens: list[int], size: int) -> Tensor:
     # (1, size) token ids, padded: from bytes, as tinygrad converts a list value by value
     padded = array.array("i", tokens + [0] * (size - len(tokens))).tobytes()
     return Tensor(padded, dtype=dtypes.int32).reshape(1, size)
+
+
+def _packed(parts: list[Tensor]) -> Tensor:
+    # tensors' bytes, one after another, as one block
+    return Tensor.cat(*(p.contiguous().bitcast(dtypes.uint8).flatten() for p in parts)).realize()
+
+
+def _unpack(parts: list[Tensor], block: Tensor) -> None:
+    # each tensor assigned its bytes of a block, as _packed made it
+    at, writes = 0, []
+    for p in parts:
+        n = math.prod(cast(tuple[int, ...], p.shape)) * p.dtype.itemsize
+        writes.append(p.assign(block[at : at + n].bitcast(p.dtype).reshape(p.shape)))
+        at += n
+    Tensor.realize(*writes)
 
 
 def _extends(prompt: list[int], kept: list[int]) -> bool:

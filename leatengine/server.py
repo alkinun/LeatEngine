@@ -516,6 +516,7 @@ class Server(ThreadingHTTPServer):
             )
         try:  # timed from before start(), which copies a prefix in or restores a kept state
             started, cached = time.perf_counter(), engine.cached_prefix(request.prompt, owner)
+            stored = engine.stored_prefix(request.prompt, owner)
             sequence = engine.start(
                 request.prompt, request.max_tokens, request.sampling, request.seed,
                 images=request.images, owner=owner, constraint=constraint,
@@ -524,6 +525,8 @@ class Server(ThreadingHTTPServer):
         except Exception as e:  # for the client; the server carries on
             request.out.put(e)
             return True
+        if stored:
+            self.metrics.add("leatengine_stored_tokens_total", stored, key=request.key)
         running[sequence] = _Writer(request, engine.tokenizer, cached, started, self.metrics)
         return True
 
@@ -664,6 +667,9 @@ class _Metrics:
         ),
         "leatengine_cached_tokens_total": (
             "Prompt tokens the cache held, which were not computed again."
+        ),
+        "leatengine_stored_tokens_total": (
+            "Of those, the prefix store's, which were copied back to a slot."
         ),
         "leatengine_completion_tokens_total": "Tokens generated.",
         "leatengine_prefill_seconds_total": (
@@ -839,6 +845,9 @@ class _Handler(BaseHTTPRequestHandler):
         if loaded is not None:
             gauges.append(("leatengine_model_loaded", "The model loaded, of its context in tokens.",
                            {"model": loaded.name}, loaded.engine.max_context))  # fmt: skip
+        if loaded is not None and (store := loaded.engine.store) is not None:
+            gauges.append(("leatengine_prefix_store_bytes", "Bytes of host memory the prefix "
+                           "store holds.", {}, store.used))  # fmt: skip
         data = s.metrics.text(gauges).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

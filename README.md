@@ -62,8 +62,10 @@ leatengine run unsloth/Qwen3-8B-GGUF:Q4_K_M
 The server listens on `127.0.0.1:8080`, with 4 slots. A model takes its own context, as far as the
 KV cache of its slots fits in the memory its weights leave, and `run` and `serve` say what they
 chose; `--max-context` and `--slots` set them, and `--cache-type q8_0` holds the KV cache in about
-half the memory of its default, f16, as llama.cpp's q8_0 cache does. `python -m leatengine` exposes
-the same commands in the environment where the package is installed.
+half the memory of its default, f16, as llama.cpp's q8_0 cache does. `--prefix-store GIB` keeps
+what slots held when other prompts took them, so that more conversations than slots, as agents'
+sessions, each go on from their last turn ([API](docs/api.md#prefix-reuse-and-the-prefix-store)).
+`python -m leatengine` exposes the same commands in the environment where the package is installed.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \

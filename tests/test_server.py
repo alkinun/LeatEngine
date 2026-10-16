@@ -1017,6 +1017,26 @@ def test_metrics(client, server):
     assert after['leatengine_model_loaded{model="tiny"}'] == CONTEXT
 
 
+def test_prefix_store(tiny_model, monkeypatch):
+    # a chat's next turn, after another took the one slot, comes back from the prefix store: its
+    # tokens counted as cached and as stored, and the store's bytes. Tiles of 8 positions, as the
+    # tiny model's context is 64.
+    for module in ("leatengine.model", "leatengine.engine"):
+        monkeypatch.setattr(f"{module}.CACHE_TILE", 8)
+    options = {"max_context": CONTEXT, "prefill_chunk": 8, "slots": 1, "prefix_store": 1 << 30}
+    with serving(tiny_model[0], **options) as server:
+        server.load("tiny")
+        client, first = connect(server), "a first question, long enough"
+        for content in (first, "another one, as long as it"):
+            chat(client, content, max_tokens=2, temperature=0)
+        reply = chat(client, first + " and more", max_tokens=2, temperature=0)
+        counted = metrics(server)
+        stored = counted['leatengine_stored_tokens_total{key=""}']
+        assert stored == reply.usage.prompt_tokens_details.cached_tokens >= len(first)
+        assert counted["leatengine_prefix_store_bytes"] > 0
+        server.shutdown()
+
+
 def test_keys(tiny_model, tmp_path):
     # given keys, every request must hold one, as OpenAI's clients send it or Anthropic's, and
     # each key's use is counted apart; a key removed is refused from the next request on

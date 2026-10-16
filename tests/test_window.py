@@ -136,6 +136,25 @@ def test_ring_shares_held_prefixes(long, monkeypatch):
 
 
 @pytest.mark.usefixtures("reference_ops")
+def test_ring_prefix_store(long, monkeypatch):
+    # a slot's rings go to the prefix store whole, with how far its runs wrote them: a prompt that
+    # goes on near the end of what it held takes it back, as from the slot, and one that leaves it
+    # long before, past what the rings hold, starts anew. Tiles of 16 positions, so that the
+    # prompts fill several.
+    for module in ("leatengine.model", "leatengine.engine"):
+        monkeypatch.setattr(f"{module}.CACHE_TILE", 16)
+    path = long("gemma3")[0]
+    e = engine(path, prefix_store=1 << 30)
+    list(e.generate(PROMPT, 10, SAMPLING, seed=1, ignore_eog=True))
+    list(e.generate(PROMPT[::-1], 4, SAMPLING, seed=1, ignore_eog=True))
+    near, far = PROMPT[:140] + [1, 2, 3], PROMPT[:80] + [1, 2, 3]
+    assert e.stored_prefix(near) == 140 and e.cached_prefix(far) == 0
+    starts, fresh = prefill_starts(e, monkeypatch), engine(path, True, monkeypatch)
+    expected = list(fresh.generate(near, 20, SAMPLING, seed=2, ignore_eog=True))
+    assert list(e.generate(near, 20, SAMPLING, seed=2, ignore_eog=True)) == expected
+    assert starts == [140]
+
+
 def test_ring_shares_its_own_slot(long, monkeypatch):
     # a prompt that leaves a slot's tokens goes on in that slot where its rings hold the window
     # before, overwriting what the slot held past there

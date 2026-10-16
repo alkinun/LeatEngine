@@ -648,22 +648,117 @@ def test_copy_takes_recurrent_state(tiny):
     np.testing.assert_array_equal(first, copied)
 
 
+STORE = 1 << 30  # bytes of a prefix store that keeps whatever a test gives it
+
+
+@pytest.fixture
+def small_tiles(monkeypatch):
+    # tiles of 8 positions, so that the tiny models' contexts of 64 hold several, and a slot of 8
+    # tokens or more goes to the prefix store
+    for module in ("leatengine.model", "leatengine.engine"):
+        monkeypatch.setattr(f"{module}.CACHE_TILE", 8)
+
+
+@pytest.mark.usefixtures("reference_ops", "small_tiles")
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
+def test_prefix_store_takes_back_what_a_slot_held(tiny_model, monkeypatch, cache_type):
+    # a prompt that takes the one slot sends what it held to the store, and a prompt that goes on
+    # from that takes it back, prefilling only what follows, as from the slot itself
+    path, _ = tiny_model
+    options = {"max_context": CONTEXT, "prefill_chunk": 8, "cache_type": cache_type}
+    engine = Engine(path, **options, prefix_store=STORE)
+    first = (PROMPT * 2)[:20]
+    out = list(engine.generate(first, 4))
+    list(engine.generate([9, 8, 7] * 6, 4))
+    turn = first + out + [5]
+    held = len(first) + 3  # the last token generated is not run
+    assert engine.cached_prefix(turn) == engine.stored_prefix(turn) == held
+    starts = prefill_starts(engine, monkeypatch)
+    assert list(engine.generate(turn, 4)) == list(Engine(path, **options).generate(turn, 4))
+    assert starts == [held] and len(engine.store) == 2  # and the other prompt's went there
+
+
+@pytest.mark.usefixtures("reference_ops", "small_tiles")
+def test_prefix_store_keeps_owners_apart(tiny_model):
+    path, _ = tiny_model
+    engine = Engine(path, max_context=CONTEXT, prefill_chunk=8, prefix_store=STORE)
+    first = (PROMPT * 2)[:20]
+    list(engine.generate(first, 4, owner="a"))
+    list(engine.generate([9, 8, 7] * 6, 4, owner="b"))
+    turn = first[:18] + [5, 6]
+    assert engine.stored_prefix(turn, "a") == 18 and engine.cached_prefix(turn, "b") == 0
+    engine.reset()
+    assert engine.cached_prefix(turn, "a") == 0 and len(engine.store) == 0
+
+
+@pytest.mark.usefixtures("reference_ops", "small_tiles")
+def test_prefix_store_resumes_recurrent_state(tiny, monkeypatch):
+    # a slot's recurrent state goes to the store with it, and the copy it kept KEEP_BACK tokens
+    # before its prompt's end, from which a chat's next turn goes on, as from the slot itself
+    path, _ = tiny("qwen35moe")
+    engine = Engine(path, max_context=CONTEXT, prefill_chunk=8, prefix_store=STORE)
+    prompt = (PROMPT * 2)[:20]
+    list(engine.generate(prompt, 3))
+    list(engine.generate([9, 8, 7] * 6, 3))
+    turn = prompt[:18] + [7, 1, 2]
+    assert engine.stored_prefix(turn) == len(prompt) - KEEP_BACK
+    starts = prefill_starts(engine, monkeypatch)
+    assert list(engine.generate(turn, 4)) == generated(path, turn, 4)
+    assert starts == [len(prompt) - KEEP_BACK, len(turn) - KEEP_BACK, 13]
+
+
+@pytest.mark.usefixtures("reference_ops", "small_tiles")
+@pytest.mark.parametrize("arch", ["llama", "qwen35moe"])
+def test_prefix_store_copies_all_a_slot_holds(tiny, arch):
+    copies_all_a_slot_holds(tiny, arch)
+
+
+@pytest.mark.gpu
+@pytest.mark.usefixtures("small_tiles")
+def test_prefix_store_copies_all_a_slot_holds_kernels(tiny):
+    copies_all_a_slot_holds(tiny, "qwen35moe")
+
+
+def copies_all_a_slot_holds(tiny, arch: str) -> None:
+    # its keys and values, recurrent states and their kept copy, and its drafter's, Qwen3.5's MTP
+    # layer's keys and values and the hidden states its drafts go on from: back as they were
+    path, _ = tiny(arch)
+    draft = path if arch == "qwen35moe" else None
+    engine = Engine(path, max_context=CONTEXT, prefill_chunk=8, draft=draft, prefix_store=STORE)
+    prompt = (PROMPT * 2)[:20]
+    list(engine.generate(prompt, 3))
+    slot = engine._slot_vars[0].bind(0)
+
+    def held() -> list[np.ndarray]:
+        tiles = [engine._tile_parts(slot, engine._tile.bind(t)) for t in range(3)]
+        return [p.numpy() for p in (*(p for t in tiles for p in t), *engine._held_parts(slot))]
+
+    before = held()
+    list(engine.generate([9, 8, 7] * 6, 3))
+    engine._swap_in(prompt + [1], "", [0])
+    for got, expected in zip(held(), before, strict=True):
+        np.testing.assert_array_equal(got, expected)
+
+
 @pytest.mark.parametrize(
     "arch, slots, batches",
     [("llama", 5, [1, 2, 4, 5]), ("qwen35moe", 2, [1, 2]), ("gemma4", 2, [1, 2])],
 )
 def test_warm_up(tiny, tiny_assistant, monkeypatch, arch, slots, batches):
-    # compiles every graph, the copy's and every batch's too, and keeping and restoring recurrent
-    # state's, and a drafter's speculative step's, and leaves nothing cached that a generation
-    # could see. Few tokens are 4 here: the reference Gated DeltaNet's graphs grow with their
-    # tokens.
+    # compiles every graph, the copy's and every batch's too, the prefix store's, and keeping and
+    # restoring recurrent state's, and a drafter's speculative step's, and leaves nothing cached
+    # that a generation could see. Few tokens are 4 here: the reference Gated DeltaNet's graphs
+    # grow with their tokens.
     monkeypatch.setattr("leatengine.engine.FEW_TOKENS", 4)
     monkeypatch.setattr("leatengine.engine.KEEP_BACK", 4)
     path, _ = tiny(arch)
     draft = {"gemma4": tiny_assistant[0], "qwen35moe": path}.get(arch)
-    engine = Engine(path, max_context=CONTEXT, prefill_chunk=8, slots=slots, draft=draft)
+    engine = Engine(path, max_context=CONTEXT, prefill_chunk=8, slots=slots, draft=draft,
+                    prefix_store=STORE)  # fmt: skip
     engine.warm_up()
     graphs = [engine._chunk, engine._few_chunk, *engine._decode.values(), engine._copy]
+    graphs += [engine._tile_out, engine._tile_in]
+    graphs += [engine._held_out, engine._held_in] if engine._more else []
     graphs += [engine._keep, engine._restore] if arch == "qwen35moe" else []
     if draft:  # of each number of sequences
         graphs += [*engine._speculate.values(), *engine._settle.values()]

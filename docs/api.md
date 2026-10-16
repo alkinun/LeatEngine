@@ -157,6 +157,27 @@ usage. It uses the configured embedding model, independently of the chat model. 
 configured embedding model, the endpoint returns 404. Inputs are truncated to the embedding
 context; model-specific query/document instructions remain the client's responsibility.
 
+## Prefix reuse and the prefix store
+
+Each of the server's slots, 4 by default, keeps the keys and values of the last prompt it ran, and
+a prompt that starts as a slot's tokens do, of the same key and user, prefills only the rest, as a
+conversation's next turn does. With more conversations than slots, as several agents' sessions,
+each new one takes a slot from another and that one's next turn prefills from the start.
+
+`serve --prefix-store GIB` keeps, in that much host memory, what a slot held when another prompt
+took it, if 256 tokens or more, letting the least recently used go first; a prompt that goes on
+from one of them copies it back into a slot rather than prefilling it again. Such tokens count as
+cached in `usage.prompt_tokens_details.cached_tokens`, and `/metrics` counts them as
+`leatengine_stored_tokens_total` too, with the store's size as `leatengine_prefix_store_bytes`.
+
+Size the store by the KV cache a token takes, about what `serve` says the slots' cache takes divided
+by their context: 128 KiB in f16 for Llama 3.1 8B, half that with `--cache-type q8_0`, so that 8
+sessions of 30,000 tokens take about 30 GiB. On an RTX 3090, 8 such sessions of 8,192 tokens over 4
+slots took their next turns' first tokens in 0.37 s on average from the store, against 2.10 s
+prefilling them again; keeping each cost about 0.25 s when its slot was taken. On an APU, as Strix
+Halo's, the GPU's memory and the host's are the same, so the store takes from what the models and
+their caches have.
+
 ## Keys, state, and metrics
 
 ```bash

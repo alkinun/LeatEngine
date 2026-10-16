@@ -100,6 +100,12 @@ def main(argv: list[str] | None = None) -> None:
     )  # fmt: skip
     _cache_type(serve)
     serve.add_argument(
+        "--prefix-store", type=_gib, default=0, metavar="GIB",
+        help="GiB of host memory that keep what slots held when other prompts take them, so that "
+        "a prompt that goes on from one, as an agent's next turn, copies it back rather than "
+        "prefilling it again; by default none",
+    )  # fmt: skip
+    serve.add_argument(
         "--draft", type=Path,
         help="a drafter's GGUF, for speculative decoding, of the one model; by default each model "
         "drafts with its own MTP layer, if any, in its file or the mtp-*.gguf beside it",
@@ -262,6 +268,13 @@ def _positive(text: str) -> int:
     if (n := int(text)) < 1:
         raise argparse.ArgumentTypeError(f"must be at least 1, got {n}")
     return n
+
+
+def _gib(text: str) -> int:
+    # an amount of memory in GiB, as bytes
+    if (gib := float(text)) < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {text}")
+    return int(gib * 2**30)
 
 
 def _option(name: str) -> Any:
@@ -484,7 +497,8 @@ def _serve(args: argparse.Namespace) -> None:
         raise SystemExit(f"there are no keys at {args.keys}: make one with "
                          f"`leatengine keys add NAME --file {args.keys}`")  # fmt: skip
     options = {"max_context": args.max_context, "slots": args.slots, "draft": args.draft,
-               "vision": args.mmproj, "cache_type": args.cache_type}  # fmt: skip
+               "vision": args.mmproj, "cache_type": args.cache_type,
+               "prefix_store": args.prefix_store}  # fmt: skip
     keys = Keys(args.keys) if args.keys is not None else None
     sampling = Overrides(args.sampling) if args.sampling is not None else None
     if sampling is not None:
