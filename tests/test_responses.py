@@ -85,6 +85,8 @@ def test_options():
     ({"input": [{"role": "user", "content": [{"type": "input_file"}]}]}, "'input_file' are not"),
     ({"input": "x", "tools": [{"type": "web_search"}]}, "tools must be a list of function tools"),
     ({"input": "x", "instructions": 1}, "instructions must be a string"),
+    ({"input": "x", "text": "json"}, "text must be an object"),
+    ({"input": "x", "reasoning": "high"}, "reasoning must be an object"),
 ])  # fmt: skip
 def test_refused(body, error):
     with pytest.raises(ValueError, match=error):

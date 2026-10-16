@@ -28,6 +28,9 @@ def as_chat(body: Any) -> dict[str, Any]:
                              "the conversation whole as input")  # fmt: skip
     if body.get("background"):
         raise ValueError("background is not supported: this server keeps no responses")
+    for key in ("text", "reasoning"):
+        if not isinstance(body.get(key) or {}, dict):
+            raise ValueError(f"{key} must be an object")
     instructions = body.get("instructions")
     if instructions is not None and not isinstance(instructions, str):
         raise ValueError("instructions must be a string")

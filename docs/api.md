@@ -81,7 +81,7 @@ message roles and tool formats a model understands.
   other keywords, as `pattern`, `format` or `minimum`, are refused with an error rather than
   ignored. Properties come in the schema's order. A reasoning model reasons first, freely, as its
   template opens or allows it. A reply cut off by `max_tokens` holds JSON cut short. A request
-  may not yet give both `tools` and a JSON `response_format`.
+  may not yet give both a JSON `response_format` and `tools` it may call, of `tool_choice` `auto`.
 - `logprobs: true` gives each token's log-probability, and `top_logprobs` those of up to 20 of
   the likeliest tokens, in `choices[].logprobs.content`, streamed with the chunks: of the model's
   distribution as its logits give it, before temperature, the other sampling controls and a
