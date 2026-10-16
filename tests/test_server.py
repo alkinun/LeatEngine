@@ -20,6 +20,7 @@ from leatengine.chat import ChatTemplate, Reply
 from leatengine.defaults import OPENAI, Overrides
 from leatengine.engine import Engine
 from leatengine.gguf import GGUF
+from leatengine.grammar import Grammar, Matcher
 from leatengine.keys import Keys
 from leatengine.sampler import Sampling
 from leatengine.server import Server, _calls, _Completion, _completion, _Load, _reasons, _Writer
@@ -409,6 +410,61 @@ def test_reasoning_effort(client, server, monkeypatch):
     assert [o.get("reasoning_effort") for o in rendered] == ["low", "high", None, "high"]
 
 
+def schema_format(schema: dict) -> dict:
+    # a response format of a schema's JSON, as OpenAI's SDK writes one
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": "reply", "schema": schema, "strict": True},
+    }
+
+
+DEEP: dict = {"type": "null"}
+for _ in range(64):
+    DEEP = {"type": "array", "items": DEEP}
+PICK = {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"enum": ["x", "yz"]}},
+        "required": ["a", "b"], "additionalProperties": False}  # fmt: skip
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("schema", [PICK, None])
+def test_response_format(client, stream, schema):
+    # sampled replies held to a schema's JSON, or any object's: each whole, and so ended, with
+    # "stop", as the tiny model has no end token, or cut short by max_tokens, with "length"
+    response_format = {"type": "json_object"} if schema is None else schema_format(schema)
+    matcher, whole = Matcher(Grammar(schema)), 0
+    for seed in range(6):
+        text, reason = complete(
+            client, "hello", max_tokens=40, temperature=1, seed=seed, stream=stream,
+            response_format=response_format,
+        )  # fmt: skip
+        state = matcher.feed(matcher.start, text.encode())
+        assert state and matcher.done(state) == (reason == "stop"), (text, reason)
+        if reason == "stop":
+            value = json.loads(text)
+            assert schema is None or value["a"] == int(value["a"]) and value["b"] in ("x", "yz")
+            whole += 1
+    assert whole or schema is None
+
+
+def test_response_formats_compiled_once(client, server, monkeypatch):
+    # a schema compiles once for the loaded model, its masks shared, until others more recently
+    # asked for crowd it out
+    compiled = []
+    monkeypatch.setattr(server_module, "_GRAMMARS", 2)
+    monkeypatch.setattr(server_module, "Grammar", lambda s: compiled.append(s) or Grammar(s))
+    for t in ("integer", "integer", "string", "boolean", "string", "integer"):
+        schema = {"type": "object", "properties": {"v": {"type": t}}}
+        chat(client, "hello", max_tokens=2, response_format=schema_format(schema))
+    assert [s["properties"]["v"]["type"] for s in compiled] == [
+        "integer", "string", "boolean", "integer"
+    ]  # fmt: skip
+    # properties in another order are another schema's
+    for properties in ({"a": {}, "b": {}}, {"b": {}, "a": {}}):
+        schema = {"type": "object", "properties": properties}
+        chat(client, "hello", max_tokens=2, response_format=schema_format(schema))
+    assert [list(s["properties"]) for s in compiled[-2:]] == [["a", "b"], ["b", "a"]]
+
+
 @pytest.fixture
 def replies_with(engine, monkeypatch):
     # makes the engine reply with the given text, which the tiny model would never write: each
@@ -615,6 +671,12 @@ def test_text_is_not_a_tool_call(client, replies_with, stream, text, choice):
         ({"messages": [{"role": "assistant", "tool_calls": [{"id": "x"}]}]}, "each with its"),
         ({"tools": [{"function": "weather"}]}, "tools must be a list of objects, each"),
         ({"tools": [{"function": {"name": []}}]}, "tools must be a list of objects, each"),
+        # a response format of a type or schema it does not take, and one beside tools
+        ({"response_format": {"type": "xml"}}, 'response_format must be {"type": "text"}'),
+        ({"response_format": {"type": "json_schema"}}, 'response_format must be {"type": "text"}'),
+        ({"response_format": schema_format({"format": "x"})}, "the schema's format is not"),
+        ({"response_format": schema_format(DEEP)}, "the schema nests deeper than 64 levels"),
+        ({"tools": [WEATHER], "response_format": {"type": "json_object"}}, "with tools is not"),
     ],
 )
 def test_bad_request(client, kwargs, error):
@@ -969,6 +1031,22 @@ def test_calls_tools(served, model_path):
     (call,) = response.choices[0].message.tool_calls
     assert call.function.name == "weather"
     assert json.loads(call.function.arguments) == {"city": "Paris"}
+
+
+@pytest.mark.gpu
+@pytest.mark.model
+def test_answers_in_json(served):
+    # a reply held to a schema, after the model's reasoning, if it reasons
+    schema = {"type": "object", "properties": {"city": {"type": "string"},
+              "country": {"type": "string"}}, "required": ["city", "country"],
+              "additionalProperties": False}  # fmt: skip
+    messages = [{"role": "user", "content": "Name the capital of France, as JSON."}]
+    response = served.chat.completions.create(
+        model="real", messages=messages, temperature=0, response_format=schema_format(schema)
+    )
+    choice = response.choices[0]
+    assert choice.finish_reason == "stop"
+    assert json.loads(choice.message.content) == {"city": "Paris", "country": "France"}
 
 
 @pytest.mark.gpu

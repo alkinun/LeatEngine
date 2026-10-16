@@ -47,8 +47,8 @@ placeholder when authentication is disabled). The client library is not a runtim
 
 Supported controls include `messages`, `stream`, `stream_options.include_usage`, `max_tokens`
 or `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`,
-`seed`, `stop`, `tools`, and `tool_choice` (`auto` or `none`). Templates determine which
-message roles and tool formats a model understands.
+`seed`, `stop`, `tools`, `tool_choice` (`auto` or `none`), and `response_format`. Templates
+determine which message roles and tool formats a model understands.
 
 - Streaming uses Server-Sent Events: JSON `data:` records followed by `data: [DONE]` on success.
   Disconnecting cancels the completion and releases its slot.
@@ -60,6 +60,15 @@ message roles and tool formats a model understands.
   gpt-oss's harmony messages, and Muse Glimmer's ATEM messages. Arguments written as text are
   typed by the tool's JSON schema. A reply cut off by `max_tokens` or the context keeps
   `finish_reason: "length"` even when it holds complete calls, as a later call may be missing.
+- `response_format` of type `json_object` holds the reply's answer to a JSON object, and of
+  type `json_schema` to its schema's JSON, `strict` or not: only tokens that can continue it are
+  sampled, and the reply ends, `finish_reason: "stop"`, once the JSON is whole. Schemas may use
+  `type`, `properties`, `required`, `additionalProperties`, `items`, `minItems`, `maxItems`,
+  `enum`, `const`, `anyOf`, `oneOf` (taken as `anyOf`), and `$ref` to `$defs`, recursive too;
+  other keywords, as `pattern`, `format` or `minimum`, are refused with an error rather than
+  ignored. Properties come in the schema's order. A reasoning model reasons first, freely, as its
+  template opens or allows it. A reply cut off by `max_tokens` holds JSON cut short. A request
+  may not yet give both `tools` and a JSON `response_format`.
 - Image content parts accept `image_url` with base64 `data:` URLs. Remote image URLs are not
   fetched. Supply `--mmproj` or a recognized projector beside the model.
 - `service_tier: "flex"` schedules a completion behind foreground requests.
@@ -70,8 +79,8 @@ message roles and tool formats a model understands.
 - Replies include usage and a `timings` extension. Cached token counts appear in
   `usage.prompt_tokens_details.cached_tokens`; streamed usage requires `include_usage`.
 
-This is not a complete OpenAI implementation: multiple choices, log probabilities, constrained
-JSON output, logit biases, and frequency or repetition penalties are unsupported. Responses,
+This is not a complete OpenAI implementation: multiple choices, log probabilities, logit
+biases, and frequency or repetition penalties are unsupported. Responses,
 legacy text completions, audio, file-storage, and tool-execution endpoints are not implemented.
 A prompt must fit the configured context; clients manage conversation history.
 

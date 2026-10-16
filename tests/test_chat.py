@@ -158,6 +158,19 @@ def test_form():
     assert not gemma.opens_thinking("<|turn>model\n<|channel>thought\n<channel|>")
 
 
+def test_preamble():
+    # what a reply holds before its answer, as grammar.Matcher takes it: a block of reasoning it
+    # may open, the end of the one its prompt opened, or the marker of its answer, unless the
+    # prompt wrote it; of a format that marks neither, nothing
+    think = chat(TEMPLATE + "<think>")[0]
+    assert think.preamble("a") == ("<think>", "</think>")
+    assert think.preamble("a<think>\n") == "</think>" and chat()[0].preamble("a") is None
+    gemma = with_marker("<|channel>")
+    assert gemma.preamble("<|turn>model\n") == ("<|channel>thought", "<channel|>")
+    harmony = with_marker("<|channel|>")
+    assert harmony.preamble("a") == harmony.answer and harmony.preamble(harmony.answer) is None
+
+
 def test_thinking():
     # reasoning as gpt-oss's template reads it too, of a message without text, which it would
     # take for the reasoning and refuse both

@@ -137,6 +137,15 @@ class ChatTemplate:
         nothing."""
         return _ANSWER.get(self.form or "", "")
 
+    def preamble(self, text: str) -> tuple[str, str] | str | None:
+        """What a reply to a rendered prompt holds before its answer's text, as grammar.Matcher
+        takes it: a block of reasoning it may open, (opens, closes); the marker that closes the
+        block the prompt opened, or that opens the answer, in a format that marks one; or None."""
+        if self.form in _THINKING:
+            opens, closes = _THINKING[self.form]
+            return closes if self.opens_thinking(text) else (opens, closes)
+        return self.answer if self.answer and not text.endswith(self.answer) else None
+
     def opens_thinking(self, text: str) -> bool:
         """Whether a rendered prompt ends inside a block of reasoning, which the reply then
         continues, as DeepSeek-R1's distillations' templates open their <think>."""

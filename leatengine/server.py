@@ -50,6 +50,7 @@ from leatengine.defaults import OPTIONS, Overrides, recommended
 from leatengine.draft import own_drafter
 from leatengine.engine import Engine, Sequence
 from leatengine.gguf import GGUF
+from leatengine.grammar import Grammar
 from leatengine.keys import Keys
 from leatengine.model import Config
 from leatengine.sampler import Sampling
@@ -118,13 +119,18 @@ _FIELDS: dict[str, tuple[Callable[[Any], bool], str]] = {
                           "a string of 256 characters at most"),
     "service_tier": (lambda v: v in ("auto", "default", "flex", "priority"),
                      "one of auto, default, flex and priority"),
+    "response_format": (lambda v: isinstance(v, dict) and (v.get("type") in ("text", "json_object")
+                        or v.get("type") == "json_schema" and isinstance(v.get("json_schema"), dict)
+                        and isinstance(v["json_schema"].get("schema"), dict)),
+                        '{"type": "text"}, {"type": "json_object"}, or {"type": "json_schema", '
+                        '"json_schema": {"schema": {...}}}'),
 }  # fmt: skip
 
 # what leatengine does not implement, each with the value that asks for nothing more
 _UNSUPPORTED = {
     "n": 1, "frequency_penalty": 0, "repetition_penalty": 1, "logit_bias": {}, "logprobs": False,
-    "response_format": {"type": "text"},
 }  # fmt: skip
+_GRAMMARS = 64  # compiled response formats a loaded model keeps, with their masks
 
 
 @dataclass(frozen=True)
@@ -138,10 +144,16 @@ class _Finish:
 
 @dataclass(frozen=True)
 class _Loaded:
-    # the loaded model: its id, its engine, and its chat template
+    # the loaded model: its id, its engine, and its chat template; and the response formats asked
+    # of it, by schema and preamble, each compiled, with its masks, the last asked last, which
+    # requests' threads share under `formats_lock`
     name: str
     engine: Engine
     chat: ChatTemplate
+    formats: collections.OrderedDict[str, tuple[Grammar, dict]] = field(
+        default_factory=collections.OrderedDict
+    )
+    formats_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
@@ -183,6 +195,10 @@ class _Completion:
     user: str = ""  # the end user it is for, if the client names them
     thinking: bool = False  # the prompt opened a <think> block
     opened: str = ""  # what the prompt opened the reply with, as ChatTemplate.answer
+    # the JSON its answer is held to, if any: compiled, with the masks it shares, and what goes
+    # before the answer, as ChatTemplate.preamble
+    grammar: tuple[Grammar, dict] | None = None
+    preamble: tuple[str, str] | str | None = None
     # work no one waits on, of service_tier "flex", as OpenAI's flex processing: started after the
     # completions that wait before it, and never into the last slot free
     background: bool = False
@@ -389,7 +405,8 @@ class Server(ThreadingHTTPServer):
             if sequence not in running:  # a stop string ended it before
                 continue
             writer = running[sequence]
-            if writer.take(token):  # end of generation or a stop string
+            whole = sequence.constraint is not None and sequence.constraint.over()
+            if writer.take(token) or whole:  # end of generation, a stop string, or the JSON whole
                 engine.cancel(sequence)
                 writer.finish("stop")
             elif sequence.done and i == last[sequence]:  # max_tokens, or the context full
@@ -452,11 +469,14 @@ class Server(ThreadingHTTPServer):
         # no newline, so that no key's and user's are another's. Without either, every prompt's is
         # the same, ""
         owner = f"{request.key}\n{request.user}" if request.user else request.key
+        constraint = None
+        if request.grammar is not None:
+            constraint = engine.constrain(request.grammar[0], request.preamble, request.grammar[1])
         try:  # timed from before start(), which copies a prefix in or restores a kept state
             started, cached = time.perf_counter(), engine.cached_prefix(request.prompt, owner)
             sequence = engine.start(
                 request.prompt, request.max_tokens, request.sampling, request.seed,
-                images=request.images, owner=owner,
+                images=request.images, owner=owner, constraint=constraint,
             )  # fmt: skip
         except Exception as e:  # for the client; the server carries on
             request.out.put(e)
@@ -1013,6 +1033,9 @@ def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completio
     prompt = loaded.chat.tokens(text, [image.tokens for image in shown])
     if len(prompt) >= (context := loaded.engine.max_context):
         raise ValueError(f"the prompt has {len(prompt)} tokens, too many for {context} of context")
+    grammar, preamble = _format(body.get("response_format"), loaded, text)
+    if grammar is not None and tools:
+        raise ValueError("response_format of JSON with tools is not supported yet: give either")
     # what the request asks for of its sampling, else the model's, as it reasons or not
     stop, given = body.get("stop") or [], {k: v for k, v in body.items() if v is not None}
     defaults = _sampling(server, loaded)[0 if _reasons(loaded.chat, options) else 1]
@@ -1033,8 +1056,33 @@ def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completio
         user=body.get("safety_identifier") or body.get("user") or "",
         thinking=loaded.chat.opens_thinking(text),
         opened=opened,
+        grammar=grammar,
+        preamble=preamble,
         background=body.get("service_tier") == "flex",
     )
+
+
+def _format(
+    asked: dict[str, Any] | None, loaded: _Loaded, text: str
+) -> tuple[tuple[Grammar, dict] | None, tuple[str, str] | str | None]:  # fmt: skip
+    # the JSON a response format holds a reply's answer to, compiled, with the masks it shares, of
+    # the loaded model's, and what goes before its answer; none for text
+    if asked is None or asked["type"] == "text":
+        return None, None
+    schema = asked["json_schema"]["schema"] if asked["type"] == "json_schema" else None
+    preamble = loaded.chat.preamble(text)
+    key = json.dumps([schema, preamble])  # of its keys in order, as properties come in order
+    with loaded.formats_lock:
+        if (found := loaded.formats.get(key)) is not None:
+            loaded.formats.move_to_end(key)
+            return found, preamble
+    found = Grammar(schema), {}
+    with loaded.formats_lock:
+        found = loaded.formats.setdefault(key, found)
+        loaded.formats.move_to_end(key)
+        if len(loaded.formats) > _GRAMMARS:
+            loaded.formats.popitem(last=False)
+    return found, preamble
 
 
 class _Unset(Exception):
