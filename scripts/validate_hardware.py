@@ -68,33 +68,9 @@ def main() -> None:
     report.machine(_machine(env))
     if not args.no_tests:
         report.tests(_tests(env))
-    reps = "1" if args.quick else "3"
     for model in models:
         print(f"== {model.name}", file=sys.stderr, flush=True)
-        row: dict = {"model": model.stem}
-        if args.wikitext and args.llama_cpp:
-            row["agreement"] = _agreement(env, model, args.llama_cpp, args.wikitext, args.out)
-        row["leatengine"] = _leatengine(env, "bench", model, "-r", reps)
-        if args.llama_cpp:
-            row["llama.cpp"] = _best(
-                {_name(d): _llama_bench(d, model, reps) for d in args.llama_cpp}
-            )
-        if not args.quick:
-            row["leatengine 4"] = _leatengine(
-                env, "bench", model, "-r", reps, "-s", "4", "-p", "64"
-            )
-            if args.llama_cpp:
-                row["llama.cpp 4"] = _best(
-                    {_name(d): _llama_batched(d, model) for d in args.llama_cpp}
-                )
-            draft = _drafter(model, drafters + _ggufs([model.parent]))
-            if draft is not None:
-                chat = ("bench", model, "--chat", "-n", "256", "-r", "2")
-                row["chat"] = _leatengine(env, *chat)
-                row["chat draft"] = _leatengine(env, *chat, "--draft", draft)
-                row["chat draft 2"] = _leatengine(env, *chat, "--draft", draft, "-s", "2")
-                row["chat 2"] = _leatengine(env, *chat, "-s", "2")
-        report.model(row)
+        report.model(_model(env, model, args, drafters))
     if models:
         report.server(_server(env, models[0], args.out))
     path = report.write(args.out)
@@ -102,8 +78,36 @@ def main() -> None:
     print(f"\nwritten to {path}", file=sys.stderr)
 
 
+def _model(env: dict, model: Path, args: argparse.Namespace, drafters: list[Path]) -> dict:
+    """A model's row: agreement given args.wikitext, speed against args.llama_cpp's builds, and
+    unless args.quick, of 4 sequences at once and of chat replies with the model's drafter."""
+    row: dict = {"model": model.stem}
+    reps = "1" if args.quick else "3"
+    if args.wikitext and args.llama_cpp:
+        row["agreement"] = _agreement(env, model, args.llama_cpp, args.wikitext, args.out)
+    row["leatengine"] = _leatengine(env, "bench", model, "-r", reps)
+    if args.llama_cpp:
+        row["llama.cpp"] = _best({_name(d): _llama_bench(d, model, reps) for d in args.llama_cpp})
+    if not args.quick:
+        row["leatengine 4"] = _leatengine(env, "bench", model, "-r", reps, "-s", "4", "-p", "64")
+        if args.llama_cpp:
+            row["llama.cpp 4"] = _best({_name(d): _llama_batched(d, model) for d in args.llama_cpp})
+        draft = _drafter(model, drafters + _ggufs([model.parent]))
+        if draft is not None:
+            chat = ("bench", model, "--chat", "-n", "256", "-r", "2")
+            row["chat"] = _leatengine(env, *chat)
+            row["chat draft"] = _leatengine(env, *chat, "--draft", draft)
+            row["chat draft 2"] = _leatengine(env, *chat, "--draft", draft, "-s", "2")
+            row["chat 2"] = _leatengine(env, *chat, "-s", "2")
+    return row
+
+
 class Report:
     """The report's sections, in Markdown, and the raw results at its end."""
+
+    # in this order, bring_up.py's steps among them
+    ORDER = ("machine", "doctor", "tests", "ceiling", "agreement", "speed", "errors", "server",
+             "stopped")  # fmt: skip
 
     def __init__(self, device: str, kind: str = "validate"):
         self.device, self.kind = device, kind
@@ -123,6 +127,10 @@ class Report:
         if result["failures"]:
             text += "\n\n" + "\n".join(f"- {f}" for f in result["failures"])
         self.sections["tests"] = text
+
+    def section(self, key: str, text: str, raw: object) -> None:
+        """Another script's section, as bring_up.py's of its steps."""
+        self.sections[key], self.raw[key] = text, raw
 
     def model(self, row: dict) -> None:
         self.rows.append(row)
@@ -144,8 +152,8 @@ class Report:
             self.sections["speed"] = self._speed()
         if errors := self._errors():
             self.sections["errors"] = "## Errors\n\n" + "\n".join(errors)
-        order = ("machine", "tests", "agreement", "speed", "errors", "server")
-        return "\n\n".join([head, *(self.sections[k] for k in order if k in self.sections), raw])
+        return "\n\n".join([head, *(self.sections[k] for k in self.ORDER if k in self.sections),
+                             raw])  # fmt: skip
 
     def write(self, directory: Path) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
@@ -217,18 +225,21 @@ class Report:
                 )
         return "\n".join(lines)
 
+    @staticmethod
+    def failures(row: dict) -> dict[str, str]:
+        """A model's runs that failed and their errors, agreement's of each build and way among
+        them."""
+        failed = {k: v["error"] for k, v in row.items() if isinstance(v, dict) and "error" in v}
+        for build, result in row.get("agreement", {}).items():
+            if "error" in result:
+                failed[f"agreement, {build}"] = result["error"]
+            failed |= {f"agreement, {build}, {name}": v["error"] for name, v in result.items()
+                       if isinstance(v, dict) and "error" in v}  # fmt: skip
+        return failed
+
     def _errors(self) -> list[str]:
-        # each run that failed, agreement's of each build and way among them
-        errors = [(r["model"], k, v["error"]) for r in self.rows for k, v in r.items()
-                  if isinstance(v, dict) and "error" in v]  # fmt: skip
-        for r in self.rows:
-            for build, result in r.get("agreement", {}).items():
-                errors += [(r["model"], f"agreement, {build}, {name}", v["error"])
-                           for name, v in result.items()
-                           if isinstance(v, dict) and "error" in v]  # fmt: skip
-                if "error" in result:
-                    errors.append((r["model"], f"agreement, {build}", result["error"]))
-        return [f"- {m}, {k}: `{e}`" for m, k, e in errors]
+        return [f"- {r['model']}, {k}: `{e}`" for r in self.rows
+                for k, e in self.failures(r).items()]  # fmt: skip
 
 
 def _ggufs(paths: list[Path]) -> list[Path]:
@@ -271,12 +282,13 @@ def _machine(env: dict) -> dict:
     return info
 
 
-def _tests(env: dict) -> dict:
+def _tests(env: dict, *selection: str) -> dict:
+    # the GPU tests, or those -k selects of them
     start = time.perf_counter()
     # one process on a real GPU, which the workers would share; many on the emulated one
     workers = ["-n", "auto"] if env["DEV"].startswith("MOCK") else []
     args = [sys.executable, "-m", "pytest", "-m", "gpu", "-q", *workers, "-p", "no:cacheprovider",
-            str(ROOT / "tests")]  # fmt: skip
+            *selection, str(ROOT / "tests")]  # fmt: skip
     done = _run(args, env, 7200, cwd=ROOT)
     lines = done["out"].strip().splitlines()
     summary = next((line for line in reversed(lines) if " in " in line), "no summary")

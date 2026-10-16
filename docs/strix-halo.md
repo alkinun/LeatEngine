@@ -65,6 +65,20 @@ attention, for gfx1151; it needs the Vulkan headers and glslc, and ROCm's `hipco
 wikitext-2, whose test set the report's agreement with each build is measured on
 ([agreement](benchmarks.md#agreement-with-llamacpp)).
 
+`scripts/bring_up.py` runs these steps as one command, each checked before the next, and stops at
+the first that fails, saying what to do: doctor, the device's arch, the GPU tests (the attention
+groups' first, then the rest, with the first model's tests against llama.cpp), the memory ceiling
+(the largest model, or `--ceiling`'s, served at the context it fits to memory while GTT and VRAM
+are watched), and `validate_hardware.py`'s agreement and speed of the first model, then of each
+other, and its server check. Give it a small model first, then the large ones. It writes one
+report under `reports/`.
+
+```bash
+DEV=AMD uv run python scripts/bring_up.py /models/small.gguf /models/large.gguf --llama-cpp \
+  ~/.cache/leatengine/llama.cpp/build-vulkan/bin ~/.cache/leatengine/llama.cpp/build-hip/bin \
+  --wikitext ~/.cache/leatengine/wikitext-2-raw/wiki.test.raw
+```
+
 Run the real-GPU tests in a single process. Start with a model that comfortably fits memory,
 then increase model size, context, and simultaneous sequences. Test vision, embeddings, and
 speculation with their matching weights before describing them as hardware-verified.
