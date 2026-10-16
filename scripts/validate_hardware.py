@@ -2,13 +2,15 @@
 against llama.cpp on the same files, speculative decoding over chat prompts, and the server
 answering a streamed chat. Writes a Markdown report to reports/, or --out, and prints it.
 
-    uv run python scripts/validate_hardware.py MODEL.gguf|DIR ... [--llama-cpp llama.cpp/build/bin]
+    uv run python scripts/validate_hardware.py MODEL.gguf|DIR ... [--llama-cpp BIN [BIN ...]]
 
 Every model runs in a process of its own, so each has the GPU's memory to itself. DEV picks the
 device, AMD by default for Strix Halo. A drafter is found for each model of an MTP layer
 of its own, as Qwen3.5's and Qwen3.6's, in its file or an `mtp-*.gguf` beside it, and for Gemma 4,
 a Gemma 4 assistant's GGUF among the files given. --quick runs fewer repetitions and skips the
-batched and chat runs.
+batched and chat runs. --llama-cpp takes several builds' bin directories, as of Vulkan and of HIP
+from scripts/build_llama_cpp.py: each runs, and the report gives the better per model and measure,
+and which build it was.
 """
 
 import argparse
@@ -37,7 +39,10 @@ SERVER_PROMPT = "Name three primary colors, one per line."
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("models", nargs="+", type=Path, help="GGUF files, or directories of them")
-    parser.add_argument("--llama-cpp", type=Path, help="llama.cpp's build/bin, to compare against")
+    parser.add_argument(
+        "--llama-cpp", type=Path, nargs="+", default=[],
+        help="llama.cpp's build/bin, or several builds', to compare against the better of",
+    )  # fmt: skip
     parser.add_argument("--quick", action="store_true", help="one repetition, no batch or chat")
     parser.add_argument("--no-tests", action="store_true", help="skip the GPU tests")
     parser.add_argument("--out", type=Path, default=ROOT / "reports", help="report directory")
@@ -55,13 +60,17 @@ def main() -> None:
         row: dict = {"model": model.stem}
         row["leatengine"] = _leatengine(env, "bench", model, "-r", reps)
         if args.llama_cpp:
-            row["llama.cpp"] = _llama_bench(args.llama_cpp, model, reps)
+            row["llama.cpp"] = _best(
+                {_name(d): _llama_bench(d, model, reps) for d in args.llama_cpp}
+            )
         if not args.quick:
             row["leatengine 4"] = _leatengine(
                 env, "bench", model, "-r", reps, "-s", "4", "-p", "64"
             )
             if args.llama_cpp:
-                row["llama.cpp 4"] = _llama_batched(args.llama_cpp, model)
+                row["llama.cpp 4"] = _best(
+                    {_name(d): _llama_batched(d, model) for d in args.llama_cpp}
+                )
             draft = _drafter(model, drafters + _ggufs([model.parent]))
             if draft is not None:
                 chat = ("bench", model, "--chat", "-n", "256", "-r", "2")
@@ -126,8 +135,9 @@ class Report:
     def _speed(self) -> str:
         # tokens per second: one sequence, four at once, and chat replies speculative or not
         def at(row: dict, key: str, field: str) -> str:
-            value = (row.get(key) or {}).get(field)
-            return "" if value is None else f"{value:.1f}"
+            # of several builds of llama.cpp, the better's, and its name
+            value, by = (row.get(key) or {}).get(field), (row.get(key) or {}).get(f"{field} by")
+            return "" if value is None else f"{value:.1f}" + (f" ({by})" if by else "")
 
         lines = [
             "## Speed, tokens per second\n",
@@ -236,6 +246,28 @@ def _llama_bench(bin_dir: Path, model: Path, reps: str) -> dict:
     rows = json.loads(done["out"])
     speeds = {("decode" if r["n_gen"] else "prefill"): r["avg_ts"] for r in rows}
     return speeds | {"build": rows[0].get("build_commit"), "backend": rows[0].get("backends")}
+
+
+def _name(bin_dir: Path) -> str:
+    # a build's name: its directory's, build-vulkan's vulkan
+    build = bin_dir.parent if bin_dir.name == "bin" else bin_dir
+    return build.name.removeprefix("build-") or str(bin_dir)
+
+
+def _best(builds: dict[str, dict]) -> dict:
+    """Of each measure, the best of the builds that gave it, and which it was, of several; each
+    build's results whole under "builds"; of one build, its results as they are."""
+    if len(builds) == 1:
+        return next(iter(builds.values()))
+    best: dict = {"builds": builds}
+    for field in ("prefill", "decode"):
+        given = {name: r[field] for name, r in builds.items() if field in r}
+        if given:
+            by = max(given, key=lambda name: given[name])
+            best |= {field: given[by], f"{field} by": by}
+    if "prefill" not in best and "decode" not in best:  # every build failed
+        best["error"] = "; ".join(f"{name}: {r['error']}" for name, r in builds.items())
+    return best
 
 
 def _llama_batched(bin_dir: Path, model: Path) -> dict:

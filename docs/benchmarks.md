@@ -106,7 +106,8 @@ uv run leatengine bench MODEL.gguf -s 4 --json
 uv run leatengine bench MODEL.gguf --chat --draft DRAFTER.gguf --json
 uv run leatengine perplexity MODEL.gguf --text wiki.test.raw --ctx 512 --json
 uv run leatengine perplexity MODEL.gguf --kl-base BASE.kld --json
-DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp /path/to/llama.cpp/build/bin
+uv run python scripts/build_llama_cpp.py  # llama.cpp for Vulkan and for HIP
+DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp BUILD/bin [BUILD/bin ...]
 ```
 
 - `bench -s N` decodes N sequences at once; `bench --chat` decodes replies to chat prompts,
@@ -119,8 +120,10 @@ DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp /path/to/
   and without a drafter, and a streamed HTTP request, and writes a report under the ignored
   `reports/` directory. Its batched columns time 4 sequences decoding 128 tokens each after
   1-token prompts, on both engines. `--quick` runs one repetition and skips the batched and chat
-  runs; `--no-tests` skips the GPU tests. Its process exit status is not a verdict: read the
-  failures in its report.
+  runs; `--no-tests` skips the GPU tests. Given several llama.cpp builds, as
+  `scripts/build_llama_cpp.py`'s of Vulkan and of HIP at one commit, it runs each and reports
+  the better per model and measure, naming the build. Its process exit status is not a verdict:
+  read the failures in its report.
 
 Record the engine and tinygrad commits, the llama.cpp commit and build options, the model file and
 quantization, the KV cache's type, the hardware, driver and compiler, the context, prompt and output

@@ -52,8 +52,14 @@ uv sync --locked --python 3.14
 uv run leatengine doctor
 DEV=AMD uv run python -c "from tinygrad import Device; print(Device['AMD'].arch)"
 DEV=AMD uv run pytest -m gpu
-DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp /path/to/llama.cpp/build/bin
+uv run python scripts/build_llama_cpp.py
+DEV=AMD uv run python scripts/validate_hardware.py /models --llama-cpp \
+  ~/.cache/leatengine/llama.cpp/build-vulkan/bin ~/.cache/leatengine/llama.cpp/build-hip/bin
 ```
+
+`build_llama_cpp.py` builds llama.cpp at one commit for Vulkan and for HIP with rocWMMA's flash
+attention, for gfx1151; it needs the Vulkan headers and glslc, and ROCm's `hipconfig`.
+`--dry-run` shows its commands.
 
 Run the real-GPU tests in a single process. Start with a model that comfortably fits memory,
 then increase model size, context, and simultaneous sequences. Test vision, embeddings, and
