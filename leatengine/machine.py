@@ -139,6 +139,19 @@ def _nvidia() -> Memory | None:
     return Memory("the GPU's memory", total, total - taken)
 
 
+def nvidia_gpu() -> str | None:
+    """The first NVIDIA GPU's name and driver, as nvidia-smi gives them, if it is there."""
+    if shutil.which("nvidia-smi") is None:
+        return None
+    query = ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]
+    try:
+        done = subprocess.run(query, capture_output=True, text=True, timeout=30, check=True)
+        name, driver = (x.strip() for x in done.stdout.splitlines()[0].split(","))
+    except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+        return None
+    return f"{name}, driver {driver}"
+
+
 def _meminfo(root: Path, field: str) -> int | None:
     # a field of /proc/meminfo, in bytes
     found = re.search(rf"{field}:\s*(\d+)\s*kB", read(root / "proc/meminfo") or "")

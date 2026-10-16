@@ -1,7 +1,9 @@
+import hashlib
 import json
 import os
 import struct
 import threading
+from pathlib import Path
 
 import gguf
 import jinja2
@@ -58,6 +60,24 @@ def test_bench(tiny_model, capsys, prompt, sequences):
     result = run_json(capsys, "bench", tiny_model[0], *args)
     assert result["prefill"] > 0 and result["decode"] > 0 and result["weight_gbs"] > 0
     assert result["sequences"] == sequences and result["cache_type"] == "f16"
+
+
+def test_bench_share(tiny_model, capsys):
+    # a record to share: the commits, the model by its files' hashes, the run, the result and
+    # the machine, naming no one: of no path but files' names
+    main([*map(str, ("bench", tiny_model[0], "-p", 8, "-n", 6, "-r", 1)), "--share"])
+    out = capsys.readouterr().out
+    shared = json.loads(out)
+    assert shared["shared"] == 1 and shared["leatengine"] and shared["tinygrad"]
+    (file,) = shared["model"]["files"]
+    data = tiny_model[0].read_bytes()
+    assert file == {"name": tiny_model[0].name, "bytes": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest()}  # fmt: skip
+    assert shared["run"] | {"device": "CPU"} == {
+        "device": "CPU", "cache_type": "f16", "prompt": 8, "generate": 6, "reps": 1,
+        "sequences": 1, "chat": False, "draft": None}  # fmt: skip
+    assert shared["result"]["decode"] > 0 and "cpu" in shared["machine"]
+    assert str(tiny_model[0].parent) not in out and str(Path.home()) not in out
 
 
 def test_bench_q8_0_cache(tiny_model, capsys):

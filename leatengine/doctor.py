@@ -77,7 +77,7 @@ def checks(root: Path = Path("/"), run: bool = True) -> list[Check]:
 def report(found: list[Check]) -> str:
     """The checks as text, a line each, with what to do under those that need it."""
     width = max(len(c.name) for c in found)
-    lines = [f"LeatEngine {_leatengine()}, tinygrad {_tinygrad()}", ""]
+    lines = [f"LeatEngine {leatengine()}, tinygrad {tinygrad()}", ""]
     for c in found:
         lines.append(f"  {c.status:<4}  {c.name:<{width}}  {c.found}")
         if c.fix:
@@ -101,7 +101,7 @@ def report(found: list[Check]) -> str:
 def as_json(found: list[Check]) -> dict[str, Any]:
     """The checks as one JSON object, with the versions they were made with."""
     checked = [asdict(c) for c in found]
-    return {"leatengine": _leatengine(), "tinygrad": _tinygrad(), "checks": checked}
+    return {"leatengine": leatengine(), "tinygrad": tinygrad(), "checks": checked}
 
 
 def gpu_run(render: int | None, dev: str = "AMD") -> Check:
@@ -283,7 +283,7 @@ def _compile(arch: str) -> Check:
     return Check("compile", "ok", f"a kernel for {arch}")
 
 
-def _leatengine() -> str:
+def leatengine() -> str:
     # the installed version, and the commit of a checkout it runs from
     version = metadata.version("leatengine")
     checkout = Path(__file__).resolve().parent.parent
@@ -294,7 +294,7 @@ def _leatengine() -> str:
     return version
 
 
-def _tinygrad() -> str:
+def tinygrad() -> str:
     # the pinned commit tinygrad was installed from, or its version
     with contextlib.suppress(KeyError, TypeError, ValueError):
         url = json.loads(metadata.distribution("tinygrad").read_text("direct_url.json") or "{}")

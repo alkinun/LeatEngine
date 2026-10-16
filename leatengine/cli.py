@@ -156,6 +156,11 @@ def main(argv: list[str] | None = None) -> None:
         "greedily",
     )  # fmt: skip
     speed.add_argument("--json", action="store_true", help="print one JSON object")
+    speed.add_argument(
+        "--share", action="store_true",
+        help="print one JSON object to share: the result, the run, the model's files by their "
+        "SHA-256, the commits and the machine, as docs/benchmarks.md has it, naming no one",
+    )  # fmt: skip
 
     quality = commands.add_parser(
         "perplexity", help="measure quality on text, or against llama.cpp"
@@ -515,10 +520,17 @@ def _bench(args: argparse.Namespace) -> None:
     name = model_name(engine.gguf.path)
     head = {"model": name, "device": Device.DEFAULT, "cache_type": args.cache_type}
     title = f"{name} on {Device.DEFAULT}, {args.cache_type} KV cache"
+    run = {"device": Device.DEFAULT, "cache_type": args.cache_type, "prompt": args.prompt,
+           "generate": args.generate, "reps": args.reps, "sequences": n, "chat": args.chat,
+           "draft": args.draft.name if args.draft else None}  # fmt: skip
     if args.chat:
         made: dict[str, Any] = dict(recommended(engine.gguf.metadata)[0])  # the reasoning set's
         sampling = Sampling(**made) if args.recommended else GREEDY
         chat = bench.chat_speed(engine, args.generate, args.reps, n, sampling)
+        if args.share:
+            run |= {"sampling": asdict(sampling)}
+            print(json.dumps(bench.shared(engine, run, asdict(chat)), indent=2))
+            return
         if args.json:
             print(json.dumps(head | asdict(chat)))
             return
@@ -528,6 +540,9 @@ def _bench(args: argparse.Namespace) -> None:
               f"{chat.per_step:.2f} tokens a step{each}")  # fmt: skip
         return
     result = bench.speed(engine, args.prompt, args.generate, args.reps, n)
+    if args.share:
+        print(json.dumps(bench.shared(engine, run, asdict(result)), indent=2))
+        return
     if args.json:
         print(json.dumps(head | asdict(result)))
         return

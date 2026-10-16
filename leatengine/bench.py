@@ -4,6 +4,8 @@ Quality follows llama-perplexity: chunks start with BOS where the tokenizer adds
 their second half is scored.
 """
 
+import datetime
+import hashlib
 import math
 import random
 import statistics
@@ -16,8 +18,10 @@ from typing import BinaryIO, cast
 
 from tinygrad import Tensor, TinyJit, UOp, dtypes
 
+from leatengine import doctor, machine
 from leatengine.chat import ChatTemplate
 from leatengine.engine import BATCH, Engine, graph
+from leatengine.gguf import model_name
 from leatengine.model import zeros
 from leatengine.sampler import GREEDY, Sampling
 
@@ -148,6 +152,48 @@ def chat_speed(
             best = max(best, (made / (time.perf_counter() - start), made / steps))
     engine.reset()
     return ChatSpeed(*best, sequences)
+
+
+SHARED = 1  # the version of the fields of a result shared, as docs/benchmarks.md lists them
+# llama.cpp's file types, general.file_type, by number: those of the GGUFs LeatEngine runs
+_FILE_TYPES = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0", 9: "Q5_1",
+               10: "Q2_K", 11: "Q3_K_S", 12: "Q3_K_M", 13: "Q3_K_L", 14: "Q4_K_S", 15: "Q4_K_M",
+               16: "Q5_K_S", 17: "Q5_K_M", 18: "Q6_K", 19: "IQ2_XXS", 20: "IQ2_XS", 21: "Q2_K_S",
+               22: "IQ3_XS", 23: "IQ3_XXS", 24: "IQ1_S", 25: "IQ4_NL", 26: "IQ3_S", 27: "IQ3_M",
+               28: "IQ2_S", 29: "IQ2_M", 30: "IQ4_XS", 31: "IQ1_M", 32: "BF16", 36: "TQ1_0",
+               37: "TQ2_0", 38: "MXFP4_MOE"}  # fmt: skip
+
+
+def shared(engine: Engine, run: dict, result: dict) -> dict:
+    """A result as one record to share, as docs/benchmarks.md has it: when, the commits, the
+    model's files by their SHA-256, the run, the result, and the machine as `leatengine doctor`
+    sees it, without the GPU run, and of an NVIDIA GPU its name and driver. Of paths, file
+    names alone, so that the record names no one."""
+    metadata, files = engine.gguf.metadata, engine.gguf.parts or (engine.gguf.path,)
+    kind = metadata.get("general.file_type")
+    model = {
+        "name": model_name(engine.gguf.path),
+        "architecture": metadata.get("general.architecture"),
+        "file_type": _FILE_TYPES.get(kind, kind) if isinstance(kind, int) else kind,
+        "files": [{"name": f.name, "bytes": f.stat().st_size, "sha256": _sha256(f)} for f in files],
+    }
+    found = {c.name: c.found for c in doctor.checks(run=False)}
+    if (gpu := machine.nvidia_gpu()) is not None:
+        found["nvidia gpu"] = gpu
+    return {
+        "shared": SHARED,
+        "date": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+        "leatengine": doctor.leatengine(), "tinygrad": doctor.tinygrad(),
+        "model": model, "run": run, "result": result, "machine": found,
+    }  # fmt: skip
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while block := f.read(8 << 20):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def perplexity(

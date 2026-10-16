@@ -126,3 +126,23 @@ Record the engine and tinygrad commits, the llama.cpp commit and build options, 
 quantization, the KV cache's type, the hardware, driver and compiler, the context, prompt and output
 lengths, sampling, the number of sequences, and warmup. Compare like with like and keep the raw
 results.
+
+## Sharing a result
+
+`bench --share` prints the result as one JSON record that holds what the paragraph above asks
+for, to compare across machines and their power modes. It names files but no paths, user, or host.
+
+```bash
+uv run leatengine bench MODEL.gguf -p 512 -n 128 -r 3 --share > result.json
+```
+
+| Field | Holds |
+|---|---|
+| `shared` | The record's version, 1 |
+| `date` | When it was measured, in UTC |
+| `leatengine`, `tinygrad` | The engine's version and commit, `-dirty` for local changes, and tinygrad's pinned commit |
+| `model` | Its name, `general.architecture`, file type as llama.cpp names `general.file_type`, and each file's name, size and SHA-256 |
+| `run` | The device, KV cache type, prompt and generated tokens, repetitions, sequences, whether it decoded chat replies, the drafter's file, and with `--chat` the sampling |
+| `result` | As `--json` gives it: prefill and decode tokens per second and weight GB/s, or with `--chat` decode and tokens per step |
+| `machine` | `leatengine doctor`'s checks, its GPU run aside, by name: machine and BIOS, CPU and memory, system, kernel, power mode, the AMD GPU and its memory pools; and an NVIDIA GPU's name and driver |
+
