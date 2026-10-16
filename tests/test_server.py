@@ -557,12 +557,56 @@ def test_response_format(client, stream, schema):
     assert whole or schema is None
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("reply, called", [
+    ('<tool_call>\n{"name": "weather", "arguments": {"city": "Paris"}}\n</tool_call>', True),
+    ('{"name": "weather", "parameters": {"city": "Paris"}}', True),
+    ('{"a": 1, "b": "x"}', False),
+])  # fmt: skip
+def test_response_format_beside_tools(client, replies_with, stream, reply, called):
+    # a reply held to a schema's JSON, of tools it may call: a call, of text or of JSON, in its
+    # place, or the JSON
+    replies_with(reply)
+    response = chat(client, "Weather in Paris?", tools=[WEATHER], stream=stream,
+                    response_format=schema_format(PICK))  # fmt: skip
+    if stream:
+        choices = [chunk.choices[0] for chunk in response if chunk.choices]
+        calls = [call for c in choices for call in c.delta.tool_calls or []]
+        content, reason = "".join(c.delta.content or "" for c in choices), choices[-1].finish_reason
+    else:
+        message, reason = response.choices[0].message, response.choices[0].finish_reason
+        calls, content = message.tool_calls or [], message.content
+    if called:
+        (call,) = calls
+        assert reason == "tool_calls" and json.loads(call.function.arguments) == {"city": "Paris"}
+    else:
+        assert reason == "stop" and json.loads(content) == {"a": 1, "b": "x"} and not calls
+
+
+def test_response_format_or_call(client):
+    # sampled replies of the tiny model held to a schema's JSON or a call of JSON, as Llama 3's,
+    # its vocab having no marker of a call: each whole one the one or the other
+    seen = set()
+    for seed in range(8):
+        choice = chat(client, "hello", max_tokens=40, temperature=1, seed=seed, tools=[WEATHER],
+                      response_format=schema_format(PICK)).choices[0]  # fmt: skip
+        if choice.finish_reason == "tool_calls":
+            assert choice.message.tool_calls[0].function.name == "weather"
+        elif choice.finish_reason == "stop":
+            value = json.loads(choice.message.content)
+            assert value["a"] == int(value["a"]) and value["b"] in ("x", "yz")
+        seen.add(choice.finish_reason)
+    assert seen & {"stop", "tool_calls"}
+
+
 def test_response_formats_compiled_once(client, server, monkeypatch):
     # a schema compiles once for the loaded model, its masks shared, until others more recently
     # asked for crowd it out
     compiled = []
     monkeypatch.setattr(server_module, "_GRAMMARS", 2)
-    monkeypatch.setattr(server_module, "Grammar", lambda s: compiled.append(s) or Grammar(s))
+    monkeypatch.setattr(
+        server_module, "Grammar", lambda s, calls: compiled.append(s) or Grammar(s, calls)
+    )
     for t in ("integer", "integer", "string", "boolean", "string", "integer"):
         schema = {"type": "object", "properties": {"v": {"type": t}}}
         chat(client, "hello", max_tokens=2, response_format=schema_format(schema))
@@ -876,12 +920,11 @@ def test_text_is_not_a_tool_call(client, replies_with, stream, text, choice):
         ({"logprobs": 2}, "logprobs of a chat completion must be true or false"),
         ({"top_logprobs": 2}, "top_logprobs needs logprobs to be true"),
         ({"logprobs": True, "top_logprobs": 21}, "top_logprobs must be an integer from 0 to 20"),
-        # a response format of a type or schema it does not take, and one beside tools
+        # a response format of a type or schema it does not take
         ({"response_format": {"type": "xml"}}, 'response_format must be {"type": "text"}'),
         ({"response_format": {"type": "json_schema"}}, 'response_format must be {"type": "text"}'),
         ({"response_format": schema_format({"format": "x"})}, "the schema's format is not"),
         ({"response_format": schema_format(DEEP)}, "the schema nests deeper than 64 levels"),
-        ({"tools": [WEATHER], "response_format": {"type": "json_object"}}, "with tools is not"),
     ],
 )
 def test_bad_request(client, kwargs, error):
@@ -1297,6 +1340,37 @@ def test_responds_in_a_loop(served, model_path):
     second = served.responses.create(model="real", input=items, tools=tools, temperature=0)
     assert second.status == "completed" and second.output_text
     assert second.usage.input_tokens > first.usage.input_tokens + first.usage.output_tokens
+
+
+@pytest.mark.gpu
+@pytest.mark.model
+def test_calls_then_answers_in_json(served, model_path):
+    # as an agent SDK's structured output asks: tools and a schema at once, the model calling a
+    # tool in place of the JSON, then, given the call's output, answering in the JSON
+    metadata = GGUF.open(model_path).metadata
+    template = ChatTemplate(metadata, Tokenizer(metadata))
+    messages: list = [{"role": "user", "content": "What is the weather in Paris right now?"}]
+    if template.render(messages, tools=[WEATHER]) == template.render(messages):
+        pytest.skip("the model's chat template shows no tools")
+    schema = {"type": "object", "properties": {"city": {"type": "string"},
+              "weather": {"type": "string"}}, "required": ["city", "weather"],
+              "additionalProperties": False}  # fmt: skip
+    asked = {"model": "real", "tools": [WEATHER], "temperature": 0,
+             "response_format": schema_format(schema)}  # fmt: skip
+    first = served.chat.completions.create(messages=messages, **asked).choices[0]
+    (call,) = first.message.tool_calls
+    assert first.finish_reason == "tool_calls" and call.function.name == "weather"
+    messages += [first.message.model_dump(exclude_none=True),
+                 {"role": "tool", "tool_call_id": call.id,
+                  "content": "In Paris it is snowing heavily, at -5 C."}]  # fmt: skip
+    # of the output, the answer, as Qwen3 8B gives, or another call, as Llama 3.1 8B may: of
+    # either, never text of no JSON
+    second = served.chat.completions.create(messages=messages, **asked).choices[0]
+    if second.finish_reason == "tool_calls":
+        assert second.message.tool_calls[0].function.name == "weather"
+    else:
+        answer = json.loads(second.message.content)
+        assert second.finish_reason == "stop" and answer["city"] == "Paris"
 
 
 @pytest.mark.gpu

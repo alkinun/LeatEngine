@@ -37,6 +37,7 @@ import jinja2
 
 from leatengine import responses
 from leatengine.chat import (
+    CALL_MARKERS,
     EFFORTS,
     ChatTemplate,
     Reply,
@@ -170,7 +171,7 @@ class _Loaded:
     name: str
     engine: Engine
     chat: ChatTemplate
-    formats: collections.OrderedDict[str, tuple[Grammar, dict]] = field(
+    formats: collections.OrderedDict[str, tuple[Grammar, dict, tuple[str, ...]]] = field(
         default_factory=collections.OrderedDict
     )
     formats_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -216,9 +217,9 @@ class _Completion:
     user: str = ""  # the end user it is for, if the client names them
     thinking: bool = False  # the prompt opened a <think> block
     opened: str = ""  # what the prompt opened the reply with, as ChatTemplate.answer
-    # the JSON its answer is held to, if any: compiled, with the masks it shares, and what goes
-    # before the answer, as ChatTemplate.preamble
-    grammar: tuple[Grammar, dict] | None = None
+    # the JSON its answer is held to, if any: compiled, with the masks it shares and the markers of
+    # a call that may take its place, and what goes before the answer, as ChatTemplate.preamble
+    grammar: tuple[Grammar, dict, tuple[str, ...]] | None = None
     preamble: tuple[str, str] | str | None = None
     # work no one waits on, of service_tier "flex", as OpenAI's flex processing: started after the
     # completions that wait before it, and of an engine of more than one slot, never into its last
@@ -509,7 +510,9 @@ class Server(ThreadingHTTPServer):
         owner = f"{request.key}\n{request.user}" if request.user else request.key
         constraint = None
         if request.grammar is not None:
-            constraint = engine.constrain(request.grammar[0], request.preamble, request.grammar[1])
+            constraint = engine.constrain(
+                request.grammar[0], request.preamble, *request.grammar[1:]
+            )
         try:  # timed from before start(), which copies a prefix in or restores a kept state
             started, cached = time.perf_counter(), engine.cached_prefix(request.prompt, owner)
             sequence = engine.start(
@@ -1266,9 +1269,7 @@ def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completio
         raise ValueError("logprobs of a chat completion must be true or false")
     if body.get("top_logprobs") and not body.get("logprobs"):
         raise ValueError("top_logprobs needs logprobs to be true")
-    grammar, preamble = _format(body.get("response_format"), loaded, text)
-    if grammar is not None and tools:
-        raise ValueError("response_format of JSON with tools is not supported yet: give either")
+    grammar, preamble = _format(body.get("response_format"), loaded, text, tools)
     return _Completion(
         prompt,
         loaded.name,
@@ -1416,20 +1417,26 @@ def _chat_scores(scores: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _format(
-    asked: dict[str, Any] | None, loaded: _Loaded, text: str
-) -> tuple[tuple[Grammar, dict] | None, tuple[str, str] | str | None]:  # fmt: skip
-    # the JSON a response format holds a reply's answer to, compiled, with the masks it shares, of
-    # the loaded model's, and what goes before its answer; none for text
+    asked: dict[str, Any] | None, loaded: _Loaded, text: str, tools: list[dict] | None
+) -> tuple[tuple[Grammar, dict, tuple[str, ...]] | None, tuple[str, str] | str | None]:  # fmt: skip
+    # the JSON a response format holds a reply's answer to, compiled, with the masks it shares and
+    # the markers of calls, of the loaded model's, and what goes before its answer; none for
+    # text. Of tools it may call, a call may take the JSON's place: of JSON, as Llama 3's, or
+    # after a marker of the model's vocab, as Qwen's <tool_call>
     if asked is None or asked["type"] == "text":
         return None, None
     schema = asked["json_schema"]["schema"] if asked["type"] == "json_schema" else None
     preamble = loaded.chat.preamble(text)
-    key = json.dumps([schema, preamble])  # of its keys in order, as properties come in order
+    names = [t["function"]["name"] for t in tools or []]
+    tok = loaded.engine.tokenizer
+    markers = tuple(m for m in CALL_MARKERS if names and len(tok.encode(m, False, True)) == 1)
+    # of its keys in order, as properties come in order
+    key = json.dumps([schema, preamble, names, markers])
     with loaded.formats_lock:
         if (found := loaded.formats.get(key)) is not None:
             loaded.formats.move_to_end(key)
             return found, preamble
-    found = Grammar(schema), {}
+    found = Grammar(schema, names), {}, markers
     with loaded.formats_lock:
         found = loaded.formats.setdefault(key, found)
         loaded.formats.move_to_end(key)

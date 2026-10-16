@@ -372,15 +372,16 @@ class Engine:
 
     def constrain(
         self, grammar: Grammar, preamble: tuple[str, str] | str | None = None,
-        masks: dict | None = None,
+        masks: dict | None = None, markers: Iterable[str] = (),
     ) -> Constraint:  # fmt: skip
         """A constraint of a reply to a grammar, after its preamble, for start(): what reasoning
-        goes before the JSON, as grammar.Matcher takes it. Constraints of the same grammar and
-        preamble may share their `masks`, which they cache by state."""
+        goes before the JSON, and the markers of a call that may take its place, as
+        grammar.Matcher takes them. Constraints of the same grammar, preamble and markers may
+        share their `masks`, which they cache by state."""
         if self._vocab is None:
             tok = self.tokenizer
             self._vocab = Tokens(tok.pieces, tok.special_ids, tok.eog_ids)
-        return Constraint(Matcher(grammar, preamble), self._vocab, masks)
+        return Constraint(Matcher(grammar, preamble, markers), self._vocab, masks)
 
     def step(self) -> list[tuple[Sequence, int]]:
         """Advances the active sequences: a chunk of the first one's prompt still to prefill, then

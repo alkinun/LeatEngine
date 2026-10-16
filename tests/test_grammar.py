@@ -276,3 +276,26 @@ def test_masks_bounded(monkeypatch):
         c.advance(VOCAB.index(token), token)
     c.mask()
     assert len(cache) == 3 and list(cache)[-1] == c.state
+
+
+def test_calls():
+    # of tools, a call in place of the JSON: of JSON, a tool's name and its parameters or
+    # arguments, as Llama 3 calls; or anything after a marker of a call, after whitespace or a
+    # reasoning block, as Qwen calls
+    llama = Matcher(Grammar(PERSON, ["weather", "time"]))
+    for text in ('{"name": "weather", "parameters": {"city": "Paris"}}',
+                 '{"name": "time", "arguments": {}}'):  # fmt: skip
+        assert takes(llama, text), text
+    assert not takes(llama, '{"name": "news", "parameters": {}}')
+    assert takes(llama, '{"name": "Ada", "age": 36, "height": 1.65, "role": "admin", '
+                        '"nick": null, "pets": []}')  # fmt: skip
+    qwen = Matcher(Grammar(PERSON, ["weather"]), ("<think>", "</think>"), ["<tool_call>"])
+    call = '<tool_call>\n{"name": "weather", "arguments": {"city": "Paris"}}\n</tool_call>'
+    for text in (call, "\n\n" + call, "<think>hm</think>\n\n" + call):
+        assert takes(qwen, text), text
+    assert not takes(qwen, "Sure. " + call) and not takes(qwen, "<tool")
+    # after the marker, any token, an end too; before it, the marker among the markup
+    tokens = Tokens([*VOCAB, b""], MARKUP, [END])
+    assert tokens.allowed(qwen, qwen.feed(qwen.start, b"<tool_call>")) is None
+    mask = tokens.allowed(qwen, qwen.start)
+    assert mask is not None and mask >> VOCAB.index(b"<tool_call>") & 1

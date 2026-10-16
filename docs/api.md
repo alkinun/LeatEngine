@@ -82,8 +82,11 @@ message roles and tool formats a model understands.
   `enum`, `const`, `anyOf`, `oneOf` (taken as `anyOf`), and `$ref` to `$defs`, recursive too;
   other keywords, as `pattern`, `format` or `minimum`, are refused with an error rather than
   ignored. Properties come in the schema's order. A reasoning model reasons first, freely, as its
-  template opens or allows it. A reply cut off by `max_tokens` holds JSON cut short. A request
-  may not yet give both a JSON `response_format` and `tools` it may call, of `tool_choice` `auto`.
+  template opens or allows it. A reply cut off by `max_tokens` holds JSON cut short. Beside
+  `tools` it may call, as agent SDKs ask for structured output, a reply may call one in place of
+  the JSON: after the marker of a call of the model's format, as Qwen's `<tool_call>`, or as a
+  JSON object of a tool's `name` and its `parameters` or `arguments`, as Llama 3 calls; harmony's
+  and ATEM's calls come before the answer, as they would.
 - `logprobs: true` gives each token's log-probability, and `top_logprobs` those of up to 20 of
   the likeliest tokens, in `choices[].logprobs.content`, streamed with the chunks: of the model's
   distribution as its logits give it, before temperature, the other sampling controls and a

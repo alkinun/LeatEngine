@@ -12,7 +12,9 @@ way the bytes so far may go on: of a value, an object, an array, a string, a num
 of literals, as of keys and enum values. Whitespace goes where llama.cpp's JSON grammar has it:
 none, a space, or a newline and up to 20 spaces or tabs, so that a reply cannot run on in it.
 Before the JSON, a reply may reason, in a block of its format's markers, as Qwen3's <think>, or
-until the marker that opens its answer, as harmony's final channel.
+until the marker that opens its answer, as harmony's final channel. Of a request with tools, the
+reply may call one instead: a JSON object of a tool's name and its arguments, as Llama 3 calls,
+or anything after the marker of a call, as Qwen's <tool_call>.
 
 Tokens says which tokens a state allows: of each first byte the state takes, those whose bytes it
 takes, walking the vocab's tokens sorted by their bytes; inside a string, the tokens of string bytes
@@ -71,9 +73,11 @@ class Node:
 
 
 class Grammar:
-    """A schema compiled: its nodes, the first its root."""
+    """A schema compiled: its nodes, and its root, the first, or of `calls`, the names of tools a
+    reply may call instead, an anyOf of it and a call: an object of a tool's "name" and its
+    "parameters", as Llama 3's template asks, or "arguments"."""
 
-    def __init__(self, schema: dict[str, Any] | None):
+    def __init__(self, schema: dict[str, Any] | None, calls: Iterable[str] = ()):
         # of no schema, any object, as OpenAI's json_object has a reply be
         self.nodes: list[Node] = []
         self._refs: dict[str, int] = {}
@@ -88,6 +92,16 @@ class Grammar:
             self._grounded(at, set(), done)
         if len(self._ending()) < len(self.nodes):
             raise ValueError("the schema has a value that never ends, as one that requires itself")
+        self.root = 0
+        if names := list(calls):
+            choices = tuple(json.dumps(n, ensure_ascii=False).encode() for n in names)
+            name, given = self._add(Node("literals", choices=choices)), self._any()
+            arguments = self._add(Node("object", extra=given))
+            made = [
+                self._add(Node("object", properties=(("name", name, True), (key, arguments, True))))
+                for key in ("parameters", "arguments")
+            ]
+            self.root = self._add(Node("anyOf", options=(0, *made)))
 
     def _ending(self) -> set[int]:
         # the nodes of which a value can end: of an object, all its required properties'; of an
@@ -290,22 +304,28 @@ class Matcher:
     ("literals", choices): of choices, each (bytes still to come, the frame its end goes on with
         or None);
     ("until", marker, matched): text up to and through a marker, as reasoning before the JSON;
+    ("call", marker, matched, ws): a call's marker, after whitespace, in place of the JSON;
+    ("free",): the call after its marker, anything, which may end at any point;
     ("done",): the reply's JSON whole, which nothing follows.
     """
 
-    def __init__(self, grammar: Grammar, preamble: tuple[str, str] | str | None = None):
+    def __init__(
+        self, grammar: Grammar, preamble: tuple[str, str] | str | None = None,
+        markers: Iterable[str] = (),
+    ):  # fmt: skip
         # preamble: an optional block of reasoning, (opens, closes), before the JSON; or text up
-        # to the marker that opens the answer; or none
+        # to the marker that opens the answer; or none. markers: those of a call in its place
         self.grammar = grammar
-        root: Stack = (("value", 0, -1),)
+        heads: list[Stack] = [(("value", grammar.root, -1),)]
+        heads += [(("call", m.encode(), 0, -1),) for m in markers]
         if isinstance(preamble, str):
-            self.start: State = frozenset({(*root, ("until", preamble.encode(), 0))})
+            self.start: State = frozenset({(*h, ("until", preamble.encode(), 0)) for h in heads})
         elif preamble is not None:
             opens, closes = (m.encode() for m in preamble)
-            block = (*root, ("until", closes, 0), ("literals", ((opens, None),)))
-            self.start = frozenset({root, block})
+            blocks = {(*h, ("until", closes, 0), ("literals", ((opens, None),))) for h in heads}
+            self.start = frozenset(heads) | blocks
         else:
-            self.start = frozenset({root})
+            self.start = frozenset(heads)
 
     def feed(self, state: State, data: bytes) -> State:
         """The state after bytes, empty where they cannot go on; of STACKS ways at most, the
@@ -321,7 +341,7 @@ class Matcher:
     def done(self, state: State) -> bool:
         """Whether the reply may end here: its JSON whole, as a number may be at its end."""
         return any(
-            stack[-1][0] == "done"
+            stack[-1][0] in ("done", "free")
             or (len(stack) == 1 and stack[0][0] == "number" and stack[0][2] in _ENDS)
             for stack in state
         )
@@ -345,6 +365,10 @@ class Matcher:
             return self._literals(top, rest, b)
         if kind == "until":
             return self._until(top, rest, b)
+        if kind == "call":
+            return _called(top, rest, b)
+        if kind == "free":
+            return [stack]
         return []  # done: nothing follows the JSON
 
     def _value(self, at: int, rest: Stack, b: int) -> list[Stack]:
@@ -507,6 +531,18 @@ class Matcher:
         return [(*rest, ("until", marker, matched))]
 
 
+def _called(top: Frame, rest: Stack, b: int) -> list[Stack]:
+    # a call's marker, after whitespace as before a value, then anything
+    _, marker, matched, ws = top
+    if matched == 0 and (spaced := _spaced(ws, b)) is not None:
+        return [(*rest, ("call", marker, 0, spaced))]
+    if b != marker[matched]:
+        return []
+    if matched + 1 == len(marker):
+        return [(*rest, ("free",))]
+    return [(*rest, ("call", marker, matched + 1, ws))]
+
+
 def _spaced(ws: int, b: int) -> int | None:
     # whitespace after `ws` so far, if b goes on with it: a space or a newline first, then after a
     # newline up to INDENT spaces or tabs; before the reply's JSON, up to INDENT of any
@@ -551,12 +587,12 @@ class Tokens:
         """The tokens a state allows next, as a mask of a bit per token: those whose bytes it
         takes, and of a state that may end the reply, those that end one. None where any token
         goes, as in reasoning before the JSON."""
-        if any(stack[-1][0] == "until" for stack in state):
+        if any(stack[-1][0] in ("until", "free") for stack in state):
             return None
         mask = sum(1 << i for i in self.ends) if matcher.done(state) else 0
         if not state:
             return mask
-        if any(frame[0] == "until" for stack in state for frame in stack):  # a marker's opening
+        if any(frame[0] in ("until", "call") for stack in state for frame in stack):  # a marker's
             mask |= sum(1 << i for b, i in self._markup if matcher.feed(state, b))
         if all(stack[-1][0] == "string" and stack[-1][1] == 0 for stack in state):
             # string bytes leave the state as it is: those tokens at once
