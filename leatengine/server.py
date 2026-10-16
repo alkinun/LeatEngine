@@ -1,5 +1,6 @@
 """OpenAI-compatible HTTP server: chat completions, whole or streamed, embeddings, the model list,
-loading a model, and the metrics of what it did, in Prometheus's format.
+loading a model, and the metrics of what it did, in Prometheus's format; and OpenAI's Responses
+and Anthropic's Messages, as chat completions answered in their APIs' forms.
 
 Handler threads parse requests, render prompts and write responses. One worker thread owns the
 engines: it runs completions together, one per slot, a token of each per batched step, and loads a
@@ -35,7 +36,7 @@ from typing import Any, cast
 
 import jinja2
 
-from leatengine import responses
+from leatengine import messages, responses
 from leatengine.chat import (
     CALL_MARKERS,
     EFFORTS,
@@ -161,6 +162,7 @@ class _Finish:
     tokens: int  # tokens generated
     prefill_time: float  # seconds from the start of generation to the first token
     decode_time: float  # seconds from the first token to the last
+    stop: str | None = None  # the stop string that ended it, if one did
 
 
 @dataclass(frozen=True)
@@ -228,6 +230,7 @@ class _Completion:
     text: bool = False  # of /v1/completions: its reply text alone, as the model writes it
     # of /v1/responses: what its response says of the request, as responses.echoed() has it
     response: dict[str, Any] | None = None
+    message: bool = False  # of /v1/messages: answered as Anthropic's Messages API answers
     # of how many of the likeliest tokens it gives the log-probabilities with each token's, if it
     # gives any; and those the worker gave so far, as OpenAI's chat completions show each token's
     logprobs: int | None = None
@@ -604,7 +607,7 @@ class _Writer:
         # a text completion's continuation keeps the space before its first piece, as llama.cpp's
         self.decode, self.text = tokenizer.stream(strip=not c.text), ""
         self.sent, self.count = 0, 0
-        self.stopped = False  # by a stop string, the text cut where it begins
+        self.stopped: str | None = None  # the stop string the text was cut where it begins
         # when generation started, after any wait for a slot, and when the first token came
         self.started, self.first = started, 0.0
 
@@ -624,8 +627,9 @@ class _Writer:
             self.c.out.put([entry | {"text_offset": len(self.text)}])
         self.text += self.decode(token)
         # sent text holds no start of a stop string, so one can only begin after it
-        if found := [i for s in self.c.stop if (i := self.text.find(s, self.sent)) >= 0]:
-            self.text, self.stopped = self.text[: min(found)], True
+        if found := [(i, s) for s in self.c.stop if (i := self.text.find(s, self.sent)) >= 0]:
+            at, self.stopped = min(found)
+            self.text = self.text[:at]
             return True
         if (end := len(self.text) - partial_end(self.text, self.c.stop)) > self.sent:
             self.c.out.put(self.text[self.sent : end])
@@ -639,13 +643,15 @@ class _Writer:
     def finish(self, reason: str) -> None:
         """Puts the rest of the text, then how the reply ended: "stop", "length", or "cancelled" as
         its client hung up."""
-        if not self.stopped:
+        if self.stopped is None:
             self.text += self.decode(None)
         if len(self.text) > self.sent:
             self.c.out.put(self.text[self.sent :])
         end = time.perf_counter()
         first = self.first if self.count else end
-        finish = _Finish(reason, self.cached, self.count, first - self.started, end - first)
+        finish = _Finish(
+            reason, self.cached, self.count, first - self.started, end - first, self.stopped
+        )
         self.c.out.put(finish)
         self.metrics.finished(self.c.key, len(self.c.prompt), finish)
 
@@ -744,8 +750,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self.path = urllib.parse.urlsplit(self.path).path
         routes = {"/v1/chat/completions": self._complete, "/v1/completions": self._complete_text,
-                  "/v1/responses": self._respond, "/v1/models/load": self._load,
-                  "/v1/embeddings": self._embeddings}  # fmt: skip
+                  "/v1/responses": self._respond, "/v1/messages": self._message,
+                  "/v1/messages/count_tokens": self._count_tokens,
+                  "/v1/models/load": self._load, "/v1/embeddings": self._embeddings}  # fmt: skip
         with self._counted(self.path in routes):
             if (route := routes.get(self.path)) is None:
                 return self._error(404, f"there is no POST {self.path}")
@@ -906,6 +913,23 @@ class _Handler(BaseHTTPRequestHandler):
     def _respond(self, body: Any) -> None:
         self._generate(body, _response)
 
+    def _message(self, body: Any) -> None:
+        self._generate(body, _message)
+
+    def _count_tokens(self, body: Any) -> None:
+        # the tokens of a Messages request's prompt, as the loaded model's template renders it
+        server = self.server
+        server.ready.wait()
+        try:
+            completion = _message(body, server, server.loaded)
+        except _Unloaded as e:
+            return self._error(503, str(e))
+        except (ValueError, TypeError, jinja2.TemplateError) as e:
+            return self._error(400, str(e))
+        except RecursionError:
+            return self._error(400, "the request is nested too deeply")
+        self._json(200, {"input_tokens": len(completion.prompt)})
+
     def _generate(
         self, body: Any, asked: Callable[[Any, Server, _Loaded | None], _Completion]
     ) -> None:
@@ -936,6 +960,8 @@ class _Handler(BaseHTTPRequestHandler):
                 (self._stream_text if completion.stream else self._reply_text)(completion)
             elif completion.response is not None:
                 (self._stream_response if completion.stream else self._reply_response)(completion)
+            elif completion.message:
+                (self._stream_message if completion.stream else self._reply_message)(completion)
             elif completion.stream:
                 self._stream(completion)
             else:
@@ -1089,6 +1115,74 @@ class _Handler(BaseHTTPRequestHandler):
         body = _response_body(c, items)
         event(f"response.{body['status']}", response=body)
 
+    def _reply_message(self, c: _Completion) -> None:
+        try:
+            text = c.opened + "".join(c.pieces(self._hung_up))
+            reply = split_reply(text, c.form, c.thinking, done=True)
+        except RuntimeError as e:
+            return self._error(500, str(e))
+        content, found = _calls(reply, c.tools, c.finish.reason)
+        calls = _tool_calls(found)
+        self._json(200, _message_body(c, messages.content(reply, content, calls), calls))
+
+    def _stream_message(self, c: _Completion) -> None:
+        # as Anthropic's Messages API streams: the message begun, each content block started, its
+        # deltas, and stopped, in turn: the thinking, the text, then the tool uses once the reply
+        # is done and they are known; then the message's stop reason and usage, and its end
+        self._events()
+
+        def event(kind: str, **fields: Any) -> None:
+            self._event({"type": kind, **fields}, kind)
+
+        index, kind = -1, ""  # the block open, if any, and its type
+
+        def start(block: dict[str, Any]) -> None:
+            nonlocal index, kind
+            if kind:
+                event("content_block_stop", index=index)
+            index, kind = index + 1, block["type"]
+            event("content_block_start", index=index, content_block=block)
+
+        def delta(**fields: Any) -> None:
+            event("content_block_delta", index=index, delta=fields)
+
+        event("message_start", message=_message_body(c, [], [], done=False))
+        text, reasoned, sent, reply = c.opened, 0, 0, Reply()
+        try:
+            for piece in itertools.chain(c.pieces(self._hung_up), [None]):
+                text += piece or ""
+                reply = split_reply(text, c.form, c.thinking, done=piece is None)
+                if len(reply.reasoning) > reasoned and kind != "text":
+                    if kind != "thinking":
+                        start(messages.thinking_block(""))
+                    delta(type="thinking_delta", thinking=reply.reasoning[reasoned:])
+                    reasoned = len(reply.reasoning)
+                content = reply.content
+                if (end := tool_call_start(content) if c.tools else len(content)) > sent:
+                    if kind != "text":
+                        start(messages.text_block(""))
+                    delta(type="text_delta", text=content[sent:end])
+                    sent = end
+        except RuntimeError as e:
+            return event("error", error={"type": "api_error", "message": str(e)})
+        content, found = _calls(reply, c.tools, c.finish.reason)
+        calls = _tool_calls(found)
+        if len(content) > sent or not (kind or calls):  # the rest of the text, or an empty one
+            if kind != "text":
+                start(messages.text_block(""))
+            if len(content) > sent:
+                delta(type="text_delta", text=content[sent:])
+        for call in calls:  # each whole, its arguments the JSON of the object the block holds
+            start(messages.tool_use_block(call, whole=False))
+            given = messages.tool_use_block(call)["input"]
+            delta(type="input_json_delta", partial_json=json.dumps(given, ensure_ascii=False))
+        if kind:
+            event("content_block_stop", index=index)
+        done = _message_body(c, [], calls)
+        stopped = {k: done[k] for k in ("stop_reason", "stop_sequence")}
+        event("message_delta", delta=stopped, usage=done["usage"])
+        event("message_stop")
+
     def _events(self) -> None:
         # the head of a stream of Server-Sent Events
         self.send_response(200)
@@ -1204,6 +1298,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _error(self, status: int, message: str, headers: dict[str, str] | None = None) -> None:
+        if self.path.startswith("/v1/messages"):  # as Anthropic's API gives one
+            error = {"type": messages.error_type(status), "message": message}
+            return self._json(status, {"type": "error", "error": error}, headers)
         self._json(status, {"error": _error_object(status, message)}, headers)
 
 
@@ -1399,6 +1496,46 @@ def _response(body: Any, server: Server, loaded: _Loaded | None) -> _Completion:
         raise ValueError(said) from None
     completion.id, completion.response = f"resp_{uuid.uuid4().hex}", responses.echoed(body)
     return completion
+
+
+def _message(body: Any, server: Server, loaded: _Loaded | None) -> _Completion:
+    # what a request body of /v1/messages asks for of the `loaded` model: the chat completion it
+    # amounts to, answered as a message, its errors of the fields as the message's request names
+    # them
+    try:
+        completion = _completion(messages.as_chat(body), server, loaded)
+    except _Unloaded:
+        raise
+    except ValueError as e:
+        said = str(e)
+        for chat, own in (("stop", "stop_sequences"), ("user", "metadata.user_id"),
+                          ("response_format", "output_config.format")):  # fmt: skip
+            if said.startswith(f"{chat} "):
+                said = own + said[len(chat) :]
+        raise ValueError(said) from None
+    completion.id, completion.message = messages.message_id(), True
+    return completion
+
+
+def _message_body(
+    c: _Completion, content: list[dict[str, Any]], calls: list[dict[str, Any]], done: bool = True
+) -> dict[str, Any]:
+    # a message as Anthropic's Messages API gives it: begun, of the prompt's tokens; or done, with
+    # why it stopped, and its usage, the prompt's tokens the cache held read from it
+    body = {"id": c.id, "type": "message", "role": "assistant", "model": c.model,
+            "content": content, "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": len(c.prompt), "output_tokens": 0}}  # fmt: skip
+    if done:
+        reason = messages.stop_reason(c.finish.reason, calls, c.finish.stop)
+        body["stop_reason"] = reason
+        body["stop_sequence"] = c.finish.stop if reason == "stop_sequence" else None
+        body["usage"] = {
+            "input_tokens": len(c.prompt) - c.finish.cached,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": c.finish.cached,
+            "output_tokens": c.finish.tokens,
+        }
+    return body
 
 
 def _response_body(c: _Completion, output: list[dict[str, Any]], done: bool = True) -> dict:

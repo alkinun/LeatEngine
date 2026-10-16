@@ -1,9 +1,9 @@
 # HTTP API and configuration
 
 Start with `leatengine serve MODEL.gguf`. The default address is `http://127.0.0.1:8080`.
-The API implements a subset of OpenAI chat and text completions, responses, and embeddings, plus
-model-management, metrics and health extensions. It serves no HTML, frontend, or browser
-application.
+The API implements a subset of OpenAI chat and text completions, responses, and embeddings, and
+of Anthropic's Messages, plus model-management, metrics and health extensions. It serves no HTML,
+frontend, or browser application.
 
 ## Endpoints
 
@@ -14,6 +14,8 @@ application.
 | `POST /v1/chat/completions` | Generate one reply, optionally streamed |
 | `POST /v1/completions` | Continue a prompt, or fill in the middle, optionally streamed |
 | `POST /v1/responses` | Generate one reply as a response, statelessly, optionally streamed |
+| `POST /v1/messages` | Generate one reply as Anthropic's Messages API does, optionally streamed |
+| `POST /v1/messages/count_tokens` | Count a Messages request's prompt tokens |
 | `POST /v1/embeddings` | Embed text using the separately configured embedding model |
 | `GET /metrics` | Prometheus metrics with the `leatengine_` prefix |
 | `GET /health` | `200` once a chat model is loaded and warmed up, `503` until then |
@@ -21,8 +23,9 @@ application.
 All routes but `/health` use the same authentication when keys are enabled; `/health` needs no
 key, so that a supervisor can wait for the server to be ready, as llama.cpp's server allows.
 Request bodies are limited to 64 MiB. Errors use an `error` object with `message`, `type`,
-`param`, and `code`. A generation error after streaming starts arrives as an SSE error event;
-clients must handle that as well as HTTP errors.
+`param`, and `code`, as OpenAI's API does, or of `/v1/messages`, as Anthropic's does. A generation
+error after streaming starts arrives as an SSE error event; clients must handle that as well as
+HTTP errors.
 
 ## Models
 
@@ -159,6 +162,35 @@ A reply's output is a `reasoning` item of its reasoning's text, a `message` of i
 `usage` counts no reasoning tokens apart. Streams send the Responses API's events: each output
 item added, its text's deltas, and it done, then `response.completed` or
 `response.incomplete` with the whole response; calls come once the reply is done.
+
+## Messages
+
+`POST /v1/messages` answers as Anthropic's Messages API does, for clients such as Claude Code and
+Anthropic's SDKs, which send their key as `x-api-key` or as a bearer token. `system`, as text or
+text blocks, and `messages` of text, `image`, `tool_use`, `tool_result` and `thinking` blocks become
+the chat completion's messages: a tool result goes back as a tool's message, and thinking as the
+model's reasoning before its calls. A `system` message among them, as Claude Code says its
+environment after the user's first words, stays where it is, for the model's template to show.
+Client `tools`, `tool_choice` (`auto`, `any`, `tool`, `none`), `max_tokens`, `stop_sequences` and
+`stream` work as for chat completions, and so do `temperature`, `top_p` and `top_k`, which
+Anthropic's API no longer takes but older clients send. `output_config.format`, a JSON schema, holds
+the reply to it as `response_format` does. `output_config.effort` is the reasoning effort, `max` the
+highest the model takes; `thinking` of type `disabled` asks for none, `enabled` without an effort
+for medium, and `adaptive` or `between_tools` leaves it to the model, where its template takes an
+effort at all. `metadata.user_id` keeps cached prefixes to that user's prompts, as `user` does; of
+Claude Code's, its device's and account's, so that a user's sessions share their prefix. Anthropic's
+server tools, such as web search, are left out, the model not offered them; `cache_control` is
+ignored, as the server reuses prefixes by itself. The request's `model` is ignored: the loaded model
+answers.
+
+A reply's content is a `thinking` block of its reasoning, of an empty `signature`, a `text` block,
+and a `tool_use` block per call; `stop_reason` is `tool_use`, `max_tokens`, `stop_sequence` or
+`end_turn`. `usage.input_tokens` counts the prompt's tokens past those read from the cache,
+`cache_read_input_tokens`. Streams send Anthropic's events: `message_start`, each content block's
+`content_block_start`, deltas and `content_block_stop`, then `message_delta` with the stop reason
+and usage, and `message_stop`; tool uses come once the reply is done.
+`POST /v1/messages/count_tokens` gives a request's `input_tokens` as the loaded model's template
+renders it.
 
 ## Embeddings
 

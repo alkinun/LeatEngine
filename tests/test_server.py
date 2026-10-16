@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
+import anthropic
 import openai
 import pytest
 
@@ -49,6 +50,12 @@ def serving(*models: Path, **options) -> Iterator[Server]:
 def connect(server: Server) -> openai.OpenAI:
     url = f"http://127.0.0.1:{server.server_port}/v1"
     return openai.OpenAI(base_url=url, api_key="unused", max_retries=0)
+
+
+def messenger(client: openai.OpenAI) -> anthropic.Anthropic:
+    # a client of Anthropic's Messages API, of the same server
+    url = str(client.base_url).removesuffix("v1/")
+    return anthropic.Anthropic(base_url=url, api_key="unused", max_retries=0)
 
 
 def load(client: openai.OpenAI, model: str) -> dict:
@@ -726,6 +733,91 @@ def test_bad_response(client, kwargs, error):
         client.responses.create(**({"model": "tiny", "input": "hi"} | kwargs))
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_message(client, expected, stream):
+    # a reply as a message of Anthropic's Messages API: its text a block, cut off by max_tokens;
+    # streamed, the message begun, the block started, its deltas, and stopped, and the message's
+    # stop reason and usage
+    asked = {"model": "claude", "max_tokens": 8, "extra_body": {"temperature": 0},
+             "messages": [{"role": "user", "content": "hello"}]}  # fmt: skip
+    if stream:
+        events = list(messenger(client).messages.create(**asked, stream=True))
+        kinds = [e.type for e in events]
+        assert kinds[:2] == ["message_start", "content_block_start"]
+        assert kinds[-3:] == ["content_block_stop", "message_delta", "message_stop"]
+        assert set(kinds[2:-3]) == {"content_block_delta"}
+        with messenger(client).messages.stream(**asked) as streamed:
+            message = streamed.get_final_message()
+        assert "".join(e.delta.text for e in events[2:-3]) == message.content[0].text
+    else:
+        message = messenger(client).messages.create(**asked)
+    assert message.content[0].text == expected("hello", 8) and message.id.startswith("msg_")
+    assert message.stop_reason == "max_tokens" and message.model == "tiny"
+    usage = message.usage
+    assert (usage.input_tokens + usage.cache_read_input_tokens, usage.output_tokens) == (5, 8)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_message_thinks_and_uses_tools(client, replies_with, monkeypatch, stream):
+    # Qwen3's reasoning, text and a call, as a thinking block, a text block and a tool_use block;
+    # streamed, each started and stopped in turn, the tool's input as JSON
+    monkeypatch.setattr(ChatTemplate, "form", property(lambda self: "think"))
+    replies_with("<think>Rain, I fear.</think>Checking.\n<tool_call>\n"
+                 '{"name": "weather", "arguments": {"city": "Paris"}}\n</tool_call>')  # fmt: skip
+    function = WEATHER["function"]
+    asked = {"model": "claude", "max_tokens": 64,
+             "messages": [{"role": "user", "content": "Weather in Paris?"}],
+             "tools": [{"name": function["name"], "description": function["description"],
+                        "input_schema": function["parameters"]}]}  # fmt: skip
+    if stream:
+        with messenger(client).messages.stream(**asked) as streamed:
+            events = list(streamed)
+            message = streamed.get_final_message()
+        started = [e.index for e in events if e.type == "content_block_start"]
+        stopped = [e.index for e in events if e.type == "content_block_stop"]
+        assert started == stopped == [0, 1, 2]
+        deltas = [e.delta.thinking for e in events if e.type == "content_block_delta"
+                  and e.delta.type == "thinking_delta"]  # fmt: skip
+        assert "".join(deltas) == "Rain, I fear."
+    else:
+        message = messenger(client).messages.create(**asked)
+    thinking, text, used = message.content
+    assert thinking.thinking == "Rain, I fear." and text.text == "Checking."
+    assert used.type == "tool_use" and used.name == "weather" and used.input == {"city": "Paris"}
+    assert used.id.startswith("toolu_") and message.stop_reason == "tool_use"
+
+
+def test_message_stop_sequence(client, replies_with):
+    replies_with("It rains. END Or not.")
+    message = messenger(client).messages.create(
+        model="claude", max_tokens=32, stop_sequences=["END"],
+        messages=[{"role": "user", "content": "hello"}],
+    )  # fmt: skip
+    assert message.content[0].text == "It rains. "
+    assert (message.stop_reason, message.stop_sequence) == ("stop_sequence", "END")
+
+
+def test_count_tokens(client):
+    counted = messenger(client).messages.count_tokens(
+        model="claude", messages=[{"role": "user", "content": "hello"}]
+    )
+    assert counted.input_tokens == 5
+
+
+@pytest.mark.parametrize("kwargs, error", [
+    ({"messages": [{"role": "tool", "content": "x"}]}, "role is user, assistant or system"),
+    ({"stop_sequences": ["x"] * 17}, "stop_sequences must be"),
+    ({"tool_choice": {"type": "all"}}, "tool_choice must be of type"),
+    ({"max_tokens": 0}, "max_tokens must be a positive integer"),
+])  # fmt: skip
+def test_bad_message(client, kwargs, error):
+    # refused as Anthropic's API refuses, of the fields as a message's request names them
+    asked = {"model": "claude", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+    with pytest.raises(anthropic.BadRequestError, match=error) as refused:
+        messenger(client).messages.create(**(asked | kwargs))
+    assert refused.value.body["error"]["type"] == "invalid_request_error"
+
+
 # as Llama 3, Qwen3, Gemma 4 and Qwen3.5 call tools; the text before a call is the content
 CALLS = [
     (' {"name": "weather", "parameters": {"city": "Paris"}}', None),
@@ -1386,6 +1478,35 @@ def test_responds_in_a_loop(served, model_path):
     second = served.responses.create(model="real", input=items, tools=tools, temperature=0)
     assert second.status == "completed" and second.output_text
     assert second.usage.input_tokens > first.usage.input_tokens + first.usage.output_tokens
+
+
+@pytest.mark.gpu
+@pytest.mark.model
+def test_messages_in_a_loop(served, model_path):
+    # an agent's loop through Anthropic's Messages API, as Claude Code's: the model uses a tool,
+    # the client sends back the conversation, the tool's result too, and the model answers
+    metadata = GGUF.open(model_path).metadata
+    template = ChatTemplate(metadata, Tokenizer(metadata))
+    question = [{"role": "user", "content": "What is the weather in Paris right now?"}]
+    if template.render(question, tools=[WEATHER]) == template.render(question):
+        pytest.skip("the model's chat template shows no tools")
+    function = WEATHER["function"]
+    tools: list = [{"name": function["name"], "description": function["description"],
+                    "input_schema": function["parameters"]}]  # fmt: skip
+    client, messages = messenger(served), list(question)
+    greedy = {"temperature": 0}  # as Anthropic's API no longer takes, but older clients send
+    first = client.messages.create(model="real", max_tokens=1024, messages=messages, tools=tools,
+                                   extra_body=greedy)  # fmt: skip
+    used = [block for block in first.content if block.type == "tool_use"]
+    assert used and used[0].name == "weather" and first.stop_reason == "tool_use"
+    said = "In Paris it is snowing heavily, at -5 C."
+    results = [{"type": "tool_result", "tool_use_id": b.id, "content": said} for b in used]
+    messages += [{"role": "assistant", "content": [b.model_dump() for b in first.content]},
+                 {"role": "user", "content": results}]  # fmt: skip
+    second = client.messages.create(model="real", max_tokens=1024, messages=messages,
+                                    tools=tools, extra_body=greedy)  # fmt: skip
+    assert second.stop_reason == "end_turn" and any(b.type == "text" for b in second.content)
+    assert second.usage.cache_read_input_tokens > 0  # of the prompt before, as it went on from it
 
 
 @pytest.mark.gpu

@@ -20,7 +20,10 @@ Repository = "https://github.com/alkinun/LeatEngine"
 Issues = "https://github.com/alkinun/LeatEngine/issues"
 
 [dependency-groups]
-dev = ["gguf", "mypy", "numpy", "openai", "pytest", "pytest-cov", "pytest-xdist", "ruff"]
+dev = [
+  "anthropic", "gguf", "mypy", "numpy", "openai", "pytest", "pytest-cov", "pytest-xdist",
+  "ruff",
+]
 
 [build-system]
 requires = ["hatchling"]

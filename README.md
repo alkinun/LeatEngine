@@ -89,10 +89,11 @@ leatengine keys add chat-app
 leatengine serve /path/to/model.gguf --host 0.0.0.0 --keys
 ```
 
-The key is shown once. Clients send it as `Authorization: Bearer KEY`. The server provides HTTP;
-use an appropriate TLS proxy when encrypted transport is needed. See
-[API and configuration](docs/api.md), and for coding agents and agent frameworks,
-[Agents](docs/agents.md).
+The key is shown once. Clients send it as `Authorization: Bearer KEY`, or as Anthropic's clients
+do, `x-api-key: KEY`. The server provides HTTP; use an appropriate TLS proxy when encrypted
+transport is needed. See [API and configuration](docs/api.md), which covers OpenAI's chat
+completions and Responses and Anthropic's Messages, and for coding agents, Claude Code among them,
+and agent frameworks, [Agents](docs/agents.md).
 
 ## Supported models
 

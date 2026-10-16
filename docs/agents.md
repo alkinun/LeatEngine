@@ -1,9 +1,10 @@
 # Agents
 
-Coding agents and agent frameworks use `leatengine serve` as they would OpenAI's API: chat
-completions with tools and streaming, the Responses API, and structured output. Each client below
-was run against `serve` with Qwen3 8B on a small task, editing a file to make a failing test pass,
-or a tool call and a structured answer; the versions are those run.
+Coding agents and agent frameworks use `leatengine serve` as they would OpenAI's API, chat
+completions with tools and streaming, the Responses API, and structured output, or Anthropic's
+Messages API. Each client below was run against `serve` with Qwen3 8B on a small task, editing a
+file to make a failing test pass, or a tool call and a structured answer; the versions are those
+run.
 
 ## Serving
 
@@ -122,13 +123,31 @@ llm = ChatOpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused",
 `with_structured_output` by each method, `json_schema`, `function_calling` (a `tool_choice` naming
 its function) and `json_mode`, and `bind_tools` work.
 
-### Claude Code
+### Claude Code (2.1.282)
 
-Not yet: it speaks Anthropic's Messages API, which `serve` does not.
+Through Anthropic's Messages API ([`/v1/messages`](api.md#messages)), by its environment:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=unused
+export ANTHROPIC_MODEL=Qwen_Qwen3-8B-Q4_K_M ANTHROPIC_DEFAULT_HAIKU_MODEL=Qwen_Qwen3-8B-Q4_K_M
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=32768 CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+claude
+```
+
+- **The model:** `serve` answers with the loaded model whatever model a request names.
+  `ANTHROPIC_MODEL` tells Claude Code, and through its system prompt the model, which model it
+  is; `ANTHROPIC_DEFAULT_HAIKU_MODEL` does so for its background requests.
+- **The context:** Claude Code's system prompt and its 20 tools take about 15,000 tokens before
+  the task's first word. It knows no context window of a model not Anthropic's: give it the one
+  `serve` chose, and an output limit that leaves its prompt room, or it compacts the conversation
+  over and over. A model of 8B on 24 GB takes its whole 32,768 tokens with `--cache-type q8_0`.
+- **The cache:** each turn goes on from the last, so `serve` prefills only what the turn adds; a
+  user's sessions share the prefix of the system prompt and tools.
 
 ## What a small model gets wrong
 
-The server answers each request; whether the task gets done is the model's. Qwen3 8B fixed the
-task through OpenCode, Aider and Continue, but through Codex called a patch tool it was not given
-and then edited the test rather than the code. Agents are run with larger models, as a 128 GB
+The server answers each request; whether the task gets done is the model's. Qwen3 8B fixed the task
+through OpenCode, Aider, Continue and Claude Code, but through Codex called a patch tool it was not
+given and then edited the test rather than the code. Agents are run with larger models, as a 128 GB
 machine holds.
