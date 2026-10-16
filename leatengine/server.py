@@ -133,6 +133,10 @@ _FIELDS: dict[str, tuple[Callable[[Any], bool], str]] = {
                  f"true or false, or of a text completion a count from 0 to {TOP_LOGPROBS}"),
     "top_logprobs": (lambda v: type(v) is int and 0 <= v <= TOP_LOGPROBS,
                      f"an integer from 0 to {TOP_LOGPROBS}"),
+    "logit_bias": (lambda v: isinstance(v, dict) and all(
+                       re.fullmatch(r"\d{1,7}", k) and _between(-100, 100)(b)
+                       for k, b in v.items()),
+                   "an object of token ids to numbers from -100 to 100"),
     "response_format": (lambda v: isinstance(v, dict) and (v.get("type") in ("text", "json_object")
                         or v.get("type") == "json_schema" and isinstance(v.get("json_schema"), dict)
                         and isinstance(v["json_schema"].get("schema"), dict)),
@@ -142,7 +146,7 @@ _FIELDS: dict[str, tuple[Callable[[Any], bool], str]] = {
 
 # what leatengine does not implement, each with the value that asks for nothing more
 _UNSUPPORTED = {
-    "n": 1, "logit_bias": {}, "echo": False, "best_of": 1,
+    "n": 1, "echo": False, "best_of": 1,
 }  # fmt: skip
 _TEXT_TOKENS = 16  # the tokens a text completion makes unless it asks for more, as OpenAI's
 _GRAMMARS = 64  # compiled response formats a loaded model keeps, with their masks
@@ -225,6 +229,7 @@ class _Completion:
     # gives any; and those the worker gave so far, as OpenAI's chat completions show each token's
     logprobs: int | None = None
     scores: list[dict[str, Any]] = field(default_factory=list)
+    logit_bias: dict[int, float] | None = None  # what it adds to the logits of the tokens named
     id: str = field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
     created: int = field(default_factory=lambda: int(time.time()))
     # from the worker: pieces of text, and before their text, tokens' log-probabilities if asked
@@ -508,7 +513,7 @@ class Server(ThreadingHTTPServer):
             sequence = engine.start(
                 request.prompt, request.max_tokens, request.sampling, request.seed,
                 images=request.images, owner=owner, constraint=constraint,
-                logprobs=request.logprobs,
+                logprobs=request.logprobs, logit_bias=request.logit_bias,
             )  # fmt: skip
         except Exception as e:  # for the client; the server carries on
             request.out.put(e)
@@ -1273,6 +1278,7 @@ def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completio
         preamble=preamble,
         background=body.get("service_tier") == "flex",
         logprobs=(body.get("top_logprobs") or 0) if body.get("logprobs") else None,
+        logit_bias=_bias(body, loaded),
     )
 
 
@@ -1320,7 +1326,17 @@ def _text_completion(body: Any, server: Server, loaded: _Loaded | None) -> _Comp
         text=True,
         id=f"cmpl-{uuid.uuid4().hex}",
         logprobs=body.get("logprobs"),
+        logit_bias=_bias(body, loaded),
     )
+
+
+def _bias(body: dict[str, Any], loaded: _Loaded) -> dict[int, float] | None:
+    # a request's logit_bias, by token id, each of the model's vocab
+    bias = {int(k): float(b) for k, b in (body.get("logit_bias") or {}).items()}
+    vocab = int(loaded.engine.model.output.shape[0])
+    if past := [t for t in bias if t >= vocab]:
+        raise ValueError(f"logit_bias names token {past[0]}, past the vocab of {vocab}")
+    return bias or None
 
 
 def _response(body: Any, server: Server, loaded: _Loaded | None) -> _Completion:

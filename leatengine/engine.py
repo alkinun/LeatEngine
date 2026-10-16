@@ -206,6 +206,10 @@ class Engine:
         self._allowed = zeros(cache_slots, -(-vocab // 32), dtype=dtypes.uint32) - 1
         self._allowed.realize()
         self._masks: list[int | None] = [None] * cache_slots
+        # what each slot's sequence adds to its logits, as a request's logit_bias, zeros unless
+        # it gives one; and whether each holds any
+        self._bias = zeros(cache_slots, vocab)
+        self._biased = [False] * cache_slots
         self._vocab: Tokens | None = None  # its bytes, sorted, once a constraint needs them
         special = self.tokenizer.special_ids
         self._text = Tensor([i not in special for i in range(vocab)]).realize()
@@ -282,6 +286,7 @@ class Engine:
         owner: str = "",
         constraint: Constraint | None = None,
         logprobs: int | None = None,
+        logit_bias: dict[int, float] | None = None,
     ) -> Generator[int, None, None]:
         """Yields up to `max_tokens` ids; stops early at end of generation or the context limit.
 
@@ -292,8 +297,9 @@ class Engine:
         if self.active:
             raise RuntimeError("another generation is unfinished: exhaust or close it first")
         sequence = self.start(
-            prompt, max_tokens, sampling, seed, ignore_eog, images, owner, constraint, logprobs
-        )
+            prompt, max_tokens, sampling, seed, ignore_eog, images, owner, constraint, logprobs,
+            logit_bias,
+        )  # fmt: skip
         try:
             while not sequence.done:
                 for _, token in self.step():
@@ -312,16 +318,21 @@ class Engine:
         owner: str = "",
         constraint: Constraint | None = None,
         logprobs: int | None = None,
+        logit_bias: dict[int, float] | None = None,
     ) -> Sequence:
         """Starts a generation in a free slot, as generate() would; step() advances it. The
         prompt shows each of `images` with its tokens, and shares cached tokens only of prompts
         of the same `owner`. A `constraint` holds each token it draws to those it allows, as
         constrain() makes one. Given `logprobs`, the sequence keeps in `scores`, with each token
         it draws, the token's log-probability, of the model's distribution as its logits give
-        it, before any sampling option or constraint, and the `logprobs` likeliest tokens', up to
-        TOP_LOGPROBS. Either kind of sequence never decodes speculatively."""
+        it, before any sampling option, bias or constraint, and the `logprobs` likeliest tokens',
+        up to TOP_LOGPROBS. Either kind of sequence never decodes speculatively. `logit_bias`
+        adds to the logits of the tokens it names, before all else."""
         if not self.config.causal:
             raise ValueError("an encoder, whose tokens see each other, only embeds")
+        vocab = int(self._bias.shape[1])
+        if logit_bias and not all(0 <= t < vocab for t in logit_bias):
+            raise ValueError(f"logit_bias names tokens past the vocab of {vocab}")
         if logprobs is not None and not 0 <= logprobs <= TOP_LOGPROBS:
             raise ValueError(f"logprobs is of 0 to {TOP_LOGPROBS} tokens, not {logprobs}")
         if max_tokens < 1:
@@ -349,6 +360,12 @@ class Engine:
                 if t >= 0:
                     marked[t >> 3] |= 1 << (t & 7)
             _copy_row(self._prompted, slot, marked)
+        if logit_bias or self._biased[slot]:  # its bias, or zeros for the bias it held
+            row = array.array("f", bytes(4 * vocab))
+            for t, b in (logit_bias or {}).items():
+                row[t] = b
+            _copy_row(self._bias, slot, bytearray(row.tobytes()))
+            self._biased[slot] = bool(logit_bias)
         return sequence
 
     def constrain(
@@ -744,9 +761,10 @@ class Engine:
         positions = Tensor.stack(*(Tensor(start + 1 + i) for start in starts for i in range(ran)))
         seen = self._seen_rows[: n * ran]
         seen.assign(self._seen_by(run.reshape(n, ran), slots)).realize()
-        words = int(self._prompted.shape[1])
+        words, vocab = int(self._prompted.shape[1]), int(self._bias.shape[1])
         prompted = Tensor.cat(*(self._prompted[s : s + 1].expand(ran, words) for s in slots))
-        drawn = sample(logits, values, seeds, positions, seen, prompted=prompted)
+        bias = Tensor.cat(*(self._bias[s : s + 1].expand(ran, vocab) for s in slots))
+        drawn = sample(logits, values, seeds, positions, seen, prompted=prompted, bias=bias)
         drawn = drawn.cast(dtypes.int32).reshape(n, ran)
         return drafted.cast(dtypes.int32).cat(drawn, dim=1).realize()
 
@@ -855,7 +873,8 @@ class Engine:
             hidden = self._followed(tokens, hidden, spans, positions)
             logits = self.model.logits(hidden[:, -1, :])
             allowed, prompted = self._allowed[slot : slot + 1], self._prompted[slot : slot + 1]
-            drawn = sample(logits, options, seed, start + length, seen, allowed, prompted)
+            bias = self._bias[slot : slot + 1]
+            drawn = sample(logits, options, seed, start + length, seen, allowed, prompted, bias)
             return drawn.realize(logits), logits
         spans = [Span(slot, start) for slot, start in pairs]
         hidden = self._followed(tokens, self.model.run(tokens, spans, live), spans)
@@ -863,7 +882,8 @@ class Engine:
         positions = Tensor.stack(*(Tensor(start + 1) for _, start in pairs))
         allowed = Tensor.cat(*(self._allowed[slot : slot + 1] for slot in slots))
         prompted = Tensor.cat(*(self._prompted[slot : slot + 1] for slot in slots))
-        drawn = sample(logits, options, seed, positions, seen, allowed, prompted)
+        bias = Tensor.cat(*(self._bias[slot : slot + 1] for slot in slots))
+        drawn = sample(logits, options, seed, positions, seen, allowed, prompted, bias)
         return drawn.realize(logits), logits
 
     def _embedded(self, tokens: Tensor, slot: UOp, start: UOp) -> Tensor:

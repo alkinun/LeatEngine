@@ -10,7 +10,7 @@ LOGITS = [2.0, 1.0, 0.0, -1.0, 0.5]
 def draws(
     logits: list[list[float]], sampling: Sampling | list[Sampling], seed: int | list[int],
     position: int | list[int], seen: list[list[int]] | None = None,
-    prompted: list[list[int]] | None = None,
+    prompted: list[list[int]] | None = None, bias: list[list[float]] | None = None,
 ) -> list[int]:  # fmt: skip
     # one value for every row, or one per row; seen, the times each token was generated, and
     # prompted, the tokens of each prompt
@@ -21,7 +21,8 @@ def draws(
     words = None
     if prompted is not None:
         words = Tensor([[sum(1 << t for t in row)] for row in prompted], dtype=dtypes.uint32)
-    out = sample(Tensor(logits), options, seeds, positions, counted, prompted=words)
+    added = None if bias is None else Tensor(bias)
+    out = sample(Tensor(logits), options, seeds, positions, counted, prompted=words, bias=added)
     return out.numpy().ravel().tolist()
 
 
@@ -85,6 +86,15 @@ def test_frequency_penalty():
     assert draws([LOGITS], Sampling(frequency_penalty=0.6), 0, 0, [[1, 0, 0, 0, 0]]) == [0]
     assert draws([LOGITS], Sampling(frequency_penalty=0.6), 0, 0, [[2, 0, 0, 0, 0]]) == [1]
     assert draws([LOGITS], Sampling(frequency_penalty=-2), 0, 0, [[0, 1, 0, 0, 0]]) == [1]
+
+
+def test_logit_bias():
+    # onto the logits before all else, sampled or greedy, the penalties after
+    assert draws([LOGITS], Sampling(), 0, 0, bias=[[0, 1.5, 0, 0, 0]]) == [1]
+    assert set(draws([LOGITS] * 50, Sampling(1.0), list(range(50)), 0,
+                     bias=[[-100, 0, 0, 0, 100]] * 50)) == {4}  # fmt: skip
+    penalized = Sampling(repetition_penalty=2.0)  # (2 + 2) / 2 > 1.5, but not 2 / 2
+    assert draws([LOGITS], penalized, 0, 0, [[1, 0, 0, 0, 0]], bias=[[2, 0.5, 0, 0, 0]]) == [0]
 
 
 def test_repetition_penalty():

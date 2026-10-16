@@ -347,6 +347,15 @@ def test_text_completion_prompts(server, engine, monkeypatch):
     assert asked(prompt=[3], suffix="") == [6, 7, 3, 8, 9]
 
 
+def test_logit_bias(client, engine):
+    # a token biased up is all a greedy reply takes, of a chat or of text
+    seven = engine.tokenizer.decode([7] * 3)
+    assert complete(client, "hello", max_tokens=3, temperature=0, logit_bias={"7": 100}) == (
+        seven, "length")  # fmt: skip
+    reply = text(client, "hello", max_tokens=3, temperature=0, logit_bias={"7": 100})
+    assert reply == (seven, "length")
+
+
 def check_scores(tokens: list[str], chosen: list[float], likeliest: list[list]) -> None:
     # the log-probabilities of 6 greedy tokens: each token the likeliest, the likeliest in order
     assert len(tokens) == len(chosen) == len(likeliest) == 6
@@ -831,6 +840,9 @@ def test_text_is_not_a_tool_call(client, replies_with, stream, text, choice):
     [
         ({"n": 2}, "n=2 is not supported"),
         ({"frequency_penalty": 2.5}, "frequency_penalty must be a number from -2 to 2"),
+        ({"logit_bias": {"a": 1}}, "logit_bias must be an object of token ids to numbers from"),
+        ({"logit_bias": {"7": 101}}, "logit_bias must be an object of token ids to numbers from"),
+        ({"logit_bias": {"999999": 1}}, "logit_bias names token 999999, past the vocab of"),
         ({"extra_body": {"repetition_penalty": 0}}, "repetition_penalty must be a number from 0.1"),
         ({"top_p": 1.5}, "top_p must be a number from 0 to 1"),
         ({"temperature": 3}, "temperature must be a number from 0 to 2"),

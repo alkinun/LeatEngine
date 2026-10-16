@@ -804,6 +804,17 @@ def test_penalties(tiny_model):
     assert list(engine.generate(PROMPT, 12, sampling, ignore_eog=True)) == out
 
 
+def test_logit_bias(tiny_model):
+    # a token biased up is all a greedy sequence takes, and its slot's next sequence, unbiased,
+    # generates as it would have
+    path, _ = tiny_model
+    engine = Engine(path, max_context=CONTEXT, prefill_chunk=8)
+    assert list(engine.generate(PROMPT, 5, logit_bias={7: 100.0}, ignore_eog=True)) == [7] * 5
+    assert list(engine.generate(PROMPT[::-1], 5)) == generated(path, PROMPT[::-1], 5)
+    with pytest.raises(ValueError, match="logit_bias names tokens past the vocab"):
+        engine.start(PROMPT, 1, logit_bias={10**6: 1.0})
+
+
 # ******** constrained replies ********
 
 SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"enum": ["x", "yz"]}},

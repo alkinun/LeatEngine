@@ -38,12 +38,14 @@ GREEDY = Sampling()
 def sample(
     logits: Tensor, options: Tensor, seed: Tensor, position: Tensor | int | UOp,
     seen: Tensor | None = None, allowed: Tensor | None = None, prompted: Tensor | None = None,
+    bias: Tensor | None = None,
 ) -> Tensor:  # fmt: skip
     """Picks one token per row of `logits` (B, V), each row a sequence of its own, as its
     Sampling.values() in `options` float32 (B, 7) say; seen (B, V) int32 counts the text tokens
     each has generated, prompted uint32 (B, V / 32, whole words) marks those of its prompt, which
     the penalties lower; allowed, as prompted, the tokens each may take, as a constrained reply's
-    grammar has it. Of those words, token t is of word t // 32, by bit t % 32.
+    grammar has it. Of those words, token t is of word t // 32, by bit t % 32. bias float32 (B, V)
+    comes onto the logits before all else, as a request's logit_bias.
 
     `options` and `seed` uint32 hold a row per row, or one for all, (1, 7) and (1,); they are
     tensors so one compiled graph serves every value. A row's draw depends only on its logits,
@@ -57,6 +59,8 @@ def sample(
         options[:, i : i + 1] for i in range(7)
     )
     vocab = int(logits.shape[-1])
+    if bias is not None:  # of none, zeros, the logits as they are
+        logits = logits + bias
     if allowed is not None:
         logits = _marked(allowed, vocab).where(logits, -math.inf)
     # unpenalized, the logits stay as they are, to the bit: x / 1, x * 1 and x - 0 are x

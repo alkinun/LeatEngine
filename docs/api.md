@@ -50,16 +50,17 @@ placeholder when authentication is disabled). The client library is not a runtim
 
 Supported controls include `messages`, `stream`, `stream_options.include_usage`, `max_tokens`
 or `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`,
-`frequency_penalty`, `repetition_penalty`, `seed`, `stop`, `tools`, `tool_choice` (`auto` or
-`none`), `response_format`, `logprobs`, and `top_logprobs`. Templates determine which message
-roles and tool formats a model understands.
+`frequency_penalty`, `repetition_penalty`, `logit_bias`, `seed`, `stop`, `tools`, `tool_choice`
+(`auto` or `none`), `response_format`, `logprobs`, and `top_logprobs`. Templates determine which
+message roles and tool formats a model understands.
 
 - Penalties lower text tokens alone, never a format's markup, such as `<tool_call>`, which a
   reply must repeat. `repetition_penalty`, as vLLM's and Hugging Face's, divides a positive logit
   and multiplies a negative one, of each token of the prompt or of the reply so far; then
   `presence_penalty` comes off each token of the reply so far, and `frequency_penalty` as many
   times as it occurs, as OpenAI's. llama.cpp's server counts all three over the last 64 tokens
-  of prompt and reply instead.
+  of prompt and reply instead. `logit_bias` adds to the logits of the token IDs it names, -100 to
+  100 each, before the penalties.
 - Streaming uses Server-Sent Events: JSON `data:` records followed by `data: [DONE]` on success.
   Disconnecting cancels the completion and releases its slot.
 - Reasoning is returned as `reasoning_content`. `reasoning_effort` and
@@ -96,9 +97,9 @@ roles and tool formats a model understands.
 - Replies include usage and a `timings` extension. Cached token counts appear in
   `usage.prompt_tokens_details.cached_tokens`; streamed usage requires `include_usage`.
 
-This is not a complete OpenAI implementation: multiple choices and logit biases are
-unsupported. Audio, file-storage, and tool-execution endpoints are not implemented.
-A prompt must fit the configured context; clients manage conversation history.
+This is not a complete OpenAI implementation: multiple choices (`n` above 1) are unsupported.
+Audio, file-storage, and tool-execution endpoints are not implemented. A prompt must fit the
+configured context; clients manage conversation history.
 
 ## Text completions
 
@@ -117,7 +118,8 @@ and nothing is cut: the prompt must fit the context.
 Sampling controls, `stop`, `seed`, `stream`, and `stream_options` work as for chat completions.
 `logprobs` is a count of the likeliest tokens, 0 to 20, whose log-probabilities come with each
 token's, as OpenAI's text completions give them: `tokens`, `token_logprobs`, `top_logprobs` by
-token text, and `text_offset`. `echo` and `best_of` are not supported.
+token text, and `text_offset`. `logit_bias` works as for chat completions; `echo` and `best_of`
+are not supported.
 
 ## Responses
 
