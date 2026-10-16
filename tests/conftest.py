@@ -9,6 +9,11 @@ import pytest
 # It reads DEV when imported, so this comes first.
 os.environ.setdefault("DEV", "CPU")
 GPU_BACKENDS = {"NV", "CUDA", "AMD", "MOCK+AMD"}
+# What the emulated GPU's KFD properties say, as Strix Halo's would: gfx1151, of 40 CUs. The CUs
+# set how matmuls split their work; the arrays, 2 of 10 CUs to each of 2 shader engines, keep the
+# counts whole. The emulator is a gfx1100's otherwise, its registers and IP versions too.
+STRIX_HALO = {"gfx_target_version": 110501, "simd_count": 80, "array_count": 4,
+              "cu_per_simd_array": 10}  # fmt: skip
 if os.environ["DEV"].split(":")[0] == "MOCK+AMD":
     # tinygrad's emulated RDNA 3 GPU, from the tests of tinygrad's source tree at the pinned commit,
     # which PYTHONPATH must hold. It does not allow unaligned access, as GPUs do: clang would merge
@@ -18,6 +23,18 @@ if os.environ["DEV"].split(":")[0] == "MOCK+AMD":
     from leatengine.kernels import clang
 
     clang.FLAGS = ("-Xclang", "-target-feature", "-Xclang", "-unaligned-access-mode")
+    # The emulator runs RDNA 3.5's code as RDNA 3's, which is the same for what clang emits from
+    # the kernels. tinygrad makes its devices' files as it is imported, so they change here, before
+    # the device opens and reads them.
+    from test.mockgpu import mockgpu
+
+    for file in (f for driver in mockgpu.drivers for f in driver.tracked_files):
+        if file.path.startswith("/sys/devices/virtual/kfd/") and file.path.endswith("/properties"):
+            lines = file.fdcls.keywords["text"].splitlines()
+            said = (line.split(" ", 1) for line in lines)
+            file.fdcls.keywords["text"] = "\n".join(
+                f"{key} {STRIX_HALO.get(key, value)}" for key, value in said
+            )
 
 
 @pytest.fixture(autouse=True)

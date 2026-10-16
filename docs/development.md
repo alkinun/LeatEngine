@@ -58,16 +58,18 @@ PYTHONPATH=/tmp/leatengine-tinygrad DEV=MOCK+AMD uv run pytest -m gpu -n auto \
   --cov --cov-report= --durations=20
 ```
 
-The tests turn off unaligned memory access, which the emulator lacks. This checks RDNA 3 kernel
-behavior in emulation; physical Strix Halo validation is separate. The emulator skips decode
-attention over heads wider than 512 dimensions, which it computes wrongly; the
-[Strix Halo guide](strix-halo.md) covers that check.
+The tests turn off unaligned memory access, which the emulator lacks, and have the emulated GPU say
+what Strix Halo's does: gfx1151, of 40 CUs, by which matmuls split their work. The emulator runs
+RDNA 3.5's code as RDNA 3's, and is otherwise a gfx1100's. This checks kernel behavior in
+emulation; physical Strix Halo validation is separate. The emulator skips decode attention over
+heads wider than 512 dimensions, which it computes wrongly; the [Strix Halo guide](strix-halo.md)
+covers that check.
 
 ## Continuous integration
 
 - Ruff and mypy.
 - CPU tests on Python 3.12 and 3.14.
-- AMD kernel tests on tinygrad's emulator.
+- AMD kernel tests on tinygrad's emulator, as Strix Halo's GPU.
 - Tokenizer comparisons against llama.cpp at commit `889edf43ddae0cfe9a4564a882764dc879759870`.
 - Combined CPU/emulator coverage of at least 80%.
 - Wheel and source-distribution installation checks.
