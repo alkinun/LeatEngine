@@ -313,9 +313,12 @@ def attention(
 
 
 # ******** several query tokens: FlashAttention-2 ********
-# A block takes 16 query tokens and one kv head, with a warp for each query head of the GQA group;
-# the warps share tiles of 32 keys and values in shared memory, and each keeps its rows' scores,
-# softmax statistics and outputs in registers, on NVIDIA's tensor cores or RDNA 3's. Tiles of 32
+# A block takes one kv head and tiles of 16 query tokens, as many as STACKED warps hold, with a warp
+# for each query head of the GQA group of each tile; the warps share tiles of 32 keys and values in
+# shared memory, each read from memory once for them all, and each keeps its rows' scores, softmax
+# statistics and outputs in registers, on NVIDIA's tensor cores or RDNA 3's. Of Llama 3.1 8B on
+# the 3090, 4 tiles of queries a block rather than 1 took attention of a chunk of 512 tokens after
+# 32768 from 11.0 to 6.8 ms a layer, at a few hundredths of a ms more after none. Tiles of 32
 # keys leave room for more blocks per SM than 64: 9 to 17% faster from 0 to 8k cached tokens. Heads
 # wider than 256, Gemma 4's of 512, would not fit in registers: blocks take parts of 256 of their
 # outputs, each working out every score, and read the queries as they go, with tiles of 16 keys to
@@ -324,6 +327,7 @@ def attention(
 # merges their outputs.
 
 QUERIES, KEY_TILE, PART = 16, 32, 256
+STACKED = 16  # warps a block of several tiles of queries holds at most, sharing its keys' tiles
 SPLIT_BLOCKS = 64  # blocks that split one tile of queries' keys aim for
 HELD = 128  # the widest heads whose queries WMMA's warps hold in registers for the whole loop
 
@@ -493,7 +497,7 @@ class _WmmaQueries(_MmaQueries):
 def _flash_attention_kernel(
     out: UOp, *srcs: UOp, slot: int | UOp, start: int | UOp, tokens: int | UOp, window: int,
     key_tile: int, parts: int, splits: int, wmma: bool = False, causal: bool = True,
-    ring: bool = False,
+    ring: bool = False, stack: int = 1,
 ) -> UOp:  # fmt: skip
     # srcs: q (count, heads, dim) in f16, scaled so that exp2 gives the softmax, and the cache,
     # read as words of f16 pairs, of q8_0 rows dequantized; query i is at position start + i and
@@ -511,20 +515,22 @@ def _flash_attention_kernel(
     _, slots, kv_heads, positions, stride = (int(d) for d in cache.shape)
     words, width = dim // 2, dim // parts  # the part's dimensions of the output
     group = heads // kv_heads
-    threads = group * WARP
+    span = QUERIES * stack  # the block's queries: `stack` tiles of them, a warp per head of each
+    threads = group * stack * WARP
     tile: UOp = UOp.const(0, dtypes.weakint)
     if splits == 1:
-        tile = UOp.range((tokens + QUERIES - 1) // QUERIES, 0, AxisType.GLOBAL)
+        tile = UOp.range((tokens + span - 1) // span, 0, AxisType.GLOBAL)
     kv_head = UOp.range(kv_heads, 1, AxisType.GLOBAL)
-    lane, warp = lane_range(), UOp.range(group, 2, AxisType.LOCAL)
+    lane, warp = lane_range(), UOp.range(group * stack, 2, AxisType.LOCAL)
     part = UOp.range(parts, 4, AxisType.GLOBAL) if parts > 1 else UOp.const(0, dtypes.weakint)
-    head, tid = kv_head * group + warp, warp * WARP + lane
+    head, tid = kv_head * group + warp % group, warp * WARP + lane
+    first_row = tile * span + warp // group * QUERIES  # the warp's tile's first query
     frags = (_WmmaQueries if wmma else _MmaQueries)(lane)
-    rows = [tile * QUERIES + r for r in frags.queries]  # the lane's queries
-    # the keys and values from the tile's first query's window to its last query, key_tile at a
+    rows = [first_row + r for r in frags.queries]  # the lane's queries
+    # the keys and values from the block's first query's window to its last query, key_tile at a
     # time: keys as they are in the cache, values transposed so that fragments of keys are words
-    end = start + ((tile * QUERIES + QUERIES).minimum(tokens) if causal else tokens)
-    first = _since(start + tile * QUERIES + 1, window) // key_tile
+    end = start + ((tile * span + span).minimum(tokens) if causal else tokens)
+    first = _since(start + tile * span + 1, window) // key_tile
     seen_tiles = (end + key_tile - 1) // key_tile - first
     split = UOp.const(0, dtypes.weakint)
     if splits > 1:  # every splits-th of them from the split's on
@@ -607,7 +613,7 @@ def _flash_attention_kernel(
     acc, mx, total = acc.after(update), mx.after(update), total.after(update)
     # past the loop, the fragments of an opaque copy of the lane: see common.opaque
     frags = type(frags)(opaque(lane))
-    rows = [tile * QUERIES + r for r in frags.queries]
+    rows = [first_row + r for r in frags.queries]
     results = []
     for i in range(width // 2):
         r, d = frags.place(i)
@@ -661,9 +667,14 @@ def flash_attention(
     and a sink (H,) per head if given. Returns (1, T, H * D). A `ring` holds position p at p mod
     its positions, as many as the window and the tokens more."""
     _, heads, tokens, dim = q.shape
-    count = -(-q.max_shape[2] // QUERIES) * QUERIES
     shape = _flash_shape(int(cache.shape[3]), int(dim))
     assert shape is not None, "flash_attention needs supports_flash_attention"
+    # blocks of several tiles of queries, which share each tile of keys they read, as many as
+    # STACKED warps hold, and the queries need
+    group = int(heads) // int(cache.shape[2])
+    tiles = -(-q.max_shape[2] // QUERIES)
+    stack = max(min(STACKED // group, tiles), 1)
+    count = -(-tiles // stack) * stack * QUERIES
     # in the layout of the projection that made q, where scaling and rounding it is a plain copy
     q = (q.transpose(1, 2).reshape(tokens, heads, dim).float() * (LOG2E * scale)).half()
     q = q.pad_to((count, heads, dim)).contiguous()
@@ -672,7 +683,7 @@ def flash_attention(
     # one tile of queries, while prefilling few tokens, leaves SMs idle: blocks split its keys,
     # where the combine kernel takes the heads. For Llama 3.1 8B's 8 kv heads, 8 blocks each took
     # 27 us at 2000 positions, 16 took 29 and one 170.
-    split = count == QUERIES and _combine_tile(int(dim)) is not None
+    split = tiles == 1 and _combine_tile(int(dim)) is not None
     splits = max(SPLIT_BLOCKS // (int(cache.shape[2]) * shape[1]), 1) if split else 1
     rows = count * heads  # of queries and heads
     shapes = [(rows, splits, n) for n in (dim, 2)] if splits > 1 else [(count, heads * dim)]
@@ -681,7 +692,7 @@ def flash_attention(
     fxn = functools.partial(
         _flash_attention_kernel, slot=slot, start=start, tokens=bound, window=window,
         key_tile=shape[0], parts=shape[1], splits=splits, wmma=on_rdna3(q), causal=causal,
-        ring=ring,
+        ring=ring, stack=stack,
     )  # fmt: skip
     extra = () if sinks is None else (sinks.float().contiguous(),)
     outs = Tensor.custom_kernel(*outs, q, cache, *(extra if splits == 1 else ()), fxn=fxn)
