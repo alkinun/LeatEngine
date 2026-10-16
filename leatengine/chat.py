@@ -589,9 +589,12 @@ def _message(message: dict[str, Any], none: bool = False) -> dict[str, Any]:
         )
     if calls := message.pop("tool_calls", None):
         if not isinstance(calls, list) or not all(
-            isinstance(call, dict) and isinstance(call.get("function"), dict) for call in calls
-        ):
-            raise ValueError("tool_calls must be a list of objects, each with its function")
+            isinstance(call, dict) and isinstance(f := call.get("function"), dict)
+            and isinstance(f.get("name"), str) and "arguments" in f
+            for call in calls
+        ):  # fmt: skip
+            raise ValueError("tool_calls must be a list of objects, each with its function's name "
+                             "and arguments")  # fmt: skip
         message["tool_calls"] = [_decoded(call) for call in calls]
     return message
 

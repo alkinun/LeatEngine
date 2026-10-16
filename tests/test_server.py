@@ -109,8 +109,8 @@ def test_load(tiny_model, tmp_path, capsys):
     (other := tmp_path / "other.gguf").symlink_to(tiny_model[0])
     with serving(tiny_model[0], other, max_context=CONTEXT) as server:
         client = connect(server)
-        with pytest.raises(openai.BadRequestError, match="no model is loaded"):
-            chat(client, "hello")
+        with pytest.raises(openai.InternalServerError, match="503.*no model is loaded"):
+            chat(client, "hello")  # the server's state, as /health says it, for a client to retry
         engines = []
         for name, unloaded in (("tiny", "other"), ("other", "tiny"), ("other", "tiny")):
             assert load(client, name)["status"] == "loaded"
@@ -673,6 +673,9 @@ def test_response_text_format(client):
     ({"previous_response_id": "resp_1"}, "previous_response_id is not supported"),
     ({"tools": [{"type": "web_search"}]}, "tools must be a list of function tools"),
     ({"input": [{"type": "item_reference", "id": "x"}]}, "items of type 'item_reference'"),
+    # of the fields as a response's request names them
+    ({"max_output_tokens": 0}, "max_output_tokens must be a positive integer"),
+    ({"text": {"format": {"type": "xml"}}}, 'text.format must be {"type": "text"}'),
 ])  # fmt: skip
 def test_bad_response(client, kwargs, error):
     with pytest.raises(openai.BadRequestError, match=error):
@@ -864,6 +867,10 @@ def test_text_is_not_a_tool_call(client, replies_with, stream, text, choice):
         ({"messages": [{"role": "assistant", "tool_calls": [{"id": "x"}]}]}, "each with its"),
         ({"tools": [{"function": "weather"}]}, "tools must be a list of objects, each"),
         ({"tools": [{"function": {"name": []}}]}, "tools must be a list of objects, each"),
+        (
+            {"messages": [{"role": "assistant", "tool_calls": [{"function": {"name": "f"}}]}]},
+            "each with its function's name and arguments",
+        ),
         # log-probabilities of a chat asked for as a text completion's, or of the likeliest
         # tokens alone, or of too many
         ({"logprobs": 2}, "logprobs of a chat completion must be true or false"),
@@ -897,6 +904,7 @@ def test_bad_request(client, kwargs, error):
         ({"prompt": "a", "best_of": 2}, "best_of=2 is not supported"),
         ({"prompt": "a", "logprobs": True}, "logprobs of a text completion must be a count"),
         ({"prompt": "a", "logprobs": 21}, "logprobs must be true or false, or of a text"),
+        ({"prompt": "a", "top_logprobs": 2}, "top_logprobs is a chat completion's"),
     ],
 )
 def test_bad_text_completion(client, body, error):
@@ -1125,6 +1133,20 @@ def test_hang_up_before_the_reply_frees_the_slot(server, engine, monkeypatch):
     assert len(steps) < 20
 
 
+def test_no_model_loaded(server):
+    # of a load that failed: the server's state, a 503, as /health says it
+    with pytest.raises(server_module._Unloaded, match="no model is loaded"):
+        server_module._completion({"messages": [{"role": "user", "content": "hi"}]}, server, None)
+    assert issubclass(server_module._Unloaded, ValueError)
+
+
+def test_text_completion_max_completion_tokens(client):
+    # as chat completions take it, over max_tokens
+    reply = client.completions.create(model="tiny", prompt="hello", max_tokens=8,
+                                      extra_body={"max_completion_tokens": 3})  # fmt: skip
+    assert reply.usage.completion_tokens == 3
+
+
 def test_engine_error(client, engine, monkeypatch):
     # a failing step fails every running completion, and the server serves the next
     def fail():
@@ -1328,6 +1350,26 @@ def test_cut_off_call_is_no_text(client, replies_with, stream):
     replies_with('Checking.\n<tool_call>\n{"name": "weather", "argu', cut_off=True)
     kwargs = {"tools": [WEATHER], "stream": stream}
     assert complete(client, "Weather in Paris?", **kwargs) == ("Checking.", "length")
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("form, reply", [
+    ("harmony", "<|channel|>commentary to=functions.weather <|constrain|>json<|message|>"
+                '{"city": "Pa'),
+    ("atem", " to=weather<|message|>city: Pa"),
+])  # fmt: skip
+def test_cut_off_harmony_call(client, replies_with, monkeypatch, stream, form, reply):
+    # a call of a format whose calls end its reply, cut off by max_tokens: no call, as of text
+    monkeypatch.setattr(ChatTemplate, "form", property(lambda self: form))
+    replies_with(reply, cut_off=True)
+    response = chat(client, "Weather in Paris?", tools=[WEATHER], stream=stream)
+    if stream:
+        choices = [chunk.choices[0] for chunk in response if chunk.choices]
+        calls, reason = [c.delta.tool_calls for c in choices if c.delta.tool_calls], choices[-1]
+        reason = reason.finish_reason
+    else:
+        calls, reason = response.choices[0].message.tool_calls, response.choices[0].finish_reason
+    assert not calls and reason == "length"
 
 
 @pytest.mark.parametrize("stream", [False, True])

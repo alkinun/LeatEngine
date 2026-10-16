@@ -221,7 +221,8 @@ class _Completion:
     grammar: tuple[Grammar, dict] | None = None
     preamble: tuple[str, str] | str | None = None
     # work no one waits on, of service_tier "flex", as OpenAI's flex processing: started after the
-    # completions that wait before it, and never into the last slot free
+    # completions that wait before it, and of an engine of more than one slot, never into its last
+    # slot free
     background: bool = False
     text: bool = False  # of /v1/completions: its reply text alone, as the model writes it
     # of /v1/responses: what its response says of the request, as responses.echoed() has it
@@ -457,8 +458,8 @@ class Server(ThreadingHTTPServer):
     ) -> None:  # fmt: skip
         # starts what waits, as it may: a load once it is first, and nothing after it before it;
         # then the completions before the next load, those someone waits on first, each in turn,
-        # and background ones while more than one slot is free, so that a chat asked meanwhile
-        # starts at once, however much background work waits
+        # and background ones while more than one slot is free, of an engine of more than one,
+        # so that a chat asked meanwhile starts at once, however much background work waits
         while waiting and isinstance(waiting[0], _Load):
             if not self._start(waiting[0], running):
                 return
@@ -904,6 +905,8 @@ class _Handler(BaseHTTPRequestHandler):
                 continue
             try:
                 completion = asked(body, server, loaded)
+            except _Unloaded as e:  # as a load failed: ready again once one is
+                return self._error(503, str(e))
             except (ValueError, TypeError, jinja2.TemplateError) as e:
                 return self._error(400, str(e))
             except RecursionError:
@@ -911,8 +914,10 @@ class _Handler(BaseHTTPRequestHandler):
             except _Unset as e:  # the operator's file of sampling, broken
                 return self._error(500, str(e))
             completion.key = self.key
-            if server.ask(completion, loaded):
+            asked_of, loaded = loaded, None  # held no longer, so that a load may free it
+            if server.ask(completion, asked_of):
                 break
+            del asked_of
         try:
             if completion.text:
                 (self._stream_text if completion.stream else self._reply_text)(completion)
@@ -971,7 +976,7 @@ class _Handler(BaseHTTPRequestHandler):
             for piece in c.pieces(self._hung_up):
                 self._event(chunk(piece))
         except RuntimeError as e:
-            return self._event({"error": {"message": str(e), "type": "server_error"}})
+            return self._event({"error": _error_object(500, str(e))})
         timings = {"timings": _timings(c)}
         self._event(chunk("", c.finish.reason) | ({} if c.stream_usage else timings))
         if c.stream_usage:
@@ -1066,6 +1071,8 @@ class _Handler(BaseHTTPRequestHandler):
             event("response.function_call_arguments.delta", **where, delta=item["arguments"])
             event("response.function_call_arguments.done", **where, arguments=item["arguments"])
             done(item)
+        if thinking and items[0]["type"] == "reasoning":  # all of it, as more may come after
+            items[0] = responses.reasoning_item(thinking, reply.reasoning)  # the text began
         body = _response_body(c, items)
         event(f"response.{body['status']}", response=body)
 
@@ -1105,7 +1112,7 @@ class _Handler(BaseHTTPRequestHandler):
                     self._chunk(c, {"content": content[sent:end]}, logprobs=scores())
                     sent = end
         except RuntimeError as e:
-            return self._event({"error": {"message": str(e), "type": "server_error"}})
+            return self._event({"error": _error_object(500, str(e))})
         reason = c.finish.reason
         content, calls = _calls(reply, c.tools, c.finish.reason)
         if len(content) > sent:
@@ -1184,10 +1191,14 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _error(self, status: int, message: str, headers: dict[str, str] | None = None) -> None:
-        kind = "invalid_request_error" if status < 500 else "server_error"
-        code = "invalid_api_key" if status == 401 else None
-        error = {"message": message, "type": kind, "param": None, "code": code}
-        self._json(status, {"error": error}, headers)
+        self._json(status, {"error": _error_object(status, message)}, headers)
+
+
+def _error_object(status: int, message: str) -> dict[str, Any]:
+    # an error as OpenAI's API gives one, answered or streamed
+    kind = "invalid_request_error" if status < 500 else "server_error"
+    code = "invalid_api_key" if status == 401 else None
+    return {"message": message, "type": kind, "param": None, "code": code}
 
 
 def _embedded(engine: Engine, text: str) -> list[int]:
@@ -1231,7 +1242,7 @@ def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completio
     if (choice := body.get("tool_choice") or "auto") not in ("auto", "none"):
         raise ValueError(f"tool_choice={choice!r} is not supported, only 'auto' and 'none'")
     if loaded is None:
-        raise ValueError("no model is loaded")
+        raise _Unloaded("no model is loaded")
     # tool_choice "none" as OpenAI's API has it: the tools still declared, so that the prompt is
     # as of "auto", which the cache may hold, and the reply opened as an answer, as harmony's
     # final channel opens it, of a format that marks one; else the tools left out
@@ -1258,31 +1269,20 @@ def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completio
     grammar, preamble = _format(body.get("response_format"), loaded, text)
     if grammar is not None and tools:
         raise ValueError("response_format of JSON with tools is not supported yet: give either")
-    # what the request asks for of its sampling, else the model's, as it reasons or not
-    stop, given = body.get("stop") or [], {k: v for k, v in body.items() if v is not None}
-    defaults = _sampling(server, loaded)[0 if _reasons(loaded.chat, options) else 1]
-    sampling = Sampling(**({k: given.get(k, v) for k, v in defaults.items()}))
-    sampling = dataclasses.replace(sampling, top_k=max(sampling.top_k, 0))  # vLLM's -1: every one
     return _Completion(
         prompt,
         loaded.name,
         max_tokens=body.get("max_completion_tokens") or body.get("max_tokens") or context,
-        sampling=sampling,
-        seed=body.get("seed"),
-        stop=[s for s in ([stop] if isinstance(stop, str) else stop) if s],
         tools=tools,
-        stream=bool(body.get("stream")),
-        stream_usage=bool((body.get("stream_options") or {}).get("include_usage")),
         images=shown,
         form=loaded.chat.form,
-        user=body.get("safety_identifier") or body.get("user") or "",
         thinking=loaded.chat.opens_thinking(text),
         opened=opened,
         grammar=grammar,
         preamble=preamble,
-        background=body.get("service_tier") == "flex",
         logprobs=(body.get("top_logprobs") or 0) if body.get("logprobs") else None,
-        logit_bias=_bias(body, loaded),
+        # what the request asks for of its sampling, else the model's, as it reasons or not
+        **_shared(body, server, loaded, reasons=_reasons(loaded.chat, options)),
     )
 
 
@@ -1294,8 +1294,10 @@ def _text_completion(body: Any, server: Server, loaded: _Loaded | None) -> _Comp
     _valid(body, "completion", "prompt")
     if isinstance(body.get("logprobs"), bool):
         raise ValueError(f"logprobs of a text completion must be a count from 0 to {TOP_LOGPROBS}")
+    if body.get("top_logprobs") is not None:
+        raise ValueError("top_logprobs is a chat completion's: a text completion's logprobs counts")
     if loaded is None:
-        raise ValueError("no model is loaded")
+        raise _Unloaded("no model is loaded")
     tok, prompt, suffix = loaded.engine.tokenizer, body["prompt"], body.get("suffix")
     if isinstance(prompt, list) and isinstance(prompt[0], str):
         prompt = prompt[0]
@@ -1313,25 +1315,35 @@ def _text_completion(body: Any, server: Server, loaded: _Loaded | None) -> _Comp
         raise ValueError(f"the prompt must hold some tokens, each of the {vocab} of the vocab")
     if len(ids) >= (context := loaded.engine.max_context):
         raise ValueError(f"the prompt has {len(ids)} tokens, too many for {context} of context")
-    stop, given = body.get("stop") or [], {k: v for k, v in body.items() if v is not None}
-    sampling = Sampling(**({k: given.get(k, v) for k, v in _sampling(server, loaded)[1].items()}))
     return _Completion(
         ids,
         loaded.name,
-        max_tokens=body.get("max_tokens") or _TEXT_TOKENS,
-        sampling=dataclasses.replace(sampling, top_k=max(sampling.top_k, 0)),
-        seed=body.get("seed"),
-        stop=[s for s in ([stop] if isinstance(stop, str) else stop) if s],
+        max_tokens=body.get("max_completion_tokens") or body.get("max_tokens") or _TEXT_TOKENS,
         tools=None,
-        stream=bool(body.get("stream")),
-        stream_usage=bool((body.get("stream_options") or {}).get("include_usage")),
-        user=body.get("safety_identifier") or body.get("user") or "",
-        background=body.get("service_tier") == "flex",
         text=True,
         id=f"cmpl-{uuid.uuid4().hex}",
         logprobs=body.get("logprobs"),
-        logit_bias=_bias(body, loaded),
+        **_shared(body, server, loaded, reasons=False),
     )
+
+
+def _shared(body: dict[str, Any], server: Server, loaded: _Loaded, reasons: bool) -> dict:
+    # what a chat completion and a text completion ask for alike: sampling, the request's over
+    # the model's, as a reply that reasons, or not, of top_k -1 every token as vLLM's; the seed,
+    # stops, streaming, the user, the service tier and the logits' bias
+    stop, given = body.get("stop") or [], {k: v for k, v in body.items() if v is not None}
+    defaults = _sampling(server, loaded)[0 if reasons else 1]
+    sampling = Sampling(**({k: given.get(k, v) for k, v in defaults.items()}))
+    return {
+        "sampling": dataclasses.replace(sampling, top_k=max(sampling.top_k, 0)),
+        "seed": body.get("seed"),
+        "stop": [s for s in ([stop] if isinstance(stop, str) else stop) if s],
+        "stream": bool(body.get("stream")),
+        "stream_usage": bool((body.get("stream_options") or {}).get("include_usage")),
+        "user": body.get("safety_identifier") or body.get("user") or "",
+        "background": body.get("service_tier") == "flex",
+        "logit_bias": _bias(body, loaded),
+    }
 
 
 def _bias(body: dict[str, Any], loaded: _Loaded) -> dict[int, float] | None:
@@ -1345,8 +1357,19 @@ def _bias(body: dict[str, Any], loaded: _Loaded) -> dict[int, float] | None:
 
 def _response(body: Any, server: Server, loaded: _Loaded | None) -> _Completion:
     # what a request body of /v1/responses asks for of the `loaded` model: the chat completion it
-    # amounts to, answered as a response
-    completion = _completion(responses.as_chat(body), server, loaded)
+    # amounts to, answered as a response, its errors of the fields as the response's request names
+    # them
+    try:
+        completion = _completion(responses.as_chat(body), server, loaded)
+    except _Unloaded:
+        raise
+    except ValueError as e:
+        said = str(e)
+        for chat, own in (("max_completion_tokens", "max_output_tokens"),
+                          ("reasoning_effort", "reasoning.effort"),
+                          ("response_format", "text.format")):  # fmt: skip
+            said = said.replace(chat, own)
+        raise ValueError(said) from None
     completion.id, completion.response = f"resp_{uuid.uuid4().hex}", responses.echoed(body)
     return completion
 
@@ -1415,6 +1438,10 @@ def _format(
     return found, preamble
 
 
+class _Unloaded(ValueError):
+    """No model is loaded, as a load failed: the server's state, not the request's fault."""
+
+
 class _Unset(Exception):
     """The operator's file of sampling is broken."""
 
@@ -1461,7 +1488,9 @@ def _calls(
     # answers that it has no such tool, and the model goes on, rather than its turn ending in a
     # reply of nothing
     names, calls = {tool.get("function", {}).get("name") for tool in tools}, []
-    for call in reply.calls:
+    # a reply cut off in its last call, whose end ends a reply of these formats, holds it whole
+    made = reply.calls[:-1] if reason == "length" else reply.calls
+    for call in made:
         name, arguments = call["name"], call["arguments"]
         if call.get("typed") is False:  # ATEM's values of text, typed as the tool takes them
             calls.append({"name": name, "arguments": typed_arguments(call, tools)})

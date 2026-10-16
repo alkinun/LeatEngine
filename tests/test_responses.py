@@ -53,6 +53,19 @@ def test_input_of_items():
     ]  # fmt: skip
 
 
+def test_reasoning_of_its_turn():
+    # the reasoning before calls that follow the model's text goes with that turn, not the next
+    items = [
+        {"role": "assistant", "content": "Checking."},
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "R"}]},
+        {"type": "function_call", "call_id": "c", "name": "f", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c", "output": "x"},
+        {"role": "assistant", "content": "Done."},
+    ]
+    messages = as_chat({"input": items})["messages"]
+    assert messages[0]["reasoning_content"] == "R" and "reasoning_content" not in messages[2]
+
+
 def test_options():
     # function tools as chat tools, a text format as a response format, an effort, and the
     # options both APIs share

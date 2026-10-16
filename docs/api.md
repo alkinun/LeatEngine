@@ -44,7 +44,8 @@ Entries have `status` (`loading`, `loaded`, or `unloaded`). A loaded model also 
 Clients should read these capabilities rather than import engine internals.
 
 Only one chat model is loaded at a time. The `model` field of a completion request does not
-switch models: generation uses the currently loaded model. Use the explicit load endpoint.
+switch models: generation uses the currently loaded model. Use the explicit load endpoint. While
+no model is loaded, as after a load failed, completions are answered 503, as `/health` is.
 
 ## Chat completions
 

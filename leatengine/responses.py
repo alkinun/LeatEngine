@@ -60,6 +60,9 @@ def as_chat(body: Any) -> dict[str, Any]:
             last = messages[-1] if messages else {}
             if last.get("role") == "assistant":  # the calls of the message before
                 last.setdefault("tool_calls", []).append(call)
+                if reasoning:  # and the reasoning before them, of that turn
+                    last["reasoning_content"] = last.get("reasoning_content", "") + reasoning
+                    reasoning = ""
                 continue
             message = {"role": "assistant", "content": None, "tool_calls": [call]}
         elif kind == "function_call_output":
