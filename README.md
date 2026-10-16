@@ -49,6 +49,16 @@ leatengine run /path/to/model.gguf
 leatengine serve /path/to/model.gguf
 ```
 
+`pull` downloads a model from Hugging Face by repository and quantization, as llama.cpp's `-hf`
+takes them, Q4_K_M by default: every part of a split GGUF and the vision projector beside it, each
+checked against Hugging Face's SHA-256, resumed where an interrupted download stopped. `run` and
+`serve` then take it by the same name.
+
+```bash
+leatengine pull unsloth/Qwen3-8B-GGUF:Q4_K_M
+leatengine run unsloth/Qwen3-8B-GGUF:Q4_K_M
+```
+
 The server listens on `127.0.0.1:8080`, with 4 slots. A model takes its own context, as far as the
 KV cache of its slots fits in the memory its weights leave, and `run` and `serve` say what they
 chose; `--max-context` and `--slots` set them, and `--cache-type q8_0` holds the KV cache in about
@@ -115,6 +125,7 @@ reference ops, which are slower.
 
 | Command | Purpose |
 |---|---|
+| `pull` | Download a model from Hugging Face, as `OWNER/NAME:QUANT` |
 | `run` | Chat in the terminal; `/image PATH` attaches an image when supported |
 | `serve` | Serve local GGUF files or directories through HTTP |
 | `keys` | Add, list, and remove API keys |

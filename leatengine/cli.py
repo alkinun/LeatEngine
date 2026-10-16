@@ -15,8 +15,10 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from leatengine import pull
 from leatengine.defaults import OPTIONS, Overrides
 from leatengine.keys import Keys
+from leatengine.pull import DEFAULT_QUANT
 
 if TYPE_CHECKING:
     from leatengine.chat import ChatTemplate, Reply
@@ -30,8 +32,22 @@ def main(argv: list[str] | None = None) -> None:
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
+    pull = commands.add_parser(
+        "pull", help="download a model from Hugging Face, as OWNER/NAME:QUANT",
+        description="Downloads a repository's GGUF of a quantization, every part of a split one, "
+        "and the vision projector beside it, each checked against Hugging Face's SHA-256, into "
+        f"{_data() / 'models'}, where run and serve find it by the same name. An interrupted "
+        "download resumes. Gated repositories need a token, HF_TOKEN or huggingface-cli's login.",
+    )  # fmt: skip
+    pull.add_argument(
+        "model", help="OWNER/NAME, or OWNER/NAME:QUANT, QUANT a word of the file's name, as "
+        f"Q8_0 or UD-Q4_K_XL, by default {DEFAULT_QUANT}, or the file's name whole",
+    )  # fmt: skip
+    pull.add_argument("--no-mmproj", action="store_true", help="leave out the vision projector")
+    pull.add_argument("--dry-run", action="store_true", help="say what it would download")
+
     run = commands.add_parser("run", help="chat with a model in the terminal")
-    run.add_argument("model", type=Path, help="GGUF file")
+    run.add_argument("model", type=Path, help="GGUF file, or a model pulled, OWNER/NAME:QUANT")
     run.add_argument(
         "--max-context", type=_positive,
         help="tokens the chat holds at most; by default the model's own, as far as its KV cache "
@@ -66,7 +82,8 @@ def main(argv: list[str] | None = None) -> None:
     serve = commands.add_parser("serve", help="serve the OpenAI chat completions API")
     serve.add_argument(
         "models", type=Path, nargs="*",
-        help="GGUF files, or directories of them; the first file loads at start, others on request",
+        help="GGUF files, directories of them, or models pulled, OWNER/NAME:QUANT; the first file "
+        "loads at start, others on request",
     )  # fmt: skip
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=_port, default=8080)
@@ -114,7 +131,7 @@ def main(argv: list[str] | None = None) -> None:
     keys.add_argument("--file", type=Path, default=_data() / "keys.json", help="the file of keys")
 
     speed = commands.add_parser("bench", help="measure prefill and decode speed")
-    speed.add_argument("model", type=Path, help="GGUF file")
+    speed.add_argument("model", type=Path, help="GGUF file, or a model pulled, OWNER/NAME:QUANT")
     speed.add_argument("-p", "--prompt", type=_positive, default=512, help="prompt tokens")
     speed.add_argument("-n", "--generate", type=_positive, default=128, help="generated tokens")
     speed.add_argument("-r", "--reps", type=_positive, default=3)
@@ -143,7 +160,7 @@ def main(argv: list[str] | None = None) -> None:
     quality = commands.add_parser(
         "perplexity", help="measure quality on text, or against llama.cpp"
     )
-    quality.add_argument("model", type=Path, help="GGUF file")
+    quality.add_argument("model", type=Path, help="GGUF file, or a model pulled, OWNER/NAME:QUANT")
     source = quality.add_mutually_exclusive_group(required=True)
     source.add_argument("--text", type=Path, help="text file to score")
     source.add_argument(
@@ -168,10 +185,13 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.command == "serve":
         _check_serve(serve, args)
+        args.models = [_pulled(path) for path in args.models]
+    if args.command in ("run", "bench", "perplexity"):
+        args.model = _pulled(args.model)
     if args.command in ("run", "serve", "bench", "perplexity"):
         _device()
     handlers = {
-        "run": _run, "serve": _serve, "keys": _keys, "bench": _bench,
+        "pull": _pull, "run": _run, "serve": _serve, "keys": _keys, "bench": _bench,
         "perplexity": _perplexity, "doctor": _doctor,
     }  # fmt: skip
     handlers[args.command](args)
@@ -194,6 +214,24 @@ def _device() -> None:
 def _data() -> Path:
     # API keys and sampling overrides, in the XDG application data directory
     return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "leatengine"
+
+
+def _pulled(path: Path) -> Path:
+    # a model's file: as given, or of a model pulled, OWNER/NAME[:QUANT]
+    if path.exists() or pull.parse(str(path)) is None:
+        return path
+    if (found := pull.local(_data() / "models", str(path))) is None:
+        raise SystemExit(f"{path} is no file, nor a model pulled: leatengine pull {path}")
+    return found
+
+
+def _pull(args: argparse.Namespace) -> None:
+    try:
+        path = pull.pull(args.model, _data() / "models", not args.no_mmproj, args.dry_run)
+    except (ValueError, OSError) as e:
+        raise SystemExit(f"pull failed: {e}") from None
+    if not args.dry_run:
+        print(f"{path}\nrun it: leatengine run {args.model}")
 
 
 def _positive(text: str) -> int:
