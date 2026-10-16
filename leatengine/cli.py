@@ -11,6 +11,7 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -224,8 +225,10 @@ def _data() -> Path:
 
 def _pulled(path: Path) -> Path:
     # a model's file: as given, or of a model pulled, OWNER/NAME[:QUANT]
-    if path.exists() or pull.parse(str(path)) is None:
+    if path.exists():
         return path
+    if pull.parse(str(path)) is None:
+        raise SystemExit(f"{path}: there is no such file")
     try:
         found = pull.local(_data() / "models", str(path))
     except ValueError as e:  # as of a split model's part not there, or two of its quantization
@@ -233,6 +236,16 @@ def _pulled(path: Path) -> Path:
     if found is None:
         raise SystemExit(f"{path} is no file, nor a model pulled: leatengine pull {path}")
     return found
+
+
+@contextlib.contextmanager
+def _said() -> Iterator[None]:
+    # an error of a file or of what was asked of it, as a model's context, said rather than
+    # traced back
+    try:
+        yield
+    except (OSError, ValueError, MemoryError) as e:
+        raise SystemExit(str(e)) from None
 
 
 def _pull(args: argparse.Namespace) -> None:
@@ -307,8 +320,9 @@ def _run(args: argparse.Namespace) -> None:
     from leatengine.vision import Image, beside
 
     vision, draft = args.mmproj or beside(args.model), args.draft or own_drafter(args.model)
-    engine = Engine(args.model, max_context=args.max_context, draft=draft, vision=vision,
-                    cache_type=args.cache_type)  # fmt: skip
+    with _said():
+        engine = Engine(args.model, max_context=args.max_context, draft=draft, vision=vision,
+                        cache_type=args.cache_type)  # fmt: skip
     chat, tok = ChatTemplate(engine.gguf.metadata, engine.tokenizer), engine.tokenizer
     sampling = Sampling(
         args.temperature, args.top_k, args.top_p, args.min_p, args.presence_penalty,
@@ -361,11 +375,13 @@ def _run(args: argparse.Namespace) -> None:
         try:
             prompt, thinking = _prompt(chat, messages, pictures)
             if len(prompt) >= engine.max_context and len(messages) > len(first) + 1:
-                print(f"[the conversation is {len(prompt)} tokens, over --max-context; starting "
-                      "over]")  # fmt: skip
-                messages = [*first, messages[-1]]  # from the message just written
-                pictures = pictures[len(pictures) - n :]
-                prompt, thinking = _prompt(chat, messages, pictures)
+                # from the message just written, if it fits alone; else the chat as it was
+                alone, shown_alone = [*first, messages[-1]], pictures[len(pictures) - n :]
+                held, (prompt, thinking) = len(prompt), _prompt(chat, alone, shown_alone)
+                if len(prompt) < engine.max_context:
+                    print(f"[the conversation is {held} tokens, over --max-context; starting "
+                          "over]")  # fmt: skip
+                    messages, pictures = alone, shown_alone
         except ValueError as e:  # as Mistral 7B v0.3's template refuses a system prompt
             print(f"[{e}; the message is dropped{', as /system takes it away' if first else ''}]")
             messages.pop()
@@ -568,10 +584,11 @@ def _bench(args: argparse.Namespace) -> None:
     if args.chat:  # as long as the model's context allows
         metadata = GGUF.open(args.model).metadata
         context = min(context, Config.from_gguf(metadata).context_length)
-    engine = Engine(
-        args.model, max_context=context, prefill_chunk=args.prompt, slots=n, draft=args.draft,
-        cache_type=args.cache_type,
-    )  # fmt: skip
+    with _said():
+        engine = Engine(
+            args.model, max_context=context, prefill_chunk=args.prompt, slots=n,
+            draft=args.draft, cache_type=args.cache_type,
+        )  # fmt: skip
     name = model_name(engine.gguf.path)
     head = {"model": name, "device": Device.DEFAULT, "cache_type": args.cache_type}
     title = f"{name} on {Device.DEFAULT}, {args.cache_type} KV cache"
@@ -612,15 +629,16 @@ def _perplexity(args: argparse.Namespace) -> None:
     from leatengine import bench
     from leatengine.engine import Engine
 
-    ctx = bench.base_chunk(args.kl_base) if args.kl_base else args.ctx
-    # a chunk in one run
-    engine = Engine(args.model, max_context=ctx, prefill_chunk=ctx, cache_type=args.cache_type)
-    if args.kl_base:
-        result = bench.kl_divergence(engine, args.kl_base, args.chunks, args.decode)
-    else:
-        # its bytes as they are, \r\n too, as llama-perplexity reads them
-        text = args.text.read_bytes().decode()
-        result = bench.perplexity(engine, text, args.ctx, args.chunks, args.decode)
+    with _said():
+        ctx = bench.base_chunk(args.kl_base) if args.kl_base else args.ctx
+        # a chunk in one run
+        engine = Engine(args.model, max_context=ctx, prefill_chunk=ctx, cache_type=args.cache_type)
+        if args.kl_base:
+            result = bench.kl_divergence(engine, args.kl_base, args.chunks, args.decode)
+        else:
+            # its bytes as they are, \r\n too, as llama-perplexity reads them
+            text = args.text.read_bytes().decode()
+            result = bench.perplexity(engine, text, args.ctx, args.chunks, args.decode)
     if args.json:
         print(json.dumps({"model": model_name(engine.gguf.path)} | asdict(result)))
         return

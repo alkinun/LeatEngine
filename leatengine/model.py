@@ -374,15 +374,7 @@ class Transformer:
         self, config: Config, weights: dict[str, QTensor], max_context: int, slots: int = 1,
         saved_tokens: int = 0, run: int | None = None, cache_type: str = "f16",
     ):  # fmt: skip
-        if not 0 < max_context <= config.context_length:
-            raise ValueError(
-                f"max_context must be in [1, {config.context_length}], got {max_context}"
-            )
-        if cache_type not in CACHE_TYPES:
-            raise ValueError(f"cache_type must be {' or '.join(CACHE_TYPES)}, got {cache_type}")
-        if cache_type == "q8_0" and (odd := [dim for dim in config.head_dims if dim % 32]):
-            raise ValueError(f"a q8_0 cache holds heads of a multiple of 32 dimensions, and this "
-                             f"model's are of {odd[0]}: use an f16 cache")  # fmt: skip
+        check(config, max_context, cache_type)
         self.config, self.max_context, self.slots = config, max_context, slots
         self.cache_type = cache_type
         # each layer's tensors by name, without "blk.{i}." and ".weight"
@@ -808,6 +800,18 @@ def _factors(rope: Rope, weights: dict[str, QTensor], max_context: int) -> Tenso
     if rope.longrope:
         name = f"rope_factors_{'long' if max_context > rope.longrope else 'short'}.weight"
     return weights[name].dequant() if name in weights else None
+
+
+def check(config: Config, max_context: int | None, cache_type: str) -> None:
+    """A ValueError unless a model of `config` takes a context of `max_context` tokens, if given,
+    and a KV cache of `cache_type`: said before its weights load, of a Transformer's arguments."""
+    if max_context is not None and not 0 < max_context <= config.context_length:
+        raise ValueError(f"max_context must be in [1, {config.context_length}], got {max_context}")
+    if cache_type not in CACHE_TYPES:
+        raise ValueError(f"cache_type must be {' or '.join(CACHE_TYPES)}, got {cache_type}")
+    if cache_type == "q8_0" and (odd := [dim for dim in config.head_dims if dim % 32]):
+        raise ValueError(f"a q8_0 cache holds heads of a multiple of 32 dimensions, and this "
+                         f"model's are of {odd[0]}: use an f16 cache")  # fmt: skip
 
 
 def cache_bytes(

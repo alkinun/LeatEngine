@@ -264,9 +264,10 @@ def _percentile(ordered: list[float], fraction: float) -> float:
 
 def _header(f: BinaryIO, base: Path) -> tuple[int, int, int]:
     # a llama-perplexity logits file's chunk size, vocab size and number of chunks
-    magic, ctx, vocab, n_chunks = struct.unpack("<8s3i", f.read(20))
-    if magic != b"_logits_":
+    head = f.read(20)
+    if len(head) < 20 or head[:8] != b"_logits_":
         raise ValueError(f"{base} is not a llama-perplexity logits file")
+    _, ctx, vocab, n_chunks = struct.unpack("<8s3i", head)
     return ctx, vocab, n_chunks
 
 

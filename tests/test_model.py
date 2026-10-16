@@ -416,6 +416,13 @@ def test_generate_matches_reference(tiny, arch):
     assert again == list(Engine(path, max_context=CONTEXT, prefill_chunk=5).generate(longer, 4))
 
 
+def test_warm_up_of_little_context(tiny_model):
+    # the graphs compiled of prompts that fit a context of 2 tokens
+    engine = Engine(tiny_model[0], max_context=2)
+    engine.warm_up()
+    assert len(list(engine.generate([5], 5))) == 2  # the second after the cache's last position
+
+
 def test_split_model(tmp_path):
     # a model of a GGUF in parts, opened by its first, generates as the whole file does
     whole, parts = tmp_path / "whole.gguf", tmp_path / "parts" / "m.gguf"

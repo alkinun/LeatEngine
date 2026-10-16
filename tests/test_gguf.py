@@ -203,3 +203,12 @@ def test_split(tmp_path):
     files[-1].unlink()
     with pytest.raises(ValueError, match=f"but {files[-1].name} is not there"):
         GGUF.open(files[0])
+
+
+def test_header_cut_short(tiny_gguf, tmp_path):
+    # a file cut within its header or index is said to be, rather than failing to unpack
+    data = tiny_gguf[0].read_bytes()
+    for size in (6, 30, 200):
+        (cut := tmp_path / f"cut{size}.gguf").write_bytes(data[:size])
+        with pytest.raises(ValueError, match="truncated, its header ends early"):
+            GGUF.open(cut)

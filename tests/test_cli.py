@@ -147,8 +147,16 @@ def test_perplexity_arguments(tiny_model, tmp_path, monkeypatch, capsys):
         with pytest.raises(SystemExit):
             main(["perplexity", str(path), "--text", str(text), *bad])
     assert "must be at least 1, got 0" in capsys.readouterr().err
-    with pytest.raises(ValueError, match="chunks of 2 tokens score none"):
+    with pytest.raises(SystemExit, match="chunks of 2 tokens score none"):
         main(["perplexity", str(path), "--text", str(text), "--ctx", "2"])
+    (short := tmp_path / "short.kld").write_bytes(b"_logits_")
+    for base in (short, tmp_path / "none.kld"):
+        with pytest.raises(SystemExit, match="is not a llama-perplexity logits file|No such"):
+            main(["perplexity", str(path), "--kl-base", str(base)])
+    with pytest.raises(SystemExit, match=f"{tmp_path / 'none.gguf'}: there is no such file"):
+        main(["run", str(tmp_path / "none.gguf")])
+    with pytest.raises(SystemExit, match="max_context must be in"):
+        main(["bench", str(path), "-p", "512", "-n", "8"])  # past the tiny model's context
     with pytest.raises(ValueError, match="chunks of 16 tokens are over max_context 8"):
         bench.perplexity(Engine(path, max_context=8), TEXT, ctx=16)
     read = []
@@ -208,9 +216,9 @@ def test_run_sampling_bounds(tiny_model, capsys, bad):
 
 def test_run_past_the_context(tiny_model, monkeypatch, capsys):
     # past --max-context, the chat starts over from the message just written, and a message too
-    # long alone is dropped, each said so
+    # long alone is dropped, the chat kept as it was, each said so
     # a template of every message's text, a token a character: two of 32 and 33 do not fit 64
-    replies, chats = iter(["a" * 32, "a" * 33, "b" * 80]), []
+    replies, chats = iter(["a" * 32, "a" * 33, "b" * 80, "c"]), []
 
     def fake_input(prompt):
         if (reply := next(replies, None)) is None:
@@ -227,6 +235,8 @@ def test_run_past_the_context(tiny_model, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "starting over" in out and "the message makes" in out
     assert [{"role": "user", "content": "a" * 33}] in chats
+    after = next(chat for chat in chats if chat[-1]["content"] == "c")
+    assert after[0] == {"role": "user", "content": "a" * 33}
 
 
 def test_serve_directories(tiny_model, tmp_path, monkeypatch, capsys):

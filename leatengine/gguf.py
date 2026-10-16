@@ -162,7 +162,10 @@ def _opened(path: Path, part: int) -> tuple[dict[str, Any], dict[str, TensorInfo
     # a file's metadata and tensors, each of `part`, checked to end within it
     with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
         with memoryview(mm) as buf:
-            metadata, tensors = _parse(buf, part)
+            try:
+                metadata, tensors = _parse(buf, part)
+            except struct.error:  # its header or index cut short
+                raise ValueError(f"{path}: truncated, its header ends early") from None
         size = len(mm)
     for t in tensors.values():
         if t.offset + t.nbytes > size:
@@ -189,9 +192,10 @@ def _runs(tensors: list[TensorInfo], alignment: int) -> list[list[TensorInfo]]:
 
 def _read(f: io.FileIO, at: int, into: memoryview) -> None:
     f.seek(at)
+    end = at + len(into)
     while into:
         if not (n := f.readinto(into)):
-            raise ValueError(f"{f.name}: ends before byte {at + len(into)}")
+            raise ValueError(f"{f.name}: ends before byte {end}")
         into = into[n:]
 
 

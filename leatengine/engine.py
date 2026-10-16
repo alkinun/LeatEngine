@@ -19,7 +19,7 @@ from leatengine.draft import load as load_drafter
 from leatengine.gguf import GGUF
 from leatengine.grammar import Constraint, Grammar, Matcher, Tokens
 from leatengine.kernels import FEW_TOKENS, MATVEC_TOKENS, VARIABLES
-from leatengine.model import CACHE_TILE, Config, Transformer, cache_bytes, zeros
+from leatengine.model import CACHE_TILE, Config, Transformer, cache_bytes, check, zeros
 from leatengine.ops import Span
 from leatengine.sampler import GREEDY, Sampling, sample
 from leatengine.tokenizer import Tokenizer
@@ -78,7 +78,7 @@ class Sequence:
     scores: list[Scored] = field(default_factory=list)
     tokens: list[int] = field(default_factory=list)  # generated so far, the last not yet run
     done: bool = False  # generated all it will, or cancelled
-    # its sampling options and seed for the graphs, as (1, 5) and (1,) tensors
+    # its sampling options and seed for the graphs, as (1, 7) and (1,) tensors
     options: tuple[Tensor, Tensor] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -161,6 +161,7 @@ class Engine:
         self.gguf = gguf = GGUF.open(path)
         self.tokenizer = Tokenizer(gguf.metadata)
         self.config = Config.from_gguf(gguf.metadata)
+        check(self.config, max_context, cache_type)  # before the weights load
         cache_slots = slots + bool(self._padded)
         self.vision: Vision | None = None
         if vision is not None:
@@ -420,7 +421,10 @@ class Engine:
         # drafter by a speculative step
         longer = FEW_TOKENS + 1 + (KEEP_BACK if self._recurrent else 0)
         first = 2 + (self.drafter is not None)
-        for prompt, n in (([0] * min(longer, self.max_context - 1), first), ([0, 0], 1)):
+        for prompt, n in (
+            ([0] * min(longer, self.max_context - 1), first),
+            ([0] * min(2, self.max_context - 1), 1),
+        ):
             self.reset()
             for _ in self.generate(prompt, n, ignore_eog=True):
                 pass
