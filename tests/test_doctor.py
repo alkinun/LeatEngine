@@ -73,9 +73,11 @@ def test_ready(strix):
 
 
 @pytest.mark.parametrize("files, name, status, said", [
-    # a kernel before the fixes; the fix names Ubuntu's, whose releases do not show that they
-    # have them
+    # a kernel before the fixes, and Ubuntu's of them, by their releases; the fix names them
     ({"proc/sys/kernel/osrelease": "6.17.0-14-generic"}, "kernel", "warn", "HWE kernel"),
+    ({"proc/sys/kernel/osrelease": "6.17.0-19-generic"}, "kernel", "ok", "6.17.0-19"),
+    ({"proc/sys/kernel/osrelease": "6.14.0-1018-oem"}, "kernel", "ok", "6.14.0-1018"),
+    ({"proc/sys/kernel/osrelease": "6.14.0-1018-generic"}, "kernel", "warn", "OEM kernel"),
     # GTT's default, half of memory: too little for the largest models
     ({"sys/class/drm/renderD128/device/mem_info_gtt_total": 62 * GIB}, "gpu memory", "warn",
      "amd-ttm"),

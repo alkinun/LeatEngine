@@ -1,5 +1,6 @@
-"""The machine a model runs on: its AMD GPUs, as KFD lists them, and the memory free for a model's
-buffers, by which the engine sizes a context and `leatengine doctor` reports it.
+"""The machine a model runs on: its AMD GPUs, as KFD lists them, an NVIDIA GPU, as nvidia-smi
+reports it, and the memory free for a model's buffers, by which the engine sizes a context and
+`leatengine doctor` reports it.
 
 Everything here reads what Linux and the drivers show any user, under a `root` that tests set.
 """
@@ -84,16 +85,20 @@ def ram(root: Path = Path("/")) -> int | None:
 
 def used(render: int, root: Path = Path("/")) -> dict[str, int]:
     """How much of GTT and of VRAM, an APU's carve-out, amdgpu reports in use, by pool."""
-    device = root / f"sys/class/drm/renderD{render}/device"
-    found = {pool.upper(): number(device / f"mem_info_{pool}_used") for pool in ("gtt", "vram")}
-    return {pool: n for pool, n in found.items() if n is not None}
+    return _pools(render, root, "used")
 
 
 def sizes(render: int, root: Path = Path("/")) -> dict[str, int]:
     """The size of GTT and of VRAM, an APU's carve-out, amdgpu reports, by pool."""
-    device = root / f"sys/class/drm/renderD{render}/device"
-    found = {pool.upper(): number(device / f"mem_info_{pool}_total") for pool in ("gtt", "vram")}
-    return {pool: n for pool, n in found.items() if n is not None}
+    return _pools(render, root, "total")
+
+
+def pool(gpu: GPU, total: dict[str, int]) -> tuple[str, str]:
+    """The pool amdgpu serves a GPU's buffers from, of `total`'s, and what to call it: tinygrad
+    asks KFD for VRAM, which amdgpu serves from GTT on an APU whose carve-out is less than GTT."""
+    if gpu.apu and total["VRAM"] < total["GTT"]:
+        return "GTT", "GTT"
+    return "VRAM", "the carve-out" if gpu.apu else "VRAM"
 
 
 def read(path: Path) -> str | None:
@@ -113,43 +118,55 @@ def _ram(root: Path) -> Memory | None:
     return None if total is None or available is None else Memory("RAM", total, available)
 
 
+def _pools(render: int, root: Path, kind: str) -> dict[str, int]:
+    device = root / f"sys/class/drm/renderD{render}/device"
+    found = {p.upper(): number(device / f"mem_info_{p}_{kind}") for p in ("gtt", "vram")}
+    return {p: n for p, n in found.items() if n is not None}
+
+
 def _amd(root: Path, gpu: GPU) -> Memory | None:
-    # tinygrad asks KFD for VRAM, which amdgpu serves from GTT on an APU whose carve-out is less
-    # than its GTT
     total, taken = sizes(gpu.render, root), used(gpu.render, root)
     if len(total) < 2 or len(taken) < 2:
         return None
-    pool = "GTT" if gpu.apu and total["VRAM"] < total["GTT"] else "VRAM"
-    free = total[pool] - taken[pool]
+    served, called = pool(gpu, total)
+    free = total[served] - taken[served]
     if gpu.apu and (available := _meminfo(root, "MemAvailable")) is not None:
         free = min(free, available)
-    return Memory("the carve-out" if gpu.apu and pool == "VRAM" else pool, total[pool], free)
+    return Memory(called, total[served], free)
 
 
 def _nvidia() -> Memory | None:
     # the first GPU's, as tinygrad's NV:0
-    if shutil.which("nvidia-smi") is None:
+    if (said := _nvidia_smi("memory.total,memory.used", "nounits")) is None:
         return None
-    query = ["nvidia-smi", "--query-gpu=memory.total,memory.used", "--format=csv,noheader,nounits"]
     try:
-        done = subprocess.run(query, capture_output=True, text=True, timeout=30, check=True)
-        total, taken = (int(n) << 20 for n in done.stdout.splitlines()[0].split(","))
-    except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+        total, taken = (int(n) << 20 for n in said)
+    except ValueError:
         return None
     return Memory("the GPU's memory", total, total - taken)
 
 
 def nvidia_gpu() -> str | None:
     """The first NVIDIA GPU's name and driver, as nvidia-smi gives them, if it is there."""
+    said = _nvidia_smi("name,driver_version")
+    return None if said is None else f"{said[0]}, driver {said[1]}"
+
+
+def _nvidia_smi(fields: str, *options: str) -> list[str] | None:
+    # the first GPU's fields, as nvidia-smi gives them, if it is there and answers
     if shutil.which("nvidia-smi") is None:
         return None
-    query = ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]
+    query = [
+        "nvidia-smi",
+        f"--query-gpu={fields}",
+        f"--format=csv,noheader{''.join(',' + o for o in options)}",
+    ]
     try:
         done = subprocess.run(query, capture_output=True, text=True, timeout=30, check=True)
-        name, driver = (x.strip() for x in done.stdout.splitlines()[0].split(","))
-    except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+        said = [x.strip() for x in done.stdout.splitlines()[0].split(",")]
+    except (OSError, subprocess.SubprocessError, IndexError):
         return None
-    return f"{name}, driver {driver}"
+    return said if len(said) == fields.count(",") + 1 else None
 
 
 def _meminfo(root: Path, field: str) -> int | None:

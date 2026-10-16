@@ -32,6 +32,12 @@ TARGET = "gfx1151"  # Strix Halo's GPU, the one LeatEngine is made for
 # the first Linux with KFD's fixes for gfx1151, as AMD's Strix Halo guide gives it for most
 # distributions; Ubuntu 24.04's HWE and OEM kernels have them from 6.17.0-19 and 6.14.0-1018 on
 KERNEL = (6, 18, 4)
+# and Ubuntu 24.04's kernels of them, as AMD's guide names them: by version, the release from which
+# they have them, and their flavor, the HWE kernel's and the OEM kernel's
+UBUNTU: dict[tuple[int, ...], tuple[int, str]] = {
+    (6, 17, 0): (19, "generic"),
+    (6, 14, 0): (1018, "oem"),
+}
 GUIDE = "https://rocm.docs.amd.com/en/latest/how-to/system-optimization/strixhalo.html"
 # the share of the machine's memory that the GPU's buffers may take, under which the largest
 # models do not fit: GTT's default is about half
@@ -176,7 +182,15 @@ def _system(root: Path) -> Check:
 def _kernel(root: Path) -> Check:
     release = read(root / "proc/sys/kernel/osrelease") or platform.release()
     version = tuple(int(n) for n in re.findall(r"\d+", release.split("-")[0])[:3])
-    if version >= KERNEL:
+    ubuntu = re.fullmatch(r"[\d.]+-(\d+)-(\w+)", release)
+    since = UBUNTU.get(version)
+    if (
+        version >= KERNEL
+        or ubuntu
+        and since
+        and int(ubuntu[1]) >= since[0]
+        and ubuntu[2] == since[1]
+    ):
         return Check("kernel", "ok", release)
     return Check("kernel", "warn", release,
                  f"Linux {'.'.join(map(str, KERNEL))} or newer has KFD's fixes for gfx1151, as do "
@@ -224,8 +238,7 @@ def _device_file(name: str, path: Path) -> Check:
 
 
 def _memory(root: Path, gpu: GPU, ram: int | None) -> list[Check]:
-    # where the GPU's buffers come from, and so how much of them there can be. tinygrad asks KFD
-    # for VRAM, which amdgpu serves from GTT on an APU whose carve-out is less than its GTT
+    # where the GPU's buffers come from, and so how much of them there can be
     pools = machine.sizes(gpu.render, root)
     vram, gtt = pools.get("VRAM"), pools.get("GTT")
     limit = []
@@ -236,7 +249,8 @@ def _memory(root: Path, gpu: GPU, ram: int | None) -> list[Check]:
         return [Check("gpu memory", "warn", "amdgpu does not report its pools' sizes"), *limit]
     if not gpu.apu:
         return [Check("gpu memory", "info", f"VRAM {_gib(vram)}, GTT {_gib(gtt)}"), *limit]
-    pool, most = ("GTT", gtt) if vram < gtt else ("the carve-out", vram)
+    served, pool = machine.pool(gpu, pools)
+    most = pools[served]
     said = f"carve-out {_gib(vram)}, GTT {_gib(gtt)}: buffers come from {pool}, {_gib(most)}"
     if ram is None or most >= ENOUGH * (ram + vram):  # MemTotal leaves the carve-out out
         return [Check("gpu memory", "ok", said + " at most"), *limit]
