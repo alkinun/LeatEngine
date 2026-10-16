@@ -916,7 +916,9 @@ class Engine:
         # how many times each row's sequence has generated each token, for the penalties: a
         # decode step runs the last, which it counts in its slot's, a chunk of prompt none, and
         # empties its slot's. Padding rows count theirs in the spare slot, which none reads but
-        # they, whatever their writes leave.
+        # they, whatever their writes leave. The counts are read back from the slots once
+        # written: tinygrad has a tensor made of a buffer before an assign to it read it after,
+        # so that the sum the slots took would count the last token twice.
         if not decode:
             self._seen[slots[0] : slots[0] + 1].assign(self._seen[:1].zeros_like()).realize()
             return self._seen[:1].zeros_like()
@@ -926,7 +928,7 @@ class Engine:
         Tensor.realize(
             *(self._seen[s : s + 1].assign(seen[i : i + 1]) for i, s in enumerate(slots))
         )
-        return seen
+        return Tensor.cat(*(self._seen[slot : slot + 1] for slot in slots))
 
 
 def _scores(logits: Tensor, tokens: Tensor, top: int) -> Tensor:

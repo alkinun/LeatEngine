@@ -816,6 +816,27 @@ def test_penalties(tiny_model):
     assert list(engine.generate(PROMPT, 12, sampling, ignore_eog=True)) == out
 
 
+def check_counted_once(engine: Engine) -> None:
+    # each token generated counted once, of sequences decoding together: biased up 100 and
+    # losing 70 each time generated, a greedy reply takes it twice running, then another
+    penalized = Sampling(frequency_penalty=70.0)
+    started = [engine.start(p, 4, penalized, logit_bias={7: 100.0}, ignore_eog=True)
+               for p in (PROMPT, PROMPT[::-1])]  # fmt: skip
+    while engine.active:
+        engine.step()
+    for s in started:
+        assert s.tokens[:2] == [7, 7] and s.tokens[2] != 7, s.tokens
+
+
+def test_frequency_counted_once(tiny_model):
+    check_counted_once(Engine(tiny_model[0], max_context=CONTEXT, prefill_chunk=8, slots=2))
+
+
+@pytest.mark.gpu
+def test_frequency_counted_once_kernels(tiny_model):
+    check_counted_once(Engine(tiny_model[0], max_context=CONTEXT, prefill_chunk=8, slots=2))
+
+
 def test_logit_bias(tiny_model):
     # a token biased up is all a greedy sequence takes, and its slot's next sequence, unbiased,
     # generates as it would have
