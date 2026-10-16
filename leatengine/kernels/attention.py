@@ -538,10 +538,9 @@ def _flash_attention_kernel(
     if splits > 1:  # every splits-th of them from the split's on
         split = UOp.range(at_most(seen_tiles, splits), 5, AxisType.GLOBAL)
         tiles = UOp.range((seen_tiles - 1 - split) // splits + 1, 3, AxisType.LOOP)
-        kt = first + split + tiles * splits
     else:
         tiles = UOp.range(seen_tiles, 3, AxisType.LOOP)
-        kt = first + tiles
+    kt = first + split + tiles * splits
     # the queries in registers for the whole loop with one part, if they fit; else read again
     # each time
     held = parts == 1 and (not wmma or dim <= HELD)
@@ -562,15 +561,31 @@ def _flash_attention_kernel(
 
     keys = UOp.alloc((key_tile, words + 4), dtypes.uint32, addrspace=AddrSpace.LOCAL)
     values = UOp.alloc((width, key_tile // 2 + 4), dtypes.uint32, addrspace=AddrSpace.LOCAL)
-    stores = []
+    key_items = turns(key_tile * words, threads, tid)
+    value_items = [(item % (key_tile // 2), item // (key_tile // 2))  # (pair, word)
+                   for item in turns(key_tile // 2 * width // 2, threads, tid)]  # fmt: skip
 
-    row = (kt * key_tile) % positions if ring else kt * key_tile  # of the tile's first key
-    for item in turns(key_tile * words, threads, tid):
-        key, w = item // words, item % words
-        stores.append(keys[key, w].store(word(0, row + key, w)))
-    for item in turns(key_tile // 2 * width // 2, threads, tid):
-        pair, w = item % (key_tile // 2), item // (key_tile // 2)
-        a, b = (word(1, row + 2 * pair + j, part * width // 2 + w) for j in (0, 1))
+    def fetched(t: UOp) -> list[UOp]:
+        # the words of key tile t the thread stores: its keys', then pairs of its values', of the
+        # slot's positions as a ring holds them, or past the last tile, its first
+        row = (t * key_tile) % positions
+        out = [word(0, row + item // words, item % words) for item in key_items]
+        for pair, w in value_items:
+            out += [word(1, row + 2 * pair + j, part * width // 2 + w) for j in (0, 1)]
+        return out
+
+    # the next tile's words, fetched into registers while the warps work on this one's, so that
+    # its loads' latency hides behind them, as the first tile's before the loop
+    staged = UOp.alloc((len(key_items) + 2 * len(value_items),), dtypes.uint32,
+                       addrspace=AddrSpace.REG)  # fmt: skip
+    staged = staged.after(staged.store(UOp.stack(*fetched(first + split))))
+    tile_words = [staged.after(tiles)[i].load() for i in range(int(staged.shape[0]))]
+    key_words, value_words = tile_words[: len(key_items)], tile_words[len(key_items) :]
+    stores = []
+    for item, key_word in zip(key_items, key_words, strict=True):
+        stores.append(keys[item // words, item % words].store(key_word))
+    for i, (pair, w) in enumerate(value_items):
+        a, b = value_words[2 * i : 2 * i + 2]
         stores.append(values[2 * w, pair].store((a & 0xFFFF) | (b << 16)))
         stores.append(values[2 * w + 1, pair].store((a >> 16) | (b & 0xFFFF0000)))
     keys, values = keys.after(*stores), values.after(*stores)
@@ -611,6 +626,7 @@ def _flash_attention_kernel(
         acc.store(UOp.stack(*frags.weigh(p, values, before, width, key_tile))),
         mx.store(UOp.stack(*new_max)),
         total.store(UOp.stack(*(prev_total[r].load() * rescale[r] + sums[r] for r in range(n)))),
+        staged.store(UOp.stack(*fetched(kt + splits))),
     ).end(tiles)
     acc, mx, total = acc.after(update), mx.after(update), total.after(update)
     # past the loop, the fragments of an opaque copy of the lane: see common.opaque
