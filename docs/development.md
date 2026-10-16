@@ -85,8 +85,8 @@ covers that check.
 - Tokenizer comparisons against llama.cpp at commit `889edf43ddae0cfe9a4564a882764dc879759870`.
 - Combined CPU/emulator coverage of at least 80%.
 - Wheel and source-distribution installation checks.
-- The release tarball, built twice for identical bytes, checked unpacked, and kept as the run's
-  artifact.
+- The release tarball, built twice for identical bytes, checked installed, and kept as the run's
+  artifact; of a version's tag, published as its release once every other job passes.
 
 CPU and emulated GPU jobs rebalance queued tests between workers with `--dist worksteal`, so
 long model cases do not leave the remaining tests queued behind one busy worker. The emulated GPU
@@ -121,7 +121,8 @@ neither.
 uv run python scripts/build_release.py
 ```
 
-This builds `dist/leatengine-0.0.1-linux-x86_64.tar.gz`, about 37 MiB, and its SHA-256 beside it.
+This builds `dist/leatengine-0.0.1-linux-x86_64.tar.gz`, about 37 MiB, and `dist/SHA256SUMS`
+beside it.
 The tarball holds python-build-standalone's CPython 3.14 in `python/`, with LeatEngine and its
 locked dependencies installed into it, and `bin/leatengine`, which runs that Python from wherever
 the tarball is unpacked, ignoring `PYTHONPATH` and the like. `BUILD-INFO.json` records the
@@ -146,13 +147,36 @@ time in another directory and requires identical bytes. To bump CPython, change 
 `PYTHON_SHA256` in the script, taking the hash from the python-build-standalone release's
 `SHA256SUMS`.
 
-After building, the script unpacks the tarball into a temporary directory whose path has a space and
-checks it: the launcher, directly and through a symlink; `leatengine doctor`'s report; the packaging
-check's isolation and streamed completion from generated CPU weights; and `bin/leatengine serve` as
-a supervisor such as Lemonade would start it, waiting on `/health`, streaming a completion, and
-stopping it with SIGINT. Where unprivileged user namespaces are allowed, the last two run in a
-network namespace with only loopback; elsewhere the script says so and checks with the network.
-`--no-check` skips the checks.
+After building, the script installs the tarball with `scripts/install.sh` into a temporary home
+whose path has a space, and checks it: the launcher, directly and through the installed link;
+`leatengine doctor`'s report; the packaging check's isolation and streamed completion from generated
+CPU weights; and the installed `leatengine serve` as a supervisor such as Lemonade would start it,
+waiting on `/health`, streaming a completion, and stopping it with SIGINT; then uninstalls it. Where
+unprivileged user namespaces are allowed, the completion and `serve` run in a network namespace
+with only loopback; elsewhere the script says so and checks with the network. `--no-check` skips
+the checks.
+
+## Releases and the installer
+
+A tag of the version in `pyproject.toml`, `v0.0.1` of `0.0.1`, pushed to GitHub, runs CI on it;
+once every job passes, its `publish` job makes a GitHub release of the tag, with the tarball the
+release job built, `SHA256SUMS`, and `scripts/install.sh`. A tag of another version fails the job
+before anything is published.
+
+`install.sh` installs a release on Linux x86-64: it checks the tarball against `SHA256SUMS`, unpacks
+it to `~/.local/share/leatengine/VERSION` (`$XDG_DATA_HOME` where set), and links
+`~/.local/bin/leatengine` to it. An upgrade keeps the installed version until the new one's
+`leatengine doctor --json` reports, then removes it. It refuses to replace a `leatengine` of another
+install, as `uv tool install`'s, and `--uninstall` removes its own, keeping pulled models and
+compiled kernels.
+
+```bash
+curl -fsSL https://github.com/alkinun/LeatEngine/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/alkinun/LeatEngine/releases/latest/download/install.sh |
+  sh -s -- --version 0.0.1
+sh scripts/install.sh --from file://$PWD/dist  # the tarball just built
+sh scripts/install.sh --uninstall
+```
 
 ## Provenance
 

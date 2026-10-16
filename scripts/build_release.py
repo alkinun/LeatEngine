@@ -5,9 +5,10 @@
 The tarball, dist/leatengine-VERSION-linux-x86_64.tar.gz, holds python-build-standalone's CPython
 with LeatEngine and its locked dependencies installed into it, and bin/leatengine, which runs it:
 it needs no network and no system Python. clang with its AMDGPU target stays the system's. A
-commit builds the same bytes each time. The tarball is then unpacked elsewhere and checked: its
-launcher, the package's isolation, and a streamed completion from generated CPU weights, served
-without a network where a network namespace can be made.
+commit builds the same bytes each time; dist/SHA256SUMS holds its SHA-256, as a release does. The
+tarball is then installed elsewhere by scripts/install.sh and checked: its launcher, the
+package's isolation, and a streamed completion from generated CPU weights, served without a
+network where a network namespace can be made; and uninstalled.
 """
 
 import argparse
@@ -226,7 +227,7 @@ def build(out: Path) -> Path:
             work, {})  # fmt: skip
         unpacked = sum(p.lstat().st_size for p in tree.rglob("*"))
     digest = sha256(tarball)
-    (out / f"{tarball.name}.sha256").write_text(f"{digest}  {tarball.name}\n")
+    (out / "SHA256SUMS").write_text(f"{digest}  {tarball.name}\n")
     size = tarball.stat().st_size
     print(f"Built {tarball}: {size / 2**20:.1f} MiB ({size} bytes), {unpacked / 2**20:.0f} MiB "
           f"unpacked, SHA-256 {digest}", flush=True)  # fmt: skip
@@ -277,7 +278,8 @@ def offline() -> list[str]:
 
 
 def check(tarball: Path) -> None:
-    """Unpacks `tarball` elsewhere and runs it with neither the checkout nor a network."""
+    """Installs `tarball` from its directory, as install.sh does a release, and runs it with
+    neither the checkout nor a network; then uninstalls it."""
     from check_package import SMOKE
 
     print(f"Checking {tarball}", flush=True)
@@ -292,13 +294,14 @@ def check(tarball: Path) -> None:
             "write_tiny_model(Path(sys.argv[1]), 'llama')"
         )
         run([sys.executable, "-c", generate, str(model)], ROOT, env)
-        unpacked = work / "un packed"  # a space, for the launcher's quoting
-        unpacked.mkdir()
-        run(["tar", "-xzf", str(tarball), "-C", str(unpacked)], work, env)
-        tree = unpacked / NAME
-        link = work / "bin/leatengine"  # as a user's own bin/ would link to it
-        link.parent.mkdir()
-        link.symlink_to(tree / "bin/leatengine")
+        # into a home of its own, a space in its path for the launcher's quoting
+        home = work / "a home"
+        install = ["sh", str(ROOT / "scripts/install.sh")]
+        mine = {k: v for k, v in env.items() if k != "XDG_DATA_HOME"} | {"HOME": str(home)}
+        run([*install, "--from", tarball.parent.as_uri()], work, mine)
+        tree = home / ".local/share/leatengine" / VERSION
+        link = home / ".local/bin/leatengine"  # as the user's own bin/ links to it
+        assert link.resolve() == (tree / "bin/leatengine").resolve(), link.resolve()
         # the Python settings the launcher's must not read
         env |= {"DEV": "CPU", "CACHEDB": str(work / "compile.db"),
                 "PYTHONHOME": str(work / "none"), "PYTHONPATH": str(ROOT)}  # fmt: skip
@@ -315,9 +318,10 @@ def check(tarball: Path) -> None:
         prefix = offline()
         python = str(tree / "python/bin/python3")
         run([*prefix, python, "-I", "-c", SMOKE, str(model), VERSION], work, env)
-        run([*prefix, python, "-I", "-c", SERVE, str(tree / "bin/leatengine"), str(model)],
-            work, env)  # fmt: skip
-    print("The unpacked tarball passed its checks", flush=True)
+        run([*prefix, python, "-I", "-c", SERVE, str(link), str(model)], work, env)
+        run([*install, "--uninstall"], work, mine)
+        assert not link.is_symlink() and not tree.exists(), "uninstalled, it was still there"
+    print("The installed tarball passed its checks", flush=True)
 
 
 def main() -> None:

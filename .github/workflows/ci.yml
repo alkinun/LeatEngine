@@ -3,6 +3,8 @@ name: ci
 on:
   push:
     branches: [main]
+    # a version's tag, as v0.1.0 of pyproject.toml's 0.1.0, publishes its release once all passes
+    tags: ["v*"]
   pull_request:
 
 permissions:
@@ -42,7 +44,9 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: leatengine-linux-x86_64
-          path: dist/leatengine-*-linux-x86_64.tar.gz*
+          path: |
+            dist/leatengine-*-linux-x86_64.tar.gz
+            dist/SHA256SUMS
 
   lint:
     runs-on: ubuntu-latest
@@ -188,3 +192,32 @@ jobs:
           merge-multiple: true
       - run: uv run coverage combine .coverage.*
       - run: uv run coverage report --fail-under=80
+
+  publish:
+    # of a version's tag, once every other job passed: a GitHub release of the tag, with the
+    # tarball the release job built, its SHA256SUMS and the installer, which fetches both
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [package, release, lint, test, kernels, tokenizer, coverage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: leatengine-linux-x86_64
+          path: dist
+      - run: |
+          tarball=$(cd dist && ls leatengine-*-linux-x86_64.tar.gz)
+          version=${tarball#leatengine-}
+          version=${version%-linux-x86_64.tar.gz}
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::the tag $GITHUB_REF_NAME is not v$version, of pyproject.toml's version"
+            exit 1
+          fi
+          (cd dist && sha256sum --check SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" "dist/$tarball" dist/SHA256SUMS scripts/install.sh \
+            --verify-tag --title "LeatEngine $version" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
