@@ -48,7 +48,7 @@ from leatengine.chat import (
 )
 from leatengine.defaults import OPTIONS, Overrides, recommended
 from leatengine.draft import own_drafter
-from leatengine.engine import Engine, Sequence
+from leatengine.engine import TOP_LOGPROBS, Engine, Scored, Sequence
 from leatengine.gguf import GGUF
 from leatengine.grammar import Grammar
 from leatengine.keys import Keys
@@ -125,6 +125,11 @@ _FIELDS: dict[str, tuple[Callable[[Any], bool], str]] = {
                    or bool(v) and all(type(t) is int and t >= 0 for t in v)),
                "a string, a list of one string, or a non-empty list of token ids"),
     "suffix": (lambda v: isinstance(v, str), "a string"),
+    # a chat's true or false, and its count of the likeliest tokens; a text completion's count
+    "logprobs": (lambda v: isinstance(v, bool) or type(v) is int and 0 <= v <= TOP_LOGPROBS,
+                 f"true or false, or of a text completion a count from 0 to {TOP_LOGPROBS}"),
+    "top_logprobs": (lambda v: type(v) is int and 0 <= v <= TOP_LOGPROBS,
+                     f"an integer from 0 to {TOP_LOGPROBS}"),
     "response_format": (lambda v: isinstance(v, dict) and (v.get("type") in ("text", "json_object")
                         or v.get("type") == "json_schema" and isinstance(v.get("json_schema"), dict)
                         and isinstance(v["json_schema"].get("schema"), dict)),
@@ -134,8 +139,8 @@ _FIELDS: dict[str, tuple[Callable[[Any], bool], str]] = {
 
 # what leatengine does not implement, each with the value that asks for nothing more
 _UNSUPPORTED = {
-    "n": 1, "frequency_penalty": 0, "repetition_penalty": 1, "logit_bias": {}, "logprobs": False,
-    "echo": False, "best_of": 1,
+    "n": 1, "frequency_penalty": 0, "repetition_penalty": 1, "logit_bias": {}, "echo": False,
+    "best_of": 1,
 }  # fmt: skip
 _TEXT_TOKENS = 16  # the tokens a text completion makes unless it asks for more, as OpenAI's
 _GRAMMARS = 64  # compiled response formats a loaded model keeps, with their masks
@@ -212,10 +217,17 @@ class _Completion:
     # completions that wait before it, and never into the last slot free
     background: bool = False
     text: bool = False  # of /v1/completions: its reply text alone, as the model writes it
+    # of how many of the likeliest tokens it gives the log-probabilities with each token's, if it
+    # gives any; and those the worker gave so far, as OpenAI's chat completions show each token's
+    logprobs: int | None = None
+    scores: list[dict[str, Any]] = field(default_factory=list)
     id: str = field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
     created: int = field(default_factory=lambda: int(time.time()))
-    # from the worker: pieces of text, then how generation finished or the exception it raised
-    out: queue.SimpleQueue[str | _Finish | Exception] = field(default_factory=queue.SimpleQueue)
+    # from the worker: pieces of text, and before their text, tokens' log-probabilities if asked
+    # for; then how generation finished or the exception it raised
+    out: queue.SimpleQueue[str | list[dict[str, Any]] | _Finish | Exception] = field(
+        default_factory=queue.SimpleQueue
+    )
     cancelled: threading.Event = field(default_factory=threading.Event)
     finish: _Finish = field(init=False)  # once pieces() is exhausted
 
@@ -225,13 +237,15 @@ class _Completion:
         for a reply that sends nothing before it ends, which would never find its client gone."""
         while True:
             try:
-                item: str | _Finish | Exception | None = self.out.get(timeout=_HANG_UP_CHECK)
+                item = self.out.get(timeout=_HANG_UP_CHECK)
             except queue.Empty:
                 item = None
             if hung_up():
                 raise ConnectionAbortedError("the client hung up")
             if isinstance(item, str):
                 yield item
+            elif isinstance(item, list):  # tokens' log-probabilities, before their text
+                self.scores += item
             elif item is not None:
                 break
         if isinstance(item, Exception):
@@ -416,7 +430,10 @@ class Server(ThreadingHTTPServer):
                 continue
             writer = running[sequence]
             whole = sequence.constraint is not None and sequence.constraint.over()
-            if writer.take(token) or whole:  # end of generation, a stop string, or the JSON whole
+            score = None if sequence.logprobs is None else sequence.scores[writer.count]
+            if (
+                writer.take(token, score) or whole
+            ):  # end of generation, a stop string, or the JSON whole
                 engine.cancel(sequence)
                 writer.finish("stop")
             elif sequence.done and i == last[sequence]:  # max_tokens, or the context full
@@ -487,6 +504,7 @@ class Server(ThreadingHTTPServer):
             sequence = engine.start(
                 request.prompt, request.max_tokens, request.sampling, request.seed,
                 images=request.images, owner=owner, constraint=constraint,
+                logprobs=request.logprobs,
             )  # fmt: skip
         except Exception as e:  # for the client; the server carries on
             request.out.put(e)
@@ -570,13 +588,18 @@ class _Writer:
         # when generation started, after any wait for a slot, and when the first token came
         self.started, self.first = started, 0.0
 
-    def take(self, token: int) -> bool:
-        """Takes the next token; True if it ends the reply: end of generation or a stop string."""
+    def take(self, token: int, score: Scored | None = None) -> bool:
+        """Takes the next token, and its log-probability and the likeliest tokens' if asked for;
+        True if it ends the reply: end of generation or a stop string."""
         self.count += 1
         if self.count == 1:
             self.first = time.perf_counter()
         if token in self.tokenizer.eog_ids:
             return True
+        if score is not None:
+            chosen, likeliest = score
+            top = [self._spelled(i) | {"logprob": v} for i, v in likeliest]
+            self.c.out.put([self._spelled(token) | {"logprob": chosen, "top_logprobs": top}])
         self.text += self.decode(token)
         # sent text holds no start of a stop string, so one can only begin after it
         if found := [i for s in self.c.stop if (i := self.text.find(s, self.sent)) >= 0]:
@@ -586,6 +609,10 @@ class _Writer:
             self.c.out.put(self.text[self.sent : end])
             self.sent = end
         return False
+
+    def _spelled(self, token: int) -> dict[str, Any]:
+        data = self.tokenizer.spelled(token)
+        return {"token": data.decode("utf-8", errors="replace"), "bytes": list(data)}
 
     def finish(self, reason: str) -> None:
         """Puts the rest of the text, then how the reply ended: "stop", "length", or "cancelled" as
@@ -892,7 +919,8 @@ class _Handler(BaseHTTPRequestHandler):
         if calls:
             message |= {"content": content or None, "tool_calls": _tool_calls(calls)}
             reason = _with_calls(reason)
-        choice = {"index": 0, "message": message, "logprobs": None, "finish_reason": reason}
+        scores = None if c.logprobs is None else {"content": c.scores}
+        choice = {"index": 0, "message": message, "logprobs": scores, "finish_reason": reason}
         body = {"choices": [choice], "usage": _usage(c), "timings": _timings(c)}
         self._json(200, self._head(c, "chat.completion") | body)
 
@@ -901,15 +929,23 @@ class _Handler(BaseHTTPRequestHandler):
             text = "".join(c.pieces(self._hung_up))
         except RuntimeError as e:
             return self._error(500, str(e))
-        choice = {"text": text, "index": 0, "logprobs": None, "finish_reason": c.finish.reason}
+        scores = None if c.logprobs is None else _text_scores(c.scores, 0)
+        choice = {"text": text, "index": 0, "logprobs": scores, "finish_reason": c.finish.reason}
         body = {"choices": [choice], "usage": _usage(c), "timings": _timings(c)}
         self._json(200, self._head(c, "text_completion") | body)
 
     def _stream_text(self, c: _Completion) -> None:
         self._events()
+        given, at = 0, 0  # the log-probabilities sent, and where the next one's token's text is
 
         def chunk(text: str, reason: str | None = None) -> dict[str, Any]:
-            choice = {"text": text, "index": 0, "logprobs": None, "finish_reason": reason}
+            # with the log-probabilities not sent yet, if asked for
+            nonlocal given, at
+            scores = None
+            if c.logprobs is not None:
+                scores, given = _text_scores(c.scores[given:], at), len(c.scores)
+                at += sum(map(len, scores["tokens"]))
+            choice = {"text": text, "index": 0, "logprobs": scores, "finish_reason": reason}
             return self._head(c, "text_completion") | {"choices": [choice]}
 
         try:
@@ -934,6 +970,16 @@ class _Handler(BaseHTTPRequestHandler):
     def _stream(self, c: _Completion) -> None:
         self._events()
         self._chunk(c, {"role": "assistant", "content": ""})
+        given = 0  # the log-probabilities sent
+
+        def scores() -> dict[str, Any] | None:
+            # those not sent yet, for the next chunk, if asked for
+            nonlocal given
+            if c.logprobs is None:
+                return None
+            new, given = c.scores[given:], len(c.scores)
+            return {"content": new}
+
         # what may yet be part of a tool call is held back; the reply is split once more when
         # done, the end that may have begun a marker then its own
         text, reasoned, sent, reply = c.opened, 0, 0, Reply()
@@ -942,27 +988,29 @@ class _Handler(BaseHTTPRequestHandler):
                 text += piece or ""
                 reply = split_reply(text, c.form, c.thinking, done=piece is None)
                 if len(reply.reasoning) > reasoned:
-                    self._chunk(c, {"reasoning_content": reply.reasoning[reasoned:]})
+                    delta = {"reasoning_content": reply.reasoning[reasoned:]}
+                    self._chunk(c, delta, logprobs=scores())
                     reasoned = len(reply.reasoning)
                 content = reply.content
                 if (end := tool_call_start(content) if c.tools else len(content)) > sent:
-                    self._chunk(c, {"content": content[sent:end]})
+                    self._chunk(c, {"content": content[sent:end]}, logprobs=scores())
                     sent = end
         except RuntimeError as e:
             return self._event({"error": {"message": str(e), "type": "server_error"}})
         reason = c.finish.reason
         content, calls = _calls(reply, c.tools, c.finish.reason)
         if len(content) > sent:
-            self._chunk(c, {"content": content[sent:]})
+            self._chunk(c, {"content": content[sent:]}, logprobs=scores())
         if calls:
             self._chunk(
                 c,
                 {"tool_calls": [{"index": i} | call for i, call in enumerate(_tool_calls(calls))]},
+                logprobs=scores(),
             )
             reason = _with_calls(reason)
         # the timings on the last chunk, as llama.cpp's server sends them
         timings = {"timings": _timings(c)}
-        self._chunk(c, {}, reason, {} if c.stream_usage else timings)
+        self._chunk(c, {}, reason, {} if c.stream_usage else timings, scores())
         if c.stream_usage:
             usage = {"choices": [], "usage": _usage(c)} | timings
             self._event(self._head(c, "chat.completion.chunk") | usage)
@@ -1003,9 +1051,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _chunk(
         self, c: _Completion, delta: dict[str, Any], reason: str | None = None,
-        extra: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None, logprobs: dict[str, Any] | None = None,
     ) -> None:  # fmt: skip
-        choice = {"index": 0, "delta": delta, "logprobs": None, "finish_reason": reason}
+        choice = {"index": 0, "delta": delta, "logprobs": logprobs, "finish_reason": reason}
         self._event(self._head(c, "chat.completion.chunk") | {"choices": [choice]} | (extra or {}))
 
     def _event(self, data: dict[str, Any] | str) -> None:
@@ -1092,6 +1140,10 @@ def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completio
     prompt = loaded.chat.tokens(text, [image.tokens for image in shown])
     if len(prompt) >= (context := loaded.engine.max_context):
         raise ValueError(f"the prompt has {len(prompt)} tokens, too many for {context} of context")
+    if body.get("logprobs") is not None and not isinstance(body["logprobs"], bool):
+        raise ValueError("logprobs of a chat completion must be true or false")
+    if body.get("top_logprobs") and not body.get("logprobs"):
+        raise ValueError("top_logprobs needs logprobs to be true")
     grammar, preamble = _format(body.get("response_format"), loaded, text)
     if grammar is not None and tools:
         raise ValueError("response_format of JSON with tools is not supported yet: give either")
@@ -1118,6 +1170,7 @@ def _completion(body: Any, server: Server, loaded: _Loaded | None) -> _Completio
         grammar=grammar,
         preamble=preamble,
         background=body.get("service_tier") == "flex",
+        logprobs=(body.get("top_logprobs") or 0) if body.get("logprobs") else None,
     )
 
 
@@ -1127,6 +1180,8 @@ def _text_completion(body: Any, server: Server, loaded: _Loaded | None) -> _Comp
     # given a suffix, the text between, after the prompt and the suffix in the model's
     # fill-in-the-middle tokens, as llama.cpp's /infill puts them, neither's text a token's
     _valid(body, "completion", "prompt")
+    if isinstance(body.get("logprobs"), bool):
+        raise ValueError(f"logprobs of a text completion must be a count from 0 to {TOP_LOGPROBS}")
     if loaded is None:
         raise ValueError("no model is loaded")
     tok, prompt, suffix = loaded.engine.tokenizer, body["prompt"], body.get("suffix")
@@ -1162,7 +1217,20 @@ def _text_completion(body: Any, server: Server, loaded: _Loaded | None) -> _Comp
         background=body.get("service_tier") == "flex",
         text=True,
         id=f"cmpl-{uuid.uuid4().hex}",
+        logprobs=body.get("logprobs"),
     )
+
+
+def _text_scores(scores: list[dict[str, Any]], at: int) -> dict[str, Any]:
+    # tokens' log-probabilities as OpenAI's text completions give them, of the likeliest tokens
+    # too, by their text; the first token's text at `at` in the reply's
+    offsets = itertools.accumulate((len(s["token"]) for s in scores), initial=at)
+    return {
+        "tokens": [s["token"] for s in scores],
+        "token_logprobs": [s["logprob"] for s in scores],
+        "top_logprobs": [{t["token"]: t["logprob"] for t in s["top_logprobs"]} for s in scores],
+        "text_offset": list(offsets)[:-1],
+    }
 
 
 def _format(

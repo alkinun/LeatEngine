@@ -49,8 +49,8 @@ placeholder when authentication is disabled). The client library is not a runtim
 
 Supported controls include `messages`, `stream`, `stream_options.include_usage`, `max_tokens`
 or `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`,
-`seed`, `stop`, `tools`, `tool_choice` (`auto` or `none`), and `response_format`. Templates
-determine which message roles and tool formats a model understands.
+`seed`, `stop`, `tools`, `tool_choice` (`auto` or `none`), `response_format`, `logprobs`, and
+`top_logprobs`. Templates determine which message roles and tool formats a model understands.
 
 - Streaming uses Server-Sent Events: JSON `data:` records followed by `data: [DONE]` on success.
   Disconnecting cancels the completion and releases its slot.
@@ -71,6 +71,13 @@ determine which message roles and tool formats a model understands.
   ignored. Properties come in the schema's order. A reasoning model reasons first, freely, as its
   template opens or allows it. A reply cut off by `max_tokens` holds JSON cut short. A request
   may not yet give both `tools` and a JSON `response_format`.
+- `logprobs: true` gives each token's log-probability, and `top_logprobs` those of up to 20 of
+  the likeliest tokens, in `choices[].logprobs.content`, streamed with the chunks: of the model's
+  distribution as its logits give it, before temperature, the other sampling controls and a
+  response format, as llama.cpp's and vLLM's servers give them by default. Every generated token
+  has one, the reasoning's too, but an end of generation. A completion that asks for them never
+  decodes speculatively, and each of its steps runs one more small graph, for the
+  log-probabilities alone.
 - Image content parts accept `image_url` with base64 `data:` URLs. Remote image URLs are not
   fetched. Supply `--mmproj` or a recognized projector beside the model.
 - `service_tier: "flex"` schedules a completion behind foreground requests.
@@ -81,8 +88,8 @@ determine which message roles and tool formats a model understands.
 - Replies include usage and a `timings` extension. Cached token counts appear in
   `usage.prompt_tokens_details.cached_tokens`; streamed usage requires `include_usage`.
 
-This is not a complete OpenAI implementation: multiple choices, log probabilities, logit
-biases, and frequency or repetition penalties are unsupported. Responses, audio, file-storage,
+This is not a complete OpenAI implementation: multiple choices, logit biases, and frequency or
+repetition penalties are unsupported. Responses, audio, file-storage,
 and tool-execution endpoints are not implemented.
 A prompt must fit the configured context; clients manage conversation history.
 
@@ -95,13 +102,15 @@ one string; or a list of token IDs. `max_tokens` defaults to 16, as OpenAI's doe
 
 With `suffix`, the reply fills in the middle, as code-completion clients ask: the prompt and the
 suffix go between the model's fill-in-the-middle tokens, `[FIM_PRE]prompt[FIM_SUF]suffix[FIM_MID]`,
-in llama.cpp's default order, neither's text read as tokens. The tokens are those GGUF metadata names, else those of the texts
-llama.cpp knows, such as Qwen's `<|fim_prefix|>`; a model without them refuses a suffix. Unlike
-llama.cpp's `/infill`, no repository header or other files are added and nothing is cut: the
-prompt must fit the context.
+in llama.cpp's default order, neither's text read as tokens. The tokens are those GGUF metadata
+names, else those of the texts llama.cpp knows, such as Qwen's `<|fim_prefix|>`; a model without
+them refuses a suffix. Unlike llama.cpp's `/infill`, no repository header or other files are added
+and nothing is cut: the prompt must fit the context.
 
-Sampling controls, `stop`, `seed`, `stream`, and `stream_options` work as for chat completions;
-`echo`, `best_of`, and `logprobs` are not supported.
+Sampling controls, `stop`, `seed`, `stream`, and `stream_options` work as for chat completions.
+`logprobs` is a count of the likeliest tokens, 0 to 20, whose log-probabilities come with each
+token's, as OpenAI's text completions give them: `tokens`, `token_logprobs`, `top_logprobs` by
+token text, and `text_offset`. `echo` and `best_of` are not supported.
 
 ## Embeddings
 

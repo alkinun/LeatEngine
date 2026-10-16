@@ -232,6 +232,7 @@ class Tokenizer:
 
         # the bytes each token decodes to, of control tokens none
         self.pieces = [_spell(t, ty, self._byte_level) for t, ty in zip(tokens, types, strict=True)]
+        self._texts = tokens
         # tokens special text spells, as llama.cpp's: <unk> too, which plain text never matches
         special = {
             t: i for i, t in enumerate(tokens) if types[i] in (CONTROL, USER_DEFINED, UNKNOWN)
@@ -280,6 +281,11 @@ class Tokenizer:
         if pieces and ids[0] != self.bos_id:
             pieces[0] = self._lstrip(pieces[0])
         return b"".join(pieces).decode("utf-8", errors="replace")
+
+    def spelled(self, i: int) -> bytes:
+        """A token's bytes, as its text decodes them, or of a control token, its own text's, as
+        a reply's log-probabilities show it."""
+        return self.pieces[i] or self._texts[i].encode()
 
     def stream(self) -> Callable[[int | None], str]:
         """Returns a decoder that maps one id at a time to the text it completes. None ends the

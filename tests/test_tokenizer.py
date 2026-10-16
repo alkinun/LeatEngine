@@ -86,6 +86,9 @@ def test_reply_markers_decode_as_text():
     marked = tok.encode("<|tool_call_start|>ab<|tool_call_end|><|eot|>", bos=False, special=True)
     assert tok.decode(marked) == "<|tool_call_start|>ab<|tool_call_end|>"
     assert ids(tok, "<|channel|>")[0] in tok.special_ids  # still no text a penalty lowers
+    # a token as log-probabilities show it: its text's bytes, or a control token's own text's
+    assert [tok.spelled(i) for i in marked] == [b"<|tool_call_start|>", b"ab", b"<|tool_call_end|>",
+                                                 b"<|eot|>"]  # fmt: skip
 
 
 def test_sentencepiece_bytes_it_lacks():

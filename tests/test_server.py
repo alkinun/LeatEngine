@@ -347,6 +347,50 @@ def test_text_completion_prompts(server, engine, monkeypatch):
     assert asked(prompt=[3], suffix="") == [6, 7, 3, 8, 9]
 
 
+def check_scores(tokens: list[str], chosen: list[float], likeliest: list[list]) -> None:
+    # the log-probabilities of 6 greedy tokens: each token the likeliest, the likeliest in order
+    assert len(tokens) == len(chosen) == len(likeliest) == 6
+    for token, logprob, top in zip(tokens, chosen, likeliest, strict=True):
+        assert len(top) == 3 and top[0] == (token, logprob) and logprob <= 0
+        assert [v for _, v in top] == sorted((v for _, v in top), reverse=True)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_logprobs(client, stream):
+    # each token's log-probability and the 3 likeliest tokens', of a chat whole or streamed
+    response = chat(client, "hello", max_tokens=6, temperature=0, logprobs=True, top_logprobs=3,
+                    stream=stream)  # fmt: skip
+    if stream:
+        choices = [chunk.choices[0] for chunk in response if chunk.choices]
+        scores = [e for c in choices if c.logprobs for e in c.logprobs.content]
+        text = "".join(c.delta.content or "" for c in choices)
+    else:
+        scores, text = response.choices[0].logprobs.content, response.choices[0].message.content
+    # the tokens' bytes the reply's, but for the space SentencePiece puts before the first
+    spelled = b"".join(bytes(e.bytes) for e in scores).decode(errors="replace")
+    assert spelled in (text, " " + text)
+    likeliest = [[(t.token, t.logprob) for t in e.top_logprobs] for e in scores]
+    check_scores([e.token for e in scores], [e.logprob for e in scores], likeliest)
+    # none unless asked for
+    assert chat(client, "hello", max_tokens=2).choices[0].logprobs is None
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_text_logprobs(client, stream):
+    # as OpenAI's text completions give them: by token, each where its text is in the reply's
+    response = client.completions.create(
+        model="tiny", prompt="hello", max_tokens=6, temperature=0, logprobs=3, stream=stream
+    )
+    choices = [chunk.choices[0] for chunk in response] if stream else response.choices
+    tokens = [t for c in choices if c.logprobs for t in c.logprobs.tokens]
+    chosen = [v for c in choices if c.logprobs for v in c.logprobs.token_logprobs]
+    tops = [t for c in choices if c.logprobs for t in c.logprobs.top_logprobs]
+    offsets = [o for c in choices if c.logprobs for o in c.logprobs.text_offset]
+    assert offsets == [sum(map(len, tokens[:i])) for i in range(len(tokens))]
+    likeliest = [sorted(top.items(), key=lambda kv: -kv[1]) for top in tops]
+    check_scores(tokens, chosen, likeliest)
+
+
 def _asked(body: dict, server: Server) -> _Completion:
     # what a request asks for of the server's loaded model
     return _completion(body, server, server.loaded)
@@ -727,6 +771,11 @@ def test_text_is_not_a_tool_call(client, replies_with, stream, text, choice):
         ({"messages": [{"role": "assistant", "tool_calls": [{"id": "x"}]}]}, "each with its"),
         ({"tools": [{"function": "weather"}]}, "tools must be a list of objects, each"),
         ({"tools": [{"function": {"name": []}}]}, "tools must be a list of objects, each"),
+        # log-probabilities of a chat asked for as a text completion's, or of the likeliest
+        # tokens alone, or of too many
+        ({"logprobs": 2}, "logprobs of a chat completion must be true or false"),
+        ({"top_logprobs": 2}, "top_logprobs needs logprobs to be true"),
+        ({"logprobs": True, "top_logprobs": 21}, "top_logprobs must be an integer from 0 to 20"),
         # a response format of a type or schema it does not take, and one beside tools
         ({"response_format": {"type": "xml"}}, 'response_format must be {"type": "text"}'),
         ({"response_format": {"type": "json_schema"}}, 'response_format must be {"type": "text"}'),
@@ -753,7 +802,8 @@ def test_bad_request(client, kwargs, error):
         ({"prompt": "a", "suffix": 1}, "suffix must be a string"),
         ({"prompt": "a", "echo": True}, "echo=True is not supported"),
         ({"prompt": "a", "best_of": 2}, "best_of=2 is not supported"),
-        ({"prompt": "a", "logprobs": 2}, "logprobs=2 is not supported"),
+        ({"prompt": "a", "logprobs": True}, "logprobs of a text completion must be a count"),
+        ({"prompt": "a", "logprobs": 21}, "logprobs must be true or false, or of a text"),
     ],
 )
 def test_bad_text_completion(client, body, error):
@@ -1044,7 +1094,7 @@ def test_completion_rendered_as_a_load_begins(tiny_model, tmp_path, monkeypatch)
 
 def test_worker_error(client, monkeypatch):
     # a failure past the engine's step, a bug's, fails the completions rather than the worker
-    def fail(self, token):
+    def fail(self, token, score):
         monkeypatch.undo()
         raise KeyError("a bug")
 
