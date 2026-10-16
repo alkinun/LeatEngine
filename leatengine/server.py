@@ -1440,7 +1440,7 @@ def _format(
     with loaded.formats_lock:
         found = loaded.formats.setdefault(key, found)
         loaded.formats.move_to_end(key)
-        if len(loaded.formats) > _GRAMMARS:
+        while len(loaded.formats) > _GRAMMARS:
             loaded.formats.popitem(last=False)
     return found, preamble
 
