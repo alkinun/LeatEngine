@@ -9,7 +9,7 @@ import random
 import statistics
 import struct
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, cast
@@ -20,6 +20,8 @@ from leatengine.chat import ChatTemplate
 from leatengine.engine import BATCH, Engine, graph
 from leatengine.model import zeros
 from leatengine.sampler import GREEDY, Sampling
+
+SLICE = 1024  # positions whose log-probabilities a chunk's scoring holds at once
 
 
 @dataclass(frozen=True)
@@ -159,7 +161,7 @@ def perplexity(
     nll, score = 0.0, _scorer(engine, ctx, decode)
     for i in range(n):
         chunk = tokens[i * ctx : (i + 1) * ctx]
-        nll += _nll(score(chunk), chunk)
+        nll += sum(_nll(lp, chunk[at + 1 : at + 1 + len(lp)]) for at, lp in score(chunk))
     return Quality(math.exp(nll / (n * (ctx - 1 - ctx // 2))))
 
 
@@ -179,20 +181,19 @@ def kl_divergence(
         if vocab != engine.config.vocab_size:
             raise ValueError(f"{base} has a vocab of {vocab}, the model {engine.config.vocab_size}")
         tokens = list(memoryview(f.read(4 * ctx * n_chunks)).cast("i"))
-        first, row = ctx // 2, 2 * ((vocab + 1) // 2) + 4  # uint16s per position
+        row = 2 * ((vocab + 1) // 2) + 4  # uint16s per position
         nll, same, kls, score = 0.0, 0, list[float](), _scorer(engine, ctx, decode)
         for i in range(n_chunks if chunks is None else min(n_chunks, chunks)):
             chunk = tokens[i * ctx : (i + 1) * ctx]
-            lp = score(chunk)
-            stored = Tensor(f.read(2 * row * (ctx - 1 - first))).bitcast(dtypes.uint16)
-            stored = stored.reshape(-1, row)
-            scale, low = stored[:, :4].bitcast(dtypes.float32).chunk(2, dim=1)  # per position
-            ref = stored[:, 4 : 4 + vocab].float() * scale + low
-            # llama.cpp skips reference log-probs at or below -16, where its storage clamps
-            kl = (ref > -16).where(ref.exp() * (ref - lp), 0).sum(-1)
-            kls += cast(list[float], kl.tolist())
-            same += int((ref.argmax(-1) == lp.argmax(-1)).sum().item())
-            nll += _nll(lp, chunk)
+            for at, lp in score(chunk):  # the reference's of the same positions, as stored
+                stored = Tensor(f.read(2 * row * len(lp))).bitcast(dtypes.uint16).reshape(-1, row)
+                scale, low = stored[:, :4].bitcast(dtypes.float32).chunk(2, dim=1)  # per position
+                ref = stored[:, 4 : 4 + vocab].float() * scale + low
+                # llama.cpp skips reference log-probs at or below -16, where its storage clamps
+                kl = (ref > -16).where(ref.exp() * (ref - lp), 0).sum(-1)
+                kls += cast(list[float], kl.tolist())
+                same += int((ref.argmax(-1) == lp.argmax(-1)).sum().item())
+                nll += _nll(lp, chunk[at + 1 : at + 1 + len(lp)])
     kls.sort()
     n = len(kls)
     return Quality(math.exp(nll / n), sum(kls) / n, _percentile(kls, 0.99), kls[-1], same / n)
@@ -223,39 +224,52 @@ def _header(f: BinaryIO, base: Path) -> tuple[int, int, int]:
     return ctx, vocab, n_chunks
 
 
-def _scorer(engine: Engine, ctx: int, decode: bool) -> Callable[[list[int]], Tensor]:
-    # a chunk's log-probabilities at positions ctx/2 .. ctx-2, each predicting the next token,
-    # from graphs captured for the first chunk and replayed for the rest, whose log-probabilities
-    # each overwrite the last's. With decode, those positions run one token at a time, through
-    # the kernels generation uses.
+def _scorer(
+    engine: Engine, ctx: int, decode: bool
+) -> Callable[[list[int]], Iterator[tuple[int, Tensor]]]:  # fmt: skip
+    # a chunk's log-probabilities at positions ctx/2 .. ctx-2, each predicting the next token, a
+    # slice of SLICE positions at a time, each (position, log-probabilities of it and on), from
+    # graphs captured for the first chunk and replayed for the rest, whose slices each overwrite
+    # the last's: so that a chunk of 32k tokens of a vocab of 128k fits beside the model. With
+    # decode, those positions run one token at a time, through the kernels generation uses.
     first, model, tok = ctx // 2, engine.model, engine.tokenizer
 
     def tokens(chunk: list[int]) -> list[int]:
         return [tok.bos_id] + chunk[1:] if tok.add_bos and tok.bos_id is not None else chunk
 
     if not decode:  # in a graph, which plans its buffers: a plain call holds every layer's at once
-        score = graph(lambda t: model.logits(model(t, 0)[:, first : ctx - 1])[0].log_softmax(-1))
-        return lambda chunk: score(Tensor([tokens(chunk)], dtype=dtypes.int32))
-    rows = zeros(ctx - 1 - first, engine.config.vocab_size)
+        hidden = graph(lambda t: model(t, 0)[:, first : ctx - 1].contiguous().realize())
 
-    def step(token: Tensor, pos: UOp) -> None:
-        rows[pos - first : pos - first + 1].assign(
-            model.logits(model(token, pos))[0].log_softmax(-1)
-        )
+        def scored(chunk: list[int]) -> Iterator[tuple[int, Tensor]]:
+            states = hidden(Tensor([tokens(chunk)], dtype=dtypes.int32))
+            for at in range(first, ctx - 1, SLICE):
+                part = states[:, at - first : at - first + SLICE]
+                yield at, model.logits(part)[0].log_softmax(-1).realize()
+
+        return scored
+    rows = zeros(min(SLICE, ctx - 1 - first), engine.config.vocab_size)
+
+    def step(token: Tensor, pos: UOp, row: UOp) -> None:
+        rows[row : row + 1].assign(model.logits(model(token, pos))[0].log_softmax(-1))
         rows.realize()
 
+    prefill = graph(lambda t: model(t, 0).realize())
     jit, pos = TinyJit(step), UOp.variable("start_pos", 0, engine.max_context - 1)
+    row = UOp.variable("row", 0, int(rows.shape[0]) - 1)
 
-    def run(chunk: list[int]) -> Tensor:
+    def run(chunk: list[int]) -> Iterator[tuple[int, Tensor]]:
         ids = tokens(chunk)
-        model(Tensor([ids[:first]], dtype=dtypes.int32), 0).realize()
-        for i in range(first, ctx - 1):
-            jit(Tensor([[ids[i]]], dtype=dtypes.int32), pos.bind(i))
-        return rows
+        prefill(Tensor([ids[:first]], dtype=dtypes.int32))
+        for at in range(first, ctx - 1, SLICE):
+            end = min(at + SLICE, ctx - 1)
+            for i in range(at, end):
+                jit(Tensor([[ids[i]]], dtype=dtypes.int32), pos.bind(i), row.bind(i - at))
+            yield at, rows[: end - at]
 
     return run
 
 
-def _nll(logprobs: Tensor, chunk: list[int]) -> float:
-    targets = Tensor(chunk[len(chunk) // 2 + 1 :], dtype=dtypes.int32).unsqueeze(-1)
-    return -float(logprobs.gather(-1, targets).sum().item())
+def _nll(logprobs: Tensor, targets: list[int]) -> float:
+    # of each position's next token, which follows it
+    picked = logprobs.gather(-1, Tensor(targets, dtype=dtypes.int32).unsqueeze(-1))
+    return -float(picked.sum().item())

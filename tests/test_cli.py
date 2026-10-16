@@ -86,7 +86,9 @@ def test_bench_chat(tiny, tiny_assistant, capsys, sequences, sampled):
 
 @pytest.mark.usefixtures("reference_ops")
 @pytest.mark.parametrize("mode", [[], ["--decode"]])
-def test_perplexity(tiny_model, tmp_path, capsys, mode):
+def test_perplexity(tiny_model, tmp_path, capsys, monkeypatch, mode):
+    # of each chunk's second half, 7 positions, scored a slice of 3 at a time
+    monkeypatch.setattr(bench, "SLICE", 3)
     path, weights = tiny_model
     (text := tmp_path / "text.txt").write_text(TEXT)
     result = run_json(capsys, "perplexity", path, "--text", text, "--ctx", CTX, *mode)
@@ -103,7 +105,9 @@ def test_perplexity(tiny_model, tmp_path, capsys, mode):
 @pytest.mark.parametrize("mode", [[], ["--decode"]])
 @pytest.mark.parametrize("cache_type", ["f16", "q8_0"])
 def test_kl_divergence(tiny_model, tmp_path, capsys, monkeypatch, mode, cache_type):
-    # against the reference's logits, of keys and values rounded as the cache holds them
+    # against the reference's logits, of keys and values rounded as the cache holds them, a slice
+    # of 3 positions at a time
+    monkeypatch.setattr(bench, "SLICE", 3)
     if cache_type == "q8_0":
         monkeypatch.setattr("tests.helpers.cached", q8_0)
     mode = [*mode, "--cache-type", cache_type]
