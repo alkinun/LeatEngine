@@ -23,9 +23,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from leatengine.files import PART, model_name, projector
+
 DEFAULT_QUANT = "Q4_K_M"
 _NAME = re.compile(r"([\w.-]+)/([\w.-]+)(?::([\w.-]+))?")
-_PART = re.compile(r"(.+)-(\d{5})-of-(\d{5})\.gguf")
 # projectors by the precision llama.cpp's converter writes, the closest to the model's own first
 _PRECISIONS = ("f16", "bf16", "f32", "q8_0")
 _BLOCK = 8 << 20  # bytes read and hashed at a time
@@ -62,31 +63,31 @@ def local(models: Path, spec: str) -> Path | None:
     quantization, of a split one its first part; None if it names none pulled."""
     if (named := parse(spec)) is None or not (folder := directory(models, named[0])).is_dir():
         return None
-    files = [p for p in sorted(folder.glob("*.gguf")) if not _projector(p.name)]
+    files = [p for p in sorted(folder.glob("*.gguf")) if not projector(p)]
     chosen = _chosen([p.name for p in files], named[1])
     return folder / _first(chosen) if chosen else None
 
 
 def pull(
-    spec: str, models: Path, projector: bool = True, dry_run: bool = False,
+    spec: str, models: Path, mmproj: bool = True, dry_run: bool = False,
     say: Callable[[str], None] = print,
 ) -> Path:  # fmt: skip
     """Downloads a model, OWNER/NAME[:QUANT], into MODELS/OWNER/NAME/, its projector beside it if
-    the repository has one and `projector`, each file checked against its hash; the model's
+    the repository has one and `mmproj`, each file checked against its hash; the model's
     path, of a split one its first part's. Files already there are checked rather than
     downloaded again. Of a dry run, what it would download, said."""
     if (named := parse(spec)) is None:
         raise ValueError(f"{spec!r} is not OWNER/NAME or OWNER/NAME:QUANT")
     repo, quant = named
     files = {f.name: f for f in _listed(repo) if f.path.endswith(".gguf")}
-    models_found = [name for name in files if not _projector(name)]
+    models_found = [name for name in files if not projector(name)]
     chosen = _chosen(models_found, quant)
     if not chosen:
         quants = sorted({q for name in models_found if (q := _quant(name))})
         raise ValueError(f"{repo} has no GGUF of {quant or DEFAULT_QUANT}; it has "
                          f"{', '.join(quants) or 'none it names'}")  # fmt: skip
     wanted = [files[name] for name in chosen]
-    if projector and (best := _best_projector([n for n in files if _projector(n)])):
+    if mmproj and (best := _best_projector([n for n in files if projector(n)])):
         wanted.append(files[best])
     folder = directory(models, repo)
     if dry_run:
@@ -107,28 +108,22 @@ def _chosen(names: list[str], quant: str | None) -> list[str]:
     found = [name for name in names if word.search(name)]
     if quant is not None and not found and quant in names:  # a file's whole name
         found = [quant]
-    models = sorted({_whole(name) for name in found})
+    models = sorted({f"{model_name(name)}.gguf" for name in found})
     if len(models) > 1:
         raise ValueError(f"{quant or DEFAULT_QUANT} names more than one model: "
                          f"{', '.join(models)}; give the file's name as QUANT")  # fmt: skip
     for name in found:
-        if parts := _PART.fullmatch(name):
+        if parts := PART.fullmatch(name):
             count = int(parts[3])
-            have = {int(p[2]) for n in found if (p := _PART.fullmatch(n))}
+            have = {int(p[2]) for n in found if (p := PART.fullmatch(n))}
             if have != set(range(1, count + 1)):
                 raise ValueError(f"{name}: a split GGUF of {count} parts lacks some")
             break
     return sorted(found)
 
 
-def _whole(name: str) -> str:
-    # a model file's name, of a split one's part the name of the whole
-    parts = _PART.fullmatch(name)
-    return f"{parts[1]}.gguf" if parts else name
-
-
 def _first(chosen: list[str]) -> str:
-    return next((n for n in chosen if (p := _PART.fullmatch(n)) and int(p[2]) == 1), chosen[0])
+    return next((n for n in chosen if (p := PART.fullmatch(n)) and int(p[2]) == 1), chosen[0])
 
 
 def _quant(name: str) -> str | None:
@@ -136,10 +131,6 @@ def _quant(name: str) -> str | None:
     match = re.search(r"[-_.]((?:UD-)?(?:I?Q\d\w*|[BF]F?\d+|MXFP4))(?:-\d{5}-of-\d{5})?\.gguf$",
                       name, re.IGNORECASE)  # fmt: skip
     return match[1] if match else None
-
-
-def _projector(name: str) -> bool:
-    return "mmproj" in name.lower()
 
 
 def _best_projector(names: list[str]) -> str | None:

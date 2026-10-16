@@ -21,7 +21,7 @@ from tinygrad import Tensor, TinyJit, UOp, dtypes
 from leatengine import doctor, machine
 from leatengine.chat import ChatTemplate
 from leatengine.engine import BATCH, Engine, graph
-from leatengine.gguf import model_name
+from leatengine.files import model_name
 from leatengine.model import zeros
 from leatengine.sampler import GREEDY, Sampling
 

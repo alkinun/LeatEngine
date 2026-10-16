@@ -8,7 +8,6 @@ import io
 import math
 import mmap
 import os
-import re
 import struct
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -18,14 +17,13 @@ from typing import Any
 from tinygrad import Device, Tensor, dtypes
 from tinygrad.device import Buffer
 
+from leatengine.files import PART
 from leatengine.quant import BLOCK, NATIVE, GGMLType, QTensor
 
 # metadata value type -> struct format; 8 is a string, 9 an array
 _SCALAR = dict(enumerate("BbHhIif?")) | {10: "Q", 11: "q", 12: "d"}
 _STRING, _ARRAY = 8, 9
 CHUNK = 1 << 30  # bytes of adjacent tensors `load` reads into one buffer; a larger one has its own
-# a split GGUF's part, as gguf-split names it: its prefix, its number from 1, and their count
-_PART = re.compile(r"(.+)-(\d{5})-of-(\d{5})\.gguf")
 
 
 @dataclass(frozen=True)
@@ -85,7 +83,7 @@ class GGUF:
         metadata, tensors = _opened(path, 0)
         if (count := metadata.get("split.count", 1)) <= 1:
             return GGUF(path, metadata, tensors)
-        named = _PART.fullmatch(path.name)
+        named = PART.fullmatch(path.name)
         if named is None or int(named[3]) != count:
             raise ValueError(f"{path}: a part of a split GGUF of {count}, not named as one")
         if (number := metadata.get("split.no", 0)) != 0:
@@ -158,18 +156,6 @@ class GGUF:
                     out[t.name] = _view(data[t.offset - start : t.offset - start + t.nbytes], t)
                 loaded += size
         return loaded
-
-
-def model_name(path: Path) -> str:
-    """A model's name, as its file's stem, of a split GGUF's first part without its numbers."""
-    named = _PART.fullmatch(path.name)
-    return named[1] if named else path.stem
-
-
-def later_part(path: Path) -> bool:
-    """Whether a file is a part of a split GGUF after its first, which a model is not of its own."""
-    named = _PART.fullmatch(path.name)
-    return named is not None and int(named[2]) > 1
 
 
 def _opened(path: Path, part: int) -> tuple[dict[str, Any], dict[str, TensorInfo]]:

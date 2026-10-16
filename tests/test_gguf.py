@@ -6,6 +6,7 @@ import pytest
 from gguf.quants import dequantize
 
 from leatengine import gguf as reader
+from leatengine.files import later_part, model_name
 from leatengine.gguf import GGUF
 from leatengine.quant import GGMLType
 from tests.helpers import random_blocks, write_tiny_model
@@ -195,8 +196,8 @@ def test_split(tmp_path):
     a, b = one.load("CPU"), split.load("CPU")
     for name in a:
         assert (a[name].data.numpy() == b[name].data.numpy()).all(), name
-    assert [reader.model_name(f) for f in (whole, files[0], files[-1])] == ["m"] * 3
-    assert [reader.later_part(f) for f in files] == [False] + [True] * (len(files) - 1)
+    assert [model_name(f) for f in (whole, files[0], files[-1])] == ["m"] * 3
+    assert [later_part(f) for f in files] == [False] + [True] * (len(files) - 1)
     with pytest.raises(ValueError, match="part 2 of a split GGUF of .*: open the first"):
         GGUF.open(files[1])
     files[-1].unlink()

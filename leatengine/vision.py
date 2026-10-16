@@ -28,6 +28,7 @@ from PIL import ImageOps, UnidentifiedImageError
 from tinygrad import Tensor, dtypes
 
 from leatengine import kernels, ops
+from leatengine.files import projector
 from leatengine.gguf import GGUF
 from leatengine.quant import GGMLType, QTensor
 from leatengine.tokenizer import Tokenizer
@@ -609,11 +610,6 @@ def _fit(width: int, height: int, patch: int, pool: int, tokens: int) -> tuple[i
     elif w == 0:
         w, h = cell, min(height // width * cell, tokens * cell)
     return w, h
-
-
-def projector(path: Path) -> bool:
-    """Whether a GGUF is a projector, as llama.cpp's converters name them: mmproj-*.gguf."""
-    return "mmproj" in path.name.lower()
 
 
 def beside(model: Path) -> Path | None:

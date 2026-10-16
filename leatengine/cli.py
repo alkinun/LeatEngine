@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from leatengine import pull
 from leatengine.defaults import OPTIONS, Overrides
+from leatengine.files import later_part, model_name, projector
 from leatengine.keys import Keys
 from leatengine.pull import DEFAULT_QUANT
 
@@ -298,7 +299,6 @@ def _run(args: argparse.Namespace) -> None:
     from leatengine.chat import ChatTemplate, split_reply
     from leatengine.draft import own_drafter
     from leatengine.engine import Engine
-    from leatengine.gguf import model_name
     from leatengine.sampler import Sampling
     from leatengine.vision import Image, beside
 
@@ -447,9 +447,7 @@ def _serve(args: argparse.Namespace) -> None:
     from tinygrad import Device
 
     from leatengine.draft import mtp
-    from leatengine.gguf import model_name
     from leatengine.server import Server
-    from leatengine.vision import projector
 
     models = [f for p in args.models for f in (_found(p) if p.is_dir() else [p])]
     # each model's vision encoder and MTP layer, not models
@@ -492,7 +490,7 @@ def _serve(args: argparse.Namespace) -> None:
 def _found(directory: Path) -> list[Path]:
     # the GGUFs of a directory of models that run here, saying which do not, as drafters of other
     # engines' kinds beside a model
-    from leatengine.gguf import GGUF, later_part
+    from leatengine.gguf import GGUF
     from leatengine.model import supported
 
     found = []
@@ -557,7 +555,7 @@ def _bench(args: argparse.Namespace) -> None:
     from leatengine import bench
     from leatengine.defaults import recommended
     from leatengine.engine import Engine
-    from leatengine.gguf import GGUF, model_name
+    from leatengine.gguf import GGUF
     from leatengine.model import Config
     from leatengine.sampler import GREEDY, Sampling
 
@@ -609,7 +607,6 @@ def _bench(args: argparse.Namespace) -> None:
 def _perplexity(args: argparse.Namespace) -> None:
     from leatengine import bench
     from leatengine.engine import Engine
-    from leatengine.gguf import model_name
 
     ctx = bench.base_chunk(args.kl_base) if args.kl_base else args.ctx
     # a chunk in one run

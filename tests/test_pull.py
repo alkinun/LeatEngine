@@ -135,7 +135,7 @@ def test_pull(hub, repo, tmp_path):
     pull.pull("owner/repo", models, say=said.append)
     assert not [r for r in hub.requests if r[0] == "storage"]
     # another quantization by its word, or a file by its whole name, without its projector
-    assert pull.pull("owner/repo:q8_0", models, projector=False) == folder / "tiny-Q8_0.gguf"
+    assert pull.pull("owner/repo:q8_0", models, mmproj=False) == folder / "tiny-Q8_0.gguf"
 
 
 def test_resume(hub, repo, tmp_path):
@@ -144,7 +144,7 @@ def test_resume(hub, repo, tmp_path):
     folder.mkdir(parents=True)
     data = repo["tiny-Q8_0.gguf"]
     (folder / "tiny-Q8_0.gguf.part").write_bytes(data[:77])
-    pull.pull("owner/repo:Q8_0", tmp_path / "models", projector=False)
+    pull.pull("owner/repo:Q8_0", tmp_path / "models", mmproj=False)
     ranges = [r[2].get("Range") for r in hub.requests if r[0] == "storage"]
     assert ranges == ["bytes=77-"] and (folder / "tiny-Q8_0.gguf").read_bytes() == data
     assert not (folder / "tiny-Q8_0.gguf.part").exists()
@@ -154,7 +154,7 @@ def test_checked(hub, tmp_path):
     # a file whose bytes are not those Hugging Face lists is not kept
     hub.broken.add("tiny-Q8_0.gguf")
     with pytest.raises(ValueError, match="tiny-Q8_0.gguf: downloaded, but not the file"):
-        pull.pull("owner/repo:Q8_0", tmp_path / "models", projector=False)
+        pull.pull("owner/repo:Q8_0", tmp_path / "models", mmproj=False)
     assert not list((tmp_path / "models/owner/repo").iterdir())
 
 
@@ -163,7 +163,7 @@ def test_git_files(repo, tmp_path, monkeypatch):
     hub = Hub(repo, lfs=False)
     monkeypatch.setenv("HF_ENDPOINT", hub.endpoint)
     try:
-        path = pull.pull("owner/repo:Q8_0", tmp_path / "models", projector=False)
+        path = pull.pull("owner/repo:Q8_0", tmp_path / "models", mmproj=False)
         assert path.read_bytes() == repo["tiny-Q8_0.gguf"]
     finally:
         hub.close()
@@ -172,7 +172,7 @@ def test_git_files(repo, tmp_path, monkeypatch):
 def test_token(hub, tmp_path, monkeypatch):
     # a token goes to Hugging Face, not to the storage it redirects to
     monkeypatch.setenv("HF_TOKEN", "hf_secret")
-    pull.pull("owner/repo:Q8_0", tmp_path / "models", projector=False)
+    pull.pull("owner/repo:Q8_0", tmp_path / "models", mmproj=False)
     sent = {(host, "Authorization" in headers) for host, _, headers in hub.requests}
     assert sent == {("hub", True), ("storage", False)}
 

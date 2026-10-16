@@ -50,7 +50,8 @@ from leatengine.chat import (
 from leatengine.defaults import OPTIONS, Overrides, recommended
 from leatengine.draft import own_drafter
 from leatengine.engine import TOP_LOGPROBS, Engine, Scored, Sequence
-from leatengine.gguf import GGUF, model_name
+from leatengine.files import model_name
+from leatengine.gguf import GGUF
 from leatengine.grammar import Grammar
 from leatengine.keys import Keys
 from leatengine.model import Config
