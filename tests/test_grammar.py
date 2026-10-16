@@ -4,7 +4,8 @@ import re
 
 import pytest
 
-from leatengine.grammar import Constraint, Grammar, Matcher, Tokens
+from leatengine import grammar
+from leatengine.grammar import STACKS, Constraint, Grammar, Matcher, Tokens
 
 # a schema of the kinds OpenAI's strict structured outputs take, as its SDK writes a Pydantic
 # model's: optional fields as anyOf with null, an enum, nested objects by $ref, and arrays
@@ -162,6 +163,8 @@ for _ in range(64):
     ({"type": "object", "required": "a"}, "a schema's required lists the names"),
     ({"type": "object", "properties": []}, "a schema's properties are an object of schemas"),
     (DEEP, "the schema nests deeper than 64 levels"),
+    ({"type": []}, "a schema's list of types names one at least"),
+    ({"$defs": [], "$ref": "#/$defs/a"}, "a schema's $defs is an object of schemas"),
     ({"$defs": {"a": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/b"}]},
                 "b": {"$ref": "#/$defs/a"}}, "$ref": "#/$defs/a"},
      "the schema refers to itself before a value of its own"),
@@ -229,3 +232,31 @@ def test_constraint():
         c.advance(END, b"")
         assert matcher.done(c.state)
     assert first.state == second.state and len(cache) == 6
+
+
+def test_states_bounded():
+    # of a schema of alike options nested, the ways a reply may go on would double with each
+    # array opened: STACKS at most are kept, the reply still matched
+    twice = {"anyOf": [{"type": "array", "items": {"$ref": "#/$defs/a"}}] * 2}
+    matcher = Matcher(Grammar({"$defs": {"a": twice}, "$ref": "#/$defs/a"}))
+    state = matcher.feed(matcher.start, b"[" * 12)
+    assert 0 < len(state) <= STACKS and takes(matcher, "[" * 12 + "]" * 12)
+    # an array's items counted as far as minItems and maxItems ask, so that one's states repeat
+    plain = Matcher(Grammar(None))
+    assert plain.feed(plain.start, b'{"a": [1, ') == plain.feed(plain.start, b'{"a": [1, 1, 1, ')
+    least = Matcher(Grammar({"type": "array", "items": {"type": "integer"}, "minItems": 2}))
+    assert least.feed(least.start, b"[1, ") != least.feed(least.start, b"[1, 1, ")
+    assert least.feed(least.start, b"[1, 1, ") == least.feed(least.start, b"[1, 1, 1, ")
+
+
+def test_masks_bounded(monkeypatch):
+    # a grammar's masks, of MASKS states at most, the last asked for kept
+    monkeypatch.setattr(grammar, "MASKS", 3)
+    matcher, tokens = Matcher(Grammar(None)), Tokens([*VOCAB, b""], set(), [END])
+    cache: dict = {}
+    c = Constraint(matcher, tokens, cache)
+    for token in (b'{"', b"a", b'":', b" ", b"1"):
+        c.mask()
+        c.advance(VOCAB.index(token), token)
+    c.mask()
+    assert len(cache) == 3 and list(cache)[-1] == c.state

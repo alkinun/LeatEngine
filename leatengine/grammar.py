@@ -30,6 +30,11 @@ from typing import Any
 INDENT = 20
 DIGITS = 16  # most digits of a number's integer part, and of its fraction
 NESTING = 64  # most levels a schema nests, well within Python's recursion
+# most ways a state's bytes may go on, of which more, as of a schema of alike options nested, would
+# grow it beyond bounds: those past it are dropped, any left of which matching the schema still
+STACKS = 64
+MASKS = 1024  # masks a cache of a grammar's keeps, the last asked for
+_UNSEEN: Any = object()  # a state's mask not in the cache
 # the keywords a schema may hold that hold nothing more of a value, which are ignored
 _NOTES = {"title", "description", "examples", "default", "$schema", "$id", "$comment",
           "deprecated", "readOnly", "writeOnly", "$defs", "definitions"}  # fmt: skip
@@ -148,6 +153,8 @@ class Grammar:
         if kinds is None:
             return self._any()
         if isinstance(kinds, list):
+            if not kinds:
+                raise ValueError("a schema's list of types names one at least")
             at = self._add(Node("anyOf"))
             options = tuple(self._compile(schema | {"type": kind}) for kind in kinds)
             self.nodes[at] = Node("anyOf", options=options)
@@ -205,7 +212,10 @@ class Grammar:
         if ref == "#":
             schema: Any = self._root
         elif m := re.fullmatch(r"#/(\$defs|definitions)/([^/]+)", ref):
-            schema = (self._root or {}).get(m.group(1), {}).get(m.group(2))
+            defined = (self._root or {}).get(m.group(1), {})
+            if not isinstance(defined, dict):
+                raise ValueError(f"a schema's {m.group(1)} is an object of schemas")
+            schema = defined.get(m.group(2))
             if schema is None:
                 raise ValueError(f"the schema's {ref} refers to no definition")
         else:
@@ -262,11 +272,14 @@ class Matcher:
             self.start = frozenset({root})
 
     def feed(self, state: State, data: bytes) -> State:
-        """The state after bytes, empty where they cannot go on."""
+        """The state after bytes, empty where they cannot go on; of STACKS ways at most, the
+        first of them in a fixed order."""
         for byte in data:
             state = frozenset(s for stack in state for s in self._step(stack, byte))
             if not state:
                 break
+            if len(state) > STACKS:
+                state = frozenset(sorted(state, key=repr)[:STACKS])
         return state
 
     def done(self, state: State) -> bool:
@@ -334,8 +347,10 @@ class Matcher:
         parent, below = rest[-1], rest[:-1]
         if parent[0] == "object":
             return [(*below, ("object", parent[1], parent[2], "after", 0, None))]
-        if parent[0] == "array":
-            return [(*below, ("array", parent[1], "after", 0, parent[4] + 1))]
+        if parent[0] == "array":  # its items counted as far as minItems and maxItems ask
+            node = self.grammar.nodes[parent[1]]
+            most = node.least if node.most is None else node.most
+            return [(*below, ("array", parent[1], "after", 0, min(parent[4] + 1, most)))]
         # the end of reasoning's block, or of the text before the answer: the JSON's value next
         return [rest]
 
@@ -550,18 +565,20 @@ def _common(a: bytes, b: bytes) -> int:
 class Constraint:
     """A sequence's constrained reply: its matcher's state, and which tokens it allows next."""
 
-    def __init__(
-        self, matcher: Matcher, tokens: Tokens, cache: dict[State, int | None] | None = None
-    ):
+    def __init__(self, matcher: Matcher, tokens: Tokens, cache: dict | None = None):
         self.matcher, self.tokens = matcher, tokens
         self.state = matcher.start
-        self._cache = {} if cache is None else cache  # masks by state, which constraints share
+        # masks by state, which constraints of a grammar share, MASKS of them, the last asked for
+        self._cache: dict[State, int | None] = {} if cache is None else cache
 
     def mask(self) -> int | None:
         """The tokens allowed next, a bit each; None where any token goes."""
-        if self.state not in self._cache:
-            self._cache[self.state] = self.tokens.allowed(self.matcher, self.state)
-        return self._cache[self.state]
+        if (mask := self._cache.pop(self.state, _UNSEEN)) is _UNSEEN:
+            mask = self.tokens.allowed(self.matcher, self.state)
+        self._cache[self.state] = mask  # last, as a dict keeps the order things go in
+        while len(self._cache) > MASKS:
+            del self._cache[next(iter(self._cache))]
+        return mask
 
     def advance(self, token: int, spelled: bytes) -> None:
         """Takes in a token generated, of these bytes."""
