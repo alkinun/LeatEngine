@@ -555,14 +555,14 @@ class Transformer:
     def copy(self, source: int | UOp, slot: int | UOp) -> None:
         """Copies the cache and recurrent states of slot `source` to slot `slot`."""
         # Whole slots, as tinygrad runs a copy of a bound number of positions on few threads: for
-        # Llama 3.1 8B on the 3090, 2130 positions took 12.3 ms, whole slots of 4096 3.1 ms.
-        copied = []
+        # Llama 3.1 8B on the 3090, 2130 positions took 12.3 ms, whole slots of 4096 3.1 ms. Each
+        # layer's in turn: tinygrad copies a buffer's part to another of its parts through a buffer
+        # of its own, which then serves each layer in turn, rather than all of a slot's at once.
         for cache in self.cache:
             if cache is not None:
-                copied.append(cache[:, slot : slot + 1].assign(cache[:, source : source + 1]))
-        for state in (state for states in self.states if states for state in states):
-            copied.append(state[slot : slot + 1].assign(state[source : source + 1]))
-        Tensor.realize(*copied)
+                cache[:, slot : slot + 1].assign(cache[:, source : source + 1]).realize()
+        if states := [state for states in self.states if states for state in states]:
+            Tensor.realize(*(s[slot : slot + 1].assign(s[source : source + 1]) for s in states))
 
     def holds(self, written: int, position: int) -> bool:
         """Whether a slot that ran the positions before `position`, and whose rings any run has
