@@ -193,7 +193,7 @@ def test_split(tmp_path):
         range(len(files)))  # fmt: skip
     assert split.metadata["tokenizer.ggml.tokens"] == one.metadata["tokenizer.ggml.tokens"]
     assert split.tensors.keys() == one.tensors.keys()
-    a, b = one.load("CPU"), split.load("CPU")
+    a, b = one.load(), split.load()
     for name in a:
         assert (a[name].data.numpy() == b[name].data.numpy()).all(), name
     assert [model_name(f) for f in (whole, files[0], files[-1])] == ["m"] * 3

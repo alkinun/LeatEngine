@@ -106,17 +106,15 @@ class GGUF:
             raise ValueError(f"{path}: its parts hold {len(tensors)} tensors of {expected}")
         return GGUF(path, metadata, tensors, tuple(parts))
 
-    def load(
-        self, device: str | None = None, names: Iterable[str] | None = None
-    ) -> dict[str, QTensor]:
-        """Copies the data of the tensors named, or of all, to `device` and returns a view per
+    def load(self, names: Iterable[str] | None = None) -> dict[str, QTensor]:
+        """Copies the data of the tensors named, or of all, to the device and returns a view per
         tensor. Tensors adjacent in the file share a buffer of up to CHUNK bytes, read through
         one host buffer, from a file that may be read-only, which the page cache then drops: a
         load takes little host memory beside the model's."""
         tensors = list(self.tensors.values()) if names is None else [self.tensors[n] for n in names]
         if not tensors:
             return {}
-        device = Device.canonicalize(device)
+        device = Device.DEFAULT
         alignment = self.metadata.get("general.alignment", 32)
         files = self.parts or (self.path,)
         runs = {i: _runs([t for t in tensors if t.part == i], alignment) for i in range(len(files))}

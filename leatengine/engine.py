@@ -100,7 +100,8 @@ class Engine:
 
     Several sequences generate at once, one per slot of the KV cache, which holds keys and values as
     `cache_type`, f16 or q8_0 (model.CACHE_TYPES): each step prefills a chunk of at most one prompt,
-    of SHARED_CHUNK tokens at most while others decode, and then decodes a token of every other
+    of SHARED_CHUNK tokens at most while others decode, but for an image, which runs whole, and then
+    decodes a token of every other
     sequence in one batch, which reads each weight once for all of them. On the reference ops a
     sequence generates as it would alone; the kernels for several tokens round differently from
     those for one, so a batched sequence may take another token where two are close. A sequence
@@ -749,7 +750,7 @@ class Engine:
         options = cast(list[Tensor], list(args[: 2 * n]))
         slots = cast(list[int | UOp], list(args[2 * n : 3 * n]))
         starts = cast(list[int | UOp], list(args[3 * n :]))
-        last = Tensor.cat(*(self._hidden[slot : slot + 1] for slot in slots)).reshape(1, n, -1)
+        last = _rows(self._hidden, slots).reshape(1, n, -1)
         drafted = self.drafter.draft(tokens, last, slots, starts, drafts)
         run = tokens.reshape(n, 1).cat(drafted, dim=1).reshape(1, n * ran)
         spans = [Span(slot, start, ran) for slot, start in zip(slots, starts, strict=True)]
@@ -781,7 +782,7 @@ class Engine:
         vocab = int(self._seen.shape[1])
         hot = Tensor.arange(vocab).reshape(1, 1, -1) == run.reshape(n, ran, 1)
         hot = (hot & self._text.reshape(1, 1, -1)).cast(dtypes.int32)
-        rows = [Tensor.cat(*(self._seen[slot : slot + 1] for slot in slots)) + hot[:, 0]]
+        rows = [_rows(self._seen, slots) + hot[:, 0]]
         for i in range(1, ran):
             rows.append(rows[-1] + hot[:, i])
         return Tensor.stack(*rows, dim=1).reshape(n * ran, vocab)
@@ -884,9 +885,9 @@ class Engine:
         hidden = self._followed(tokens, self.model.run(tokens, spans, live), spans)
         logits = self.model.logits(hidden).reshape(len(pairs), -1)
         positions = Tensor.stack(*(Tensor(start + 1) for _, start in pairs))
-        allowed = Tensor.cat(*(self._allowed[slot : slot + 1] for slot in slots))
-        prompted = Tensor.cat(*(self._prompted[slot : slot + 1] for slot in slots))
-        bias = Tensor.cat(*(self._bias[slot : slot + 1] for slot in slots))
+        allowed = _rows(self._allowed, slots)
+        prompted = _rows(self._prompted, slots)
+        bias = _rows(self._bias, slots)
         drawn = sample(logits, options, seed, positions, seen, allowed, prompted, bias)
         return drawn.realize(logits), logits
 
@@ -928,11 +929,11 @@ class Engine:
             return self._seen[:1].zeros_like()
         hot = Tensor.arange(self._seen.shape[1]).reshape(1, -1) == tokens.reshape(-1, 1)
         hot = (hot & self._text.reshape(1, -1)).cast(dtypes.int32)
-        seen = Tensor.cat(*(self._seen[slot : slot + 1] for slot in slots)) + hot
+        seen = _rows(self._seen, slots) + hot
         Tensor.realize(
             *(self._seen[s : s + 1].assign(seen[i : i + 1]) for i, s in enumerate(slots))
         )
-        return Tensor.cat(*(self._seen[slot : slot + 1] for slot in slots))
+        return _rows(self._seen, slots)
 
 
 def _scores(logits: Tensor, tokens: Tensor, top: int) -> Tensor:
@@ -948,6 +949,11 @@ def _scores(logits: Tensor, tokens: Tensor, top: int) -> Tensor:
         values.append(scores.gather(-1, best))
         scores = (index == best).where(-math.inf, scores)
     return Tensor.cat(*values, *(i.cast(dtypes.float32) for i in ids), dim=1).realize()
+
+
+def _rows(table: Tensor, slots: list[int | UOp] | list[UOp]) -> Tensor:
+    # each slot's row of a table of a row per slot, in turn
+    return Tensor.cat(*(table[slot : slot + 1] for slot in slots))
 
 
 def _copy_row(table: Tensor, row: int, data: bytearray) -> None:
