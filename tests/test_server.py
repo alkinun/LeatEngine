@@ -715,7 +715,7 @@ def test_response_text_format(client):
 
 @pytest.mark.parametrize("kwargs, error", [
     ({"previous_response_id": "resp_1"}, "previous_response_id is not supported"),
-    ({"tools": [{"type": "web_search"}]}, "tools must be a list of function tools"),
+    ({"tools": [{"type": "function"}]}, "tools must be a list of objects, each"),
     ({"input": [{"type": "item_reference", "id": "x"}]}, "items of type 'item_reference'"),
     # of the fields as a response's request names them
     ({"max_output_tokens": 0}, "max_output_tokens must be a positive integer"),
