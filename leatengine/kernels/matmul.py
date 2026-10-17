@@ -588,7 +588,8 @@ class _Q50Tile(_Q80Tile):
     """Q5_0 weights, unpacked to Q8_0's layout less 16: a block's 16 bytes hold values 0..15 in
     their low nibbles and 16..31 in their high ones, each with a fifth bit from its 32 high bits."""
 
-    words = 11
+    # halfwords per block, and the first of its nibbles and of its high bits; what values are less
+    words, nibbles, high, offset = 11, 3, 1, 16
 
     def fetch(self, stack: _Stack, step: UOp) -> list[UOp]:
         # for each of the thread's (row, block j, word k) of the step, a word of the block's
@@ -597,7 +598,10 @@ class _Q50Tile(_Q80Tile):
         for i in range(16):
             row, j, k = self.item(i)
             at, inside = base + self.words * j, self.inside(step, j)
-            words += [stack.word16(row, at + 3 + 2 * k, inside), stack.word16(row, at + 1, inside)]
+            words += [
+                stack.word16(row, at + self.nibbles + 2 * k, inside),
+                stack.word16(row, at + self.high, inside),
+            ]
         return words + self.scales(stack, step)
 
     def put_values(self, quants: UOp, words: list[UOp]) -> list[UOp]:
@@ -606,8 +610,8 @@ class _Q50Tile(_Q80Tile):
             (row, j, k), nibbles, high = self.item(i), words[2 * i], words[2 * i + 1]
             for h in range(2):  # values 4k.. of the block, then 16 + 4k..
                 fifth = fifth_bits((high >> (16 * h + 4 * k)) & 15)
-                q = ((nibbles >> (4 * h)) & 0x0F0F0F0F) | fifth
-                stores.append(quants[row, _swizzle(row, 8 * j + 4 * h + k)].store(minus(q, 16)))
+                q = _less(((nibbles >> (4 * h)) & 0x0F0F0F0F) | fifth, self.offset)
+                stores.append(quants[row, _swizzle(row, 8 * j + 4 * h + k)].store(q))
         return stores
 
 
@@ -628,12 +632,17 @@ def _signed_byte(word: UOp, shift: UOp) -> UOp:
     return byte.bitcast(dtypes.int8).cast(dtypes.int32)
 
 
+def _less(q: UOp, offset: int) -> UOp:
+    # each byte of a word less `offset`, as int8, as common.minus has it; or, of 0, as it is
+    return minus(q, offset) if offset else q.bitcast(dtypes.int32)
+
+
 class _Q40Tile(_Q80Tile):
     """Q4_0 weights, unpacked to Q8_0's layout less 8: a block's 16 bytes hold values 0..15 in
     their low nibbles and 16..31 in their high ones. IQ4_NL's, of the same layout, are indices into
     IQ4_VALUES instead."""
 
-    words = 9
+    words, nibbles, offset = 9, 1, 8  # as Q5_0's
 
     def fetch(self, stack: _Stack, step: UOp) -> list[UOp]:
         # for each of the thread's (row, block j, word k) of the step, a word of the block's
@@ -641,12 +650,13 @@ class _Q40Tile(_Q80Tile):
         words, base = [], step * 4 * self.words
         for i in range(16):
             row, j, k = self.item(i)
-            words.append(stack.word16(row, base + self.words * j + 1 + 2 * k, self.inside(step, j)))
+            at = base + self.words * j + self.nibbles + 2 * k
+            words.append(stack.word16(row, at, self.inside(step, j)))
         return words + self.scales(stack, step)
 
     def values(self, nibbles: UOp) -> list[UOp]:
         # the word's values of its low nibbles, then of its high ones, as int8
-        return [minus((nibbles >> (4 * h)) & 0x0F0F0F0F, 8) for h in range(2)]
+        return [_less((nibbles >> (4 * h)) & 0x0F0F0F0F, self.offset) for h in range(2)]
 
     def put_values(self, quants: UOp, words: list[UOp]) -> list[UOp]:
         # the thread's words of nibbles as their values
@@ -692,6 +702,50 @@ class _IQ4XSTile(_IQ4NLTile):
         return stores
 
 
+class _Mins(_Q80Tile):
+    """Of Q4_1 and Q5_1, whose weight is d * q + m: the values as they are, unsigned, and each
+    block's d and m as its two halfwords, a word, which tiles of 256 rows have room for in shared
+    memory where two f32 would not. m takes the sum of each group of 32 activations."""
+
+    offset = 0
+
+    def __init__(self, rows: int, tid: UOp, cols: int, grid: UOp):
+        self.rows, self.tid = rows, tid
+        self.blocks, self.ragged = cols // 32, cols % STEP != 0
+        self.quants = UOp.alloc((rows, 32), dtypes.int32, addrspace=AddrSpace.LOCAL)
+        self.d = UOp.alloc((4, rows), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+
+    def scales(self, stack: _Stack, step: UOp) -> list[UOp]:
+        # the d and m of the thread's row's 4 blocks of the step
+        at = step * 4 * self.words
+        return [stack.word16(self.tid, at + self.words * j, self.inside(step, j)) for j in range(4)]
+
+    def put(self, bufs: list[UOp], step: UOp, words: list[UOp]) -> list[UOp]:
+        quants, d = bufs
+        stores = self.put_values(quants, words[:-4])
+        return stores + [d[j, self.tid].store(word) for j, word in enumerate(words[-4:])]
+
+    @staticmethod
+    def scaled(
+        bufs: list[UOp], s: UOp, row: UOp, c: list[UOp], xd: UOp, xs: list[UOp], acc: UOp
+    ) -> UOp:  # fmt: skip
+        # c * d * xd + m * xs
+        dm = bufs[1][s, row].load()
+        return acc + c[0].float() * (f16(dm) * xd) + f16(dm >> 16) * xs[0]
+
+
+class _Q41Tile(_Mins, _Q40Tile):
+    """Q4_1 weights: Q4_0's nibbles, after d and m."""
+
+    words, nibbles = 10, 2
+
+
+class _Q51Tile(_Mins, _Q50Tile):
+    """Q5_1 weights: Q5_0's nibbles and high bits, after d and m."""
+
+    words, nibbles, high = 12, 4, 2
+
+
 class _MXFP4Tile(_Q80Tile):
     """MXFP4 weights, unpacked to Q8_0's layout: a block's nibbles index FP4_VALUES, doubled
     E2M1 as int8, its exponent byte e makes a scale 2^(e - 128). Blocks are only byte aligned: a
@@ -727,7 +781,8 @@ _TILES: dict[GGMLType, type[_Q4KTile] | type[_Q6KTile] | type[_Q80Tile]] = {
     GGMLType.Q2_K: _Q2KTile, GGMLType.Q3_K: _Q3KTile, GGMLType.Q4_K: _Q4KTile,
     GGMLType.Q5_K: _Q5KTile, GGMLType.Q6_K: _Q6KTile, GGMLType.Q5_0: _Q50Tile,
     GGMLType.Q8_0: _Q80Tile, GGMLType.MXFP4: _MXFP4Tile, GGMLType.Q4_0: _Q40Tile,
-    GGMLType.IQ4_NL: _IQ4NLTile, GGMLType.IQ4_XS: _IQ4XSTile,
+    GGMLType.Q4_1: _Q41Tile, GGMLType.Q5_1: _Q51Tile, GGMLType.IQ4_NL: _IQ4NLTile,
+    GGMLType.IQ4_XS: _IQ4XSTile,
     **{t: type(f"_{t.name}Tile", (_IQTile,), {"kind": t}) for t in IQ_FORMATS},
 }  # fmt: skip
 

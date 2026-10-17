@@ -214,8 +214,8 @@ LARGE_MODELS = {
         "unsloth/Qwen3.6-35B-A3B-GGUF UD-Q4_K_XL, blk.0 and blk.3", "qwen35moe", QWEN36_35B,
         (_qwen35moe(attention=False), _qwen35moe(attention=True)), "Q8_0",
     ),
-    # its dense first layer, a layer of experts whose down projections the tensor-core kernels
-    # do not take, and its MTP layer
+    # its dense first layer, a layer of experts whose down projections are Q5_1, as 16 of its 46
+    # layers of experts' are, and its MTP layer
     "glm-4.5-air-ud-q4_k_xl": LargeModel(
         "unsloth/GLM-4.5-Air-GGUF UD-Q4_K_XL, blk.0, blk.1 and blk.46", "glm4moe",
         GLM45_AIR | {"nextn_predict_layers": 1}, (

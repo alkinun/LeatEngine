@@ -20,11 +20,9 @@ matrix_cores = pytest.mark.skipif(not MATRIX_CORES, reason="tensor-core kernels 
 Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q5_0, Q8_0, MXFP4 = (
     GGMLType[t] for t in ("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q5_0", "Q8_0", "MXFP4")
 )
-# the matrix-vector kernels' other types
+# the kernels' other types
 IQ = [GGMLType[t] for t in ("IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S")]
 OTHER = [GGMLType[t] for t in ("Q4_0", "Q4_1", "Q5_1", "IQ4_NL", "IQ4_XS", "Q2_K", "Q3_K")] + IQ
-# of those, the tensor cores' too
-TILED = [GGMLType[t] for t in ("Q4_0", "IQ4_NL", "IQ4_XS", "Q2_K", "Q3_K")] + IQ
 
 
 def quantize_q8(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -160,7 +158,7 @@ def test_swiglu(ggml_type, kind, tokens):
 SHORT = [5, UOp.variable("tokens", 1, 16).bind(11)]
 
 
-@pytest.mark.parametrize("ggml_type", [Q4_K, Q5_K, Q6_K, Q8_0, *TILED])
+@pytest.mark.parametrize("ggml_type", [Q4_K, Q5_K, Q6_K, Q8_0, *OTHER])
 @pytest.mark.parametrize("tokens", [64, 100, UOp.variable("tokens", 1, 128).bind(70), *SHORT])
 # tiles of 128 and 256 rows, and of 96, gpt-oss's 2880 rows, which 128 do not divide
 @pytest.mark.parametrize("shape", [(256, 2048), (4096, 512), (2880, 512)])
@@ -180,7 +178,7 @@ def test_matmul(ggml_type, tokens, shape):
 
 
 # rows of whole blocks of 32 but not whole steps of 128, as Gemma 4's of 704 and 2112 weights
-@pytest.mark.parametrize("ggml_type", [Q5_0, Q8_0, MXFP4, *TILED[:2]])
+@pytest.mark.parametrize("ggml_type", [Q5_0, Q8_0, MXFP4, *OTHER[:4]])
 @pytest.mark.parametrize("tokens", [64, UOp.variable("tokens", 1, 128).bind(70), SHORT[1]])
 @pytest.mark.parametrize("shape", [(256, 704), (128, 2112), (4096, 512)])
 @matrix_cores
@@ -326,7 +324,15 @@ def expected_mixture(normed: np.ndarray, scores: np.ndarray, used: int, expert) 
 )
 @pytest.mark.parametrize("favored", [0, 3])
 # gate and up's types, and down's
-@pytest.mark.parametrize("types", [(Q4_K, Q6_K), (Q2_K, Q3_K), (GGMLType.IQ2_XXS, GGMLType.IQ3_S)])
+@pytest.mark.parametrize(
+    "types",
+    [
+        (Q4_K, Q6_K),
+        (Q2_K, Q3_K),
+        (GGMLType.IQ2_XXS, GGMLType.IQ3_S),
+        (GGMLType.Q4_1, GGMLType.Q5_1),
+    ],
+)
 def test_mixture(tokens, favored, types):
     rng = np.random.default_rng(15)
     experts, used, dim, hidden = 32, 4, 512, 768
