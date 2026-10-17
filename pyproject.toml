@@ -62,7 +62,7 @@ addopts = "-ra --strict-markers --strict-config"
 markers = [
   "gpu: needs a GPU backend (DEV=NV, CUDA, AMD or MOCK+AMD)",
   "model: needs a real GGUF model (LEATENGINE_MODEL=path.gguf)",
-  "hero: the hero models' layers at their real sizes, gigabytes each; run with -m hero",
+  "large: large models' layers at their real sizes, gigabytes each; run with -m large",
 ]
 
 [tool.coverage.run]

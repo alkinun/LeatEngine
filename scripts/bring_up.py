@@ -12,7 +12,7 @@ first step that fails, and says what to do.
 4. the memory ceiling: the largest model, or --ceiling, served at the context it fits to memory
    and answering a chat, while GTT and VRAM are watched;
 5. agreement and speed, as validate_hardware.py measures them, of the small model and then of
-   each other model, the hero models; and the server answering a chat of the small model.
+   each other, the large ones; and the server answering a chat of the small model.
 
 DEV picks the device, AMD by default. Elsewhere, on NV or the emulator's MOCK+AMD, doctor's
 verdict and the arch are recorded but not checked, and the ceiling, an APU's, is skipped; without
@@ -54,7 +54,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
         "models", nargs="*", type=Path,
-        help="GGUF files: a small model that fits easily first, then the hero models",
+        help="GGUF files: a small model that fits easily first, then large ones",
     )  # fmt: skip
     parser.add_argument("--llama-cpp", type=Path, nargs="+", default=[], help="llama.cpp builds")
     parser.add_argument("--wikitext", type=Path, help="wikitext-2's wiki.test.raw")

@@ -1,4 +1,4 @@
-# The hero models' layers, for tests at their real shapes: of each, its metadata and the tensors
+# Large models' layers, for tests at their real shapes: of each, its metadata and the tensors
 # of a layer or two, of the shapes and types the GGUF named holds (read from its header), with
 # random weights and the tiny tokenizer's vocab.
 #
@@ -34,7 +34,7 @@ Tensors = dict[str, tuple[str, tuple[int, ...]]]  # by name: type and shape, as 
 
 
 @dataclass(frozen=True)
-class Hero:
+class LargeModel:
     source: str  # the GGUF of the shapes and types: its repository, quantization and layers
     arch: str
     metadata: dict[str, Any]  # the architecture's, without its prefix, but the count of layers
@@ -133,47 +133,48 @@ QWEN36_35B = {
     "ssm.conv_kernel": 4, "ssm.state_size": 128, "ssm.group_count": 16,
     "ssm.time_step_rank": 32, "ssm.inner_size": 4096, "full_attention_interval": 2,
 }  # fmt: skip
-HEROES = {
+LARGE_MODELS = {
     # a layer of each kind: of the sliding window and of all positions
     **{
-        f"gpt-oss-120b-{kind}": Hero(
+        f"gpt-oss-120b-{kind}": LargeModel(
             f"ggml-org/gpt-oss-120b-GGUF MXFP4, {layer}", "gpt-oss",
             GPT_OSS | {"attention.sliding_window_pattern": [kind == "sliding"]}, (_gpt_oss(),),
             "Q8_0",
         )
         for kind, layer in (("sliding", "blk.0"), ("full", "blk.1"))
     },
-    "qwen3-235b-q2_k": Hero(
+    "qwen3-235b-q2_k": LargeModel(
         "unsloth/Qwen3-235B-A22B-Instruct-2507-GGUF UD-Q2_K_XL, blk.0", "qwen3moe", QWEN3_235B,
         (_qwen3moe("Q4_K", "Q4_K", "Q4_K", "Q4_K", "Q2_K", "Q3_K"),), "Q6_K",
     ),
-    "qwen3-235b-iq2_xxs": Hero(
+    "qwen3-235b-iq2_xxs": LargeModel(
         "bartowski/Qwen_Qwen3-235B-A22B-Instruct-2507-GGUF IQ2_XS, blk.11", "qwen3moe",
         QWEN3_235B, (_qwen3moe("IQ2_XS", "Q4_K", "Q4_K", "Q4_K", "IQ2_XXS", "IQ2_XXS"),), "Q5_K",
     ),
-    "qwen3-235b-iq3_xxs": Hero(
+    "qwen3-235b-iq3_xxs": LargeModel(
         "bartowski/Qwen_Qwen3-235B-A22B-Instruct-2507-GGUF IQ3_XXS, blk.0", "qwen3moe",
         QWEN3_235B, (_qwen3moe("IQ2_S", "Q8_0", "Q4_K", "Q5_K", "IQ3_XXS", "IQ3_S"),), "Q5_K",
     ),
-    "qwen3.6-35b-a3b": Hero(
+    "qwen3.6-35b-a3b": LargeModel(
         "unsloth/Qwen3.6-35B-A3B-GGUF UD-Q4_K_XL, blk.0 and blk.3", "qwen35moe", QWEN36_35B,
         (_qwen35moe(attention=False), _qwen35moe(attention=True)), "Q8_0",
     ),
 }  # fmt: skip
 
 
-def write_hero(path: Path, hero: Hero) -> None:
-    """A GGUF of a hero's layers, its tensors written one at a time, as some take gigabytes."""
+def write_layers(path: Path, large: LargeModel) -> None:
+    """A GGUF of a large model's layers, its tensors written one at a time, as some take
+    gigabytes."""
     rng = np.random.default_rng(0)
-    dim = hero.metadata["embedding_length"]
+    dim = large.metadata["embedding_length"]
     tensors: Tensors = {"token_embd.weight": ("F32", (V, dim)),
-                        "output.weight": (hero.output, (V, dim)),
+                        "output.weight": (large.output, (V, dim)),
                         "output_norm.weight": ("F32", (dim,))}  # fmt: skip
-    for i, layer in enumerate(hero.layers):
+    for i, layer in enumerate(large.layers):
         tensors |= {f"blk.{i}.{name}": spec for name, spec in layer.items()}
-    w = gguf.GGUFWriter(path, arch=hero.arch)
-    for key, value in ({"block_count": len(hero.layers)} | hero.metadata).items():
-        key = f"{hero.arch}.{key}"
+    w = gguf.GGUFWriter(path, arch=large.arch)
+    for key, value in ({"block_count": len(large.layers)} | large.metadata).items():
+        key = f"{large.arch}.{key}"
         if isinstance(value, list):
             w.add_array(key, value)
         elif isinstance(value, str):
@@ -203,7 +204,7 @@ def write_hero(path: Path, hero: Hero) -> None:
             noise = rng.standard_normal(shape) * 0.5
             w.write_tensor_data((directions[np.arange(V) % GROUPS] + noise).astype(np.float32))
         elif name.endswith("ffn_gate_inp.weight"):
-            used = hero.metadata["expert_used_count"]
+            used = large.metadata["expert_used_count"]
             w.write_tensor_data(_router(shape[0], used, units, rng))
         else:
             w.write_tensor_data(_values(name, shape, rng).astype(np.float32))
@@ -264,8 +265,9 @@ def logits(model: Transformer, tokens: list[int], start: int | UOp = 0) -> np.nd
 
 
 def main() -> None:
-    # python -m tests.heroes MODEL OUT CONTEXT TOKEN...: a prompt's logits, of the device DEV
-    # names, saved to OUT, as test_heroes has the reference ops' of the CPU, in a process apart.
+    # python -m tests.large_models MODEL OUT CONTEXT TOKEN...: a prompt's logits, of the device
+    # DEV names, saved to OUT, as test_large_models has the reference ops' of the CPU, in a
+    # process apart.
     # The prompt goes in chunks of fewer pairs of tokens and experts than there are experts, of
     # which the reference ops then read only those taken, rather than every one; and of few enough
     # that the experts taken, which they decode whole to f32, take 2 GiB at most.

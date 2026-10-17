@@ -47,17 +47,17 @@ def _collect(request):
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     # GPU and real-model tests are opt-in so the default run stays hermetic and runs on any CPU.
-    # The hero models' layers take gigabytes and minutes each: only when -m selects them.
+    # Large models' layers take gigabytes and minutes each: only when -m selects them.
     has_gpu = os.environ.get("DEV", "").split(":")[0] in GPU_BACKENDS
     has_model = bool(os.environ.get("LEATENGINE_MODEL"))
-    heroes = "hero" in config.option.markexpr
+    large = "large" in config.option.markexpr
     for item in items:
         if "gpu" in item.keywords and not has_gpu:
             item.add_marker(pytest.mark.skip(reason="needs DEV=NV, CUDA, AMD or MOCK+AMD"))
         if "model" in item.keywords and not has_model:
             item.add_marker(pytest.mark.skip(reason="needs LEATENGINE_MODEL=path.gguf"))
-        if "hero" in item.keywords and not heroes:
-            item.add_marker(pytest.mark.skip(reason="takes gigabytes: select it with -m hero"))
+        if "large" in item.keywords and not large:
+            item.add_marker(pytest.mark.skip(reason="takes gigabytes: select it with -m large"))
 
 
 @pytest.fixture

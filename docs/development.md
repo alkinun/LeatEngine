@@ -45,16 +45,16 @@ other tests load another: with a model over half the GPU's memory, run the test 
 time. The logits comparison skips architectures without an agreement limit in
 `tests/test_model.py`, whose comments record the measurements behind each limit.
 
-The hero models, the large models LeatEngine aims to run fastest on Strix Halo, have tests of their
-layers at full size: `tests/heroes.py` lists, from each GGUF's header, the shapes and types of a
-layer or two of gpt-oss 120B, of Qwen3 235B A22B at three low-bit quantizations, and of Qwen3.6 35B
-A3B, every expert included, and writes them with random weights. The kernels prefill and decode a
+Large models that a 128 GB Strix Halo runs have tests of their layers at full size:
+`tests/large_models.py` lists, from each GGUF's header, the shapes and types of a layer or two of
+gpt-oss 120B, of Qwen3 235B A22B at three low-bit quantizations, and of Qwen3.6 35B A3B, every
+expert included, and writes them with random weights. The kernels prefill and decode a
 prompt through each, against the reference ops on the CPU. They take up to 1.7 GB of disk each, and
 minutes, the more on the emulated GPU, so they run only when selected; where `/tmp` is in memory,
 give `--basetemp` a directory on disk.
 
 ```bash
-DEV=NV uv run pytest -m hero --basetemp ~/.cache/leatengine-heroes
+DEV=NV uv run pytest -m large --basetemp ~/.cache/leatengine-large
 ```
 
 ## Emulated AMD tests

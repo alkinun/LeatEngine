@@ -9,7 +9,7 @@ This document is a qualification procedure, not a claim of measured support or p
 | Execution path | Evidence |
 |---|---|
 | CPU reference | Generated-model correctness tests |
-| AMD | Kernel, tiny-model and hero-layer tests on tinygrad's emulator, as `gfx1151` of 40 CUs |
+| AMD | Kernel, tiny-model and large-model layer tests on tinygrad's emulator, as `gfx1151` of 40 CUs |
 | NVIDIA | GPU tests and real-model comparisons with llama.cpp on an RTX 3090 ([benchmarks](benchmarks.md)) |
 | Physical Strix Halo | Pending |
 
