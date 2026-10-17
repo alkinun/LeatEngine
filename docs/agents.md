@@ -116,8 +116,9 @@ reply calls a tool where the model would, and else answers in the format
 ```python
 from langchain_openai import ChatOpenAI
 
-llm = ChatOpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused",
-                 model="Qwen_Qwen3-8B-Q4_K_M")
+llm = ChatOpenAI(
+    base_url="http://127.0.0.1:8080/v1", api_key="unused", model="Qwen_Qwen3-8B-Q4_K_M"
+)
 ```
 
 `with_structured_output` by each method, `json_schema`, `function_calling` (a `tool_choice` naming
