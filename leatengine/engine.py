@@ -45,7 +45,7 @@ DRAFT_TOKENS = 3
 # the matrix-vector kernels take, as the kernels for more cost more than the guesses save, so that
 # several sequences draft fewer each. For Qwen3.6 35B A3B on the 3090, 3 sequences drafting 3
 # each decoded at 0.88 times the speed of plain steps, 4 at 0.77, and drafting 1 each, 1.11 and
-# 1.01 times; faster experts' kernels since took 3 to the 1.16 Qwen35Mtp records.
+# 1.01 times; faster experts' kernels since took 3 to the 1.16 draft.Mtp records.
 SPECULATIVE_TOKENS = MATVEC_TOKENS
 # memory a model's default context leaves free beside its weights and KV cache, for what its graphs
 # compute: on the 3090, warm-up's buffers took 0.1 to 1.1 GiB, Llama 3.1 8B's with 4 slots the

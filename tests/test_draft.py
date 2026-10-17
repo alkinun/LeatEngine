@@ -13,9 +13,11 @@ from leatengine.sampler import GREEDY, Sampling
 from tests.helpers import CONTEXT, Oracle, reference_drafts, reference_mtp_drafts, split_mtp
 
 PROMPT = [5, 77, 120, 3, 299, 42, 8, 150, 61, 200, 9, 33]
-# Gemma 4 with its assistant, and Qwen3.5 with its MTP layer, dense and of experts, of recurrent
-# state that a step goes back on where it keeps fewer tokens than it ran
-ARCHS = ["gemma4", "qwen35", "qwen35moe"]
+# Gemma 4 with its assistant; Qwen3.5 with its MTP layer, dense and of experts, of recurrent
+# state that a step goes back on where it keeps fewer tokens than it ran; and GLM-4.5 with its MTP
+# layer, of embeddings and an output head of its own
+ARCHS = ["gemma4", "qwen35", "qwen35moe", "glm4moe"]
+MTP = ["qwen35moe", "glm4moe"]  # MTP layers of experts
 
 
 def models(tiny, tiny_assistant, arch: str):
@@ -38,16 +40,17 @@ def test_drafts_match_reference(tiny, tiny_assistant):
 
 
 @pytest.mark.usefixtures("reference_ops")
-def test_mtp_drafts_match_reference(tiny):
+@pytest.mark.parametrize("arch", MTP)
+def test_mtp_drafts_match_reference(tiny, arch):
     # after a prompt of two chunks, whose second takes the first's last hidden state
-    path, weights = tiny("qwen35moe")
+    path, weights = tiny(arch)
     engine = Engine(path, max_context=CONTEXT, prefill_chunk=8, draft=path)
     assert engine.drafter is not None
     sequence = engine.start(PROMPT, 4)
     engine.step()
     ((_, token),) = engine.step()
     drafts = engine.drafter.draft(Tensor([[token]]), engine._hidden[:1], [0], [len(PROMPT)], 3)
-    assert drafts.tolist() == [reference_mtp_drafts(weights, PROMPT + [token], 3)]
+    assert drafts.tolist() == [reference_mtp_drafts(weights, PROMPT + [token], 3, arch)]
     engine.cancel(sequence)
 
 
@@ -125,15 +128,15 @@ def test_speculative_stops_where_plain_does(tiny, tiny_assistant, arch):
 
 
 @pytest.mark.usefixtures("reference_ops")
-@pytest.mark.parametrize("arch", ["gemma4", "qwen35moe"])
+@pytest.mark.parametrize("arch", ["gemma4", *MTP])
 def test_drafters_take_a_q8_0_cache(tiny, tiny_assistant, arch):
-    # Gemma 4's assistant reading the target's q8_0 cache, and Qwen3.5's MTP layer keeping its
-    # own as q8_0 too: the tokens plain decoding generates with one
+    # Gemma 4's assistant reading the target's q8_0 cache, and an MTP layer keeping its own as
+    # q8_0 too: the tokens plain decoding generates with one
     path, draft = models(tiny, tiny_assistant, arch)
     options = {"max_context": CONTEXT, "prefill_chunk": 8, "cache_type": "q8_0"}
     plain = list(Engine(path, **options).generate(PROMPT, 12))
     engine, steps = Engine(path, draft=draft, **options), 0
-    if arch == "qwen35moe":
+    if arch in MTP:
         assert engine.drafter.layer.cache_type == "q8_0"  # type: ignore[union-attr]
     speculative = engine._speculative
 
@@ -219,16 +222,19 @@ def test_speculative_several(tiny, tiny_assistant, arch, guessed):
 
 
 def test_needs(tiny, tiny_assistant):
-    # before it loads, a drafter's weights and the cache of its own: of Qwen3.5's MTP layer, past
-    # the model's layers in its file, of one attention layer of the target's; and Gemma 4's
-    # assistant's whole file, which reads the target's cache
-    path = tiny("qwen35")[0]
-    f = GGUF.open(path)
-    config = Config.from_gguf(f.metadata)
-    weights, own = needs(path, config)
-    prefix = f"blk.{config.n_layers}."
-    assert weights == sum(t.nbytes for n, t in f.tensors.items() if n.startswith(prefix)) > 0
-    assert own is not None and own.n_layers == 1 and own.recurrent == (False,)
+    # before it loads, a drafter's weights and the cache of its own: of an MTP layer, past the
+    # model's layers in its file, of one attention layer of the target's, of GLM-4.5's experts,
+    # though the target's first layer is of an MLP; and Gemma 4's assistant's whole file, which
+    # reads the target's cache
+    for arch in ("qwen35", "glm4moe"):
+        path = tiny(arch)[0]
+        f = GGUF.open(path)
+        config = Config.from_gguf(f.metadata)
+        weights, own = needs(path, config)
+        prefix = f"blk.{config.n_layers}."
+        assert weights == sum(t.nbytes for n, t in f.tensors.items() if n.startswith(prefix)) > 0
+        assert own is not None and own.n_layers == 1 and own.recurrent == (False,)
+        assert own.dense_lead == 0 and own.experts == config.experts
     config = Config.from_gguf(GGUF.open(tiny("gemma4")[0]).metadata)
     weights, own = needs(tiny_assistant[0], config)
     assert weights == sum(t.nbytes for t in GGUF.open(tiny_assistant[0]).tensors.values())
@@ -238,19 +244,23 @@ def test_needs(tiny, tiny_assistant):
 def test_drafter_needs_its_target(tiny, tiny_model, tiny_assistant):
     with pytest.raises(ValueError, match="drafts for no llama model"):
         Engine(tiny_model[0], max_context=CONTEXT, draft=tiny_assistant[0])
-    # a Qwen3.5 MTP layer of the same width, for a model of another kind
+    # an MTP layer of the same width, for a model of another kind
     with pytest.raises(ValueError, match="tiny.gguf's MTP layer is of another model"):
         Engine(tiny_model[0], max_context=CONTEXT, draft=tiny("qwen35")[0])
+    with pytest.raises(ValueError, match="tiny.gguf's MTP layer is of another model"):
+        Engine(tiny("qwen35")[0], max_context=CONTEXT, draft=tiny("glm4moe")[0])
 
 
 @pytest.mark.usefixtures("reference_ops")
-def test_own_drafter(tiny, tiny_model, tmp_path):
-    # a Qwen3.5 model's MTP layer, in its own file, or in the mtp-*.gguf beside it of its name, as
-    # Qwen3.8's converters write it, which drafts as the layer in its file does; none of a model
-    # without either, whose file as a drafter is refused, nor of another architecture
-    whole = tiny("qwen35")[0]
+@pytest.mark.parametrize("arch", ["qwen35", "glm4moe"])
+def test_own_drafter(tiny, tiny_model, tmp_path, arch):
+    # a Qwen3.5 or GLM-4.5 model's MTP layer, in its own file, or in the mtp-*.gguf beside it of
+    # its name, as llama.cpp's converters write it, which drafts as the layer in its file does;
+    # none of a model without either, whose file as a drafter is refused, nor of another
+    # architecture
+    whole = tiny(arch)[0]
     assert own_drafter(whole) == whole and own_drafter(tiny_model[0]) is None
-    model, layer = split_mtp(whole, tmp_path, "Tiny Qwen")
+    model, layer = split_mtp(whole, tmp_path, "Tiny Model")
     assert own_drafter(model) == layer and mtp(layer) and not mtp(model)
 
     def drafted(path, draft) -> tuple[list[int], int]:  # its tokens, and the speculative steps

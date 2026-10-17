@@ -151,7 +151,8 @@ def main(argv: list[str] | None = None) -> None:
         "--draft",
         type=Path,
         help="a drafter's GGUF, for speculative decoding: Gemma 4's assistant for Gemma 4, or "
-        "for Qwen3.5's MTP layer the model's own file, or the mtp-*.gguf beside it",
+        "for an MTP layer, Qwen3.5's or GLM-4.5's, the model's own file, or the mtp-*.gguf "
+        "beside it",
     )
     speed.add_argument(
         "--chat", action="store_true",

@@ -1,8 +1,9 @@
 """Drafters for speculative decoding: small models that guess the tokens a target model will
 generate next, which the target then checks all at once, reading its weights once for them all.
 
-A Qwen3.5 model's own drafter is its MTP layer, past its layers in its GGUF, or in a GGUF of its
-own beside it, as llama.cpp's converters write it: mtp-*.gguf, of the model's general.name."""
+A Qwen3.5 or GLM-4.5 model's own drafter is its MTP layer, past its layers in its GGUF, or in a
+GGUF of its own beside it, as llama.cpp's converters write it: mtp-*.gguf, of the model's
+general.name."""
 
 import re
 from dataclasses import replace
@@ -17,6 +18,9 @@ from leatengine.model import QWEN35, Config, Transformer, rope_table
 from leatengine.ops import Span
 
 PerSequence = list[int | UOp]  # a value for each sequence of a draft
+# the architectures whose GGUFs may hold an MTP layer past the model's, which drafts for it:
+# Qwen3.5's and Qwen3.6's, and GLM-4.5's
+MTP = (*QWEN35, "glm4moe")
 
 
 class Drafter(Protocol):
@@ -56,29 +60,30 @@ class Drafter(Protocol):
 
 
 def load(path: str | Path, target: Transformer) -> Drafter:
-    """The drafter in a GGUF for a target model: Gemma 4's assistant, or Qwen3.5's MTP layer, in
-    the target's own file or one of its own. Raises ValueError of a GGUF of no drafter for it."""
+    """The drafter in a GGUF for a target model: Gemma 4's assistant, or the MTP layer of Qwen3.5
+    or GLM-4.5, in the target's own file or one of its own. Raises ValueError of a GGUF of no
+    drafter for it."""
     gguf = GGUF.open(path)
     arch = gguf.metadata["general.architecture"]
     if arch == "gemma4-assistant":
         return Gemma4Assistant(gguf, target)
-    if arch in QWEN35 and _mtp_layer(gguf.metadata, gguf.tensors):
-        # of the target's width and past its layers, as Qwen35Mtp takes it
+    if arch in MTP and _mtp_layer(gguf.metadata, gguf.tensors):
+        # of the target's kind and width and past its layers, as Mtp takes it
         c, m = target.config, gguf.metadata
-        if c.arch not in QWEN35 or m[f"{arch}.embedding_length"] != c.dim or (
+        if _kind(c.arch) != _kind(arch) or m[f"{arch}.embedding_length"] != c.dim or (
             _layers(m) != c.n_layers
         ):  # fmt: skip
             raise ValueError(f"{Path(path).name}'s MTP layer is of another model")
-        return Qwen35Mtp(gguf, target)
-    if arch in QWEN35:
+        return Mtp(gguf, target)
+    if arch in MTP:
         raise ValueError(f"{Path(path).name} holds no MTP layer: give the mtp-*.gguf beside it")
     raise ValueError(f"a {arch} model drafts for no {target.config.arch} model")
 
 
 def needs(path: str | Path, config: Config) -> tuple[int, Config | None]:
     """What the drafter in a GGUF takes beside a target of `config`, before it loads: its weights'
-    bytes, and the config of the cache it keeps, Qwen3.5's MTP layer's, as model.cache_bytes takes
-    it, or None of Gemma 4's assistant, which reads the target's."""
+    bytes, and the config of the cache it keeps, an MTP layer's, as model.cache_bytes takes it, or
+    None of Gemma 4's assistant, which reads the target's."""
     gguf = GGUF.open(path)
     if gguf.metadata["general.architecture"] == "gemma4-assistant":
         return sum(t.nbytes for t in gguf.tensors.values()), None
@@ -93,12 +98,12 @@ def mtp(path: Path) -> bool:
 
 
 def own_drafter(model: Path) -> Path | None:
-    """A model's own drafter, if it has one: a Qwen3.5 model's MTP layer, in its file or else in
-    the mtp-*.gguf beside it of its general.name, whose layer is past the model's, the largest,
-    most exact, of several."""
+    """A model's own drafter, if it has one: a Qwen3.5 or GLM-4.5 model's MTP layer, in its file or
+    else in the mtp-*.gguf beside it of its general.name, whose layer is past the model's, the
+    largest, most exact, of several."""
     gguf = GGUF.open(model)
     m, arch = gguf.metadata, gguf.metadata["general.architecture"]
-    if arch not in QWEN35:
+    if arch not in MTP:
         return None
     if _mtp_layer(m, gguf.tensors):
         return model
@@ -112,26 +117,31 @@ def own_drafter(model: Path) -> Path | None:
     return max(found, key=lambda p: p.stat().st_size, default=None) if name else None
 
 
+def _kind(arch: str) -> str:
+    # the kind of model an MTP layer drafts for: Qwen3.5's dense and of experts alike
+    return "qwen35" if arch in QWEN35 else arch
+
+
 def _layers(m: dict) -> int:
-    # a Qwen3.5 GGUF's model's layers, without its MTP layer
+    # a GGUF's model's layers, without its MTP layer
     arch = m["general.architecture"]
     return m[f"{arch}.block_count"] - m.get(f"{arch}.nextn_predict_layers", 0)
 
 
 def _mtp_layer(m: dict, tensors: dict) -> bool:
-    # whether a Qwen3.5 GGUF holds its MTP layer, past the model's layers
+    # whether a GGUF holds its MTP layer, past the model's layers
     return f"blk.{_layers(m)}.nextn.eh_proj.weight" in tensors
 
 
 def _mtp_config(c: Config) -> Config:
-    # Qwen3.5's MTP layer as a model of its own: one layer of the shape of its target's attention
-    # layers
+    # an MTP layer as a model of its own: one layer of the shape of its target's attention layers,
+    # of experts where its target's are, past any first layers of an MLP
     full = max(i for i in range(c.n_layers) if not c.recurrent[i])
     one = {
         f: getattr(c, f)[full : full + 1]
         for f in ("kv_heads", "head_dims", "windows", "ropes", "scales", "recurrent")
     }
-    return replace(c, n_layers=1, **one)
+    return replace(c, n_layers=1, dense_lead=0, **one)
 
 
 def _named(name: str) -> str:
@@ -244,17 +254,19 @@ class Gemma4Assistant:
         return ops.linear(x, self.post), ops.linear(x, self.embed)
 
 
-class Qwen35Mtp:
-    """Qwen3.5's and Qwen3.6's MTP layer, past the model's own in its GGUF: a full-attention layer
-    of the model's kind, with its own keys and values, whose inputs are a token's embedding and
-    the model's hidden state at the position before, each normed, joined and projected, and whose
-    output, normed by a weight of its own, the model's output head reads. A step takes a token
-    and the hidden state before it and gives the next token and its own hidden state, from which
-    the next step drafts another at the next position, as llama.cpp's. The keys and values of
-    every position the target runs come from its tokens and its hidden states."""
+class Mtp:
+    """The MTP layer of Qwen3.5 and Qwen3.6, or of GLM-4.5, past the model's own in its GGUF: a
+    full-attention layer of the model's kind, with its own keys and values, whose inputs are a
+    token's embedding and the model's hidden state at the position before, each normed, joined and
+    projected, and whose output, normed by a weight of its own, an output head reads: the model's,
+    or of GLM-4.5 the layer's own, and its own embeddings, where its GGUF holds them, as
+    llama.cpp's. A step takes a token and the hidden state before it and gives the next token and
+    its own hidden state, from which the next step drafts another at the next position, as
+    llama.cpp's. The keys and values of every position the target runs come from its tokens and
+    its hidden states."""
 
     # for Qwen3.6 35B A3B on the 3090, 2 sequences decoded at 1.25 times the speed of plain
-    # steps, and 3 at 1.16
+    # steps, and 3 at 1.16; of GLM-4.5, as Qwen3.6's, unmeasured
     sequences = 3
 
     def __init__(self, gguf: GGUF, target: Transformer):
@@ -266,10 +278,12 @@ class Qwen35Mtp:
         self.e_norm, self.h_norm = (
             w.pop(f"nextn.{n}.weight").dequant().realize() for n in ("enorm", "hnorm")
         )
+        self.embed = w.pop("nextn.embed_tokens.weight", target.embed)
+        head = w.pop("nextn.shared_head_head.weight", target.output)
         head_norm = w.pop("nextn.shared_head_norm.weight")
         # the layer as a model of its own, its output normed with the shared head's norm
         weights = {f"blk.0.{n}": t for n, t in w.items()}
-        weights |= {"token_embd.weight": target.embed, "output.weight": target.output}
+        weights |= {"token_embd.weight": self.embed, "output.weight": head}
         weights["output_norm.weight"] = head_norm
         self.layer = self.own = Transformer(
             _mtp_config(c), weights, target.max_context, target.slots, cache_type=target.cache_type
@@ -282,7 +296,7 @@ class Qwen35Mtp:
         for i in range(count):
             spans = [Span(slot, pos + i) for slot, pos in zip(slots, positions, strict=True)]
             hidden = self.layer.forward(self._inputs(tokens, hidden), spans)
-            tokens = ops.argmax(self.target.logits(hidden).reshape(n, -1)).reshape(1, n)
+            tokens = ops.argmax(self.layer.logits(hidden).reshape(n, -1)).reshape(1, n)
             drafted.append(tokens.reshape(n, 1))
         return drafted[0].cat(*drafted[1:], dim=1)
 
@@ -299,6 +313,6 @@ class Qwen35Mtp:
 
     def _inputs(self, tokens: Tensor, hidden: Tensor) -> Tensor:
         # the layer's inputs: the tokens' embeddings and the hidden states before them
-        e = ops.rms_norm(ops.embedding(tokens, self.target.embed), self.e_norm, self.eps)
+        e = ops.rms_norm(ops.embedding(tokens, self.embed), self.e_norm, self.eps)
         h = ops.rms_norm(hidden, self.h_norm, self.eps)
         return ops.linear(e.cat(h, dim=-1), self.proj)

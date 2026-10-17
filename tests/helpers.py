@@ -1162,7 +1162,7 @@ def _reference_phi3(w: dict[str, np.ndarray], tokens: list[int]) -> np.ndarray:
 # Qwen3.5's mixture of experts: two Gated DeltaNet layers, then an attention layer whose q also
 # gives each head's output a gate, with q and k norms and RoPE over 16 of 64 dimensions; experts
 # beside a shared one with a gate of its own; and a layer past the others, for predicting
-# further tokens, which drafts for the model: see draft.Qwen35Mtp
+# further tokens, which drafts for the model: see draft.Mtp
 Q35_EVERY, Q35_ROTATED, Q35_HEAD = 3, 16, 64  # every 3rd layer attention; heads of 64
 Q35_SECTIONS = (3, 3, 2)  # of M-RoPE's 8 frequencies: of time, height and width
 Q_IMAGE = ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>")
@@ -1237,9 +1237,9 @@ def _write_qwen35(path: Path, arch: str) -> dict[str, np.ndarray]:
 
 
 def split_mtp(path: Path, folder: Path, name: str) -> tuple[Path, Path]:
-    # a Qwen3.5 GGUF with its MTP layer as llama.cpp's converters write Qwen3.8's: the model's
-    # file without the layer, of its layers alone, and mtp-*.gguf of the layer, the embeddings and
-    # the output, of the whole's metadata; each of general.name `name`
+    # a GGUF with its MTP layer as llama.cpp's converters write Qwen3.8's and GLM-4.5's: the
+    # model's file without the layer, of its layers alone, and mtp-*.gguf of the layer, the
+    # embeddings and the output, of the whole's metadata; each of general.name `name`
     reader = gguf.GGUFReader(path)
     arch = reader.fields["general.architecture"].contents()
     blocks, nextn = f"{arch}.block_count", f"{arch}.nextn_predict_layers"
@@ -1347,19 +1347,29 @@ def _qwen35_layer(
     return x + shared * sigmoid(h @ lw["ffn_gate_inp_shexp"])[:, None]
 
 
-def reference_mtp_drafts(w: dict[str, np.ndarray], tokens: list[int], count: int) -> list[int]:
+def reference_mtp_drafts(
+    w: dict[str, np.ndarray], tokens: list[int], count: int, arch: str = "qwen35moe"
+) -> list[int]:
     # the MTP layer's `count` greedy drafts after `tokens`, the last at a position the model has
     # not run: the layer runs every position, of each token with the model's hidden state before
-    # it, none before the first; then the drafts', each with the layer's own state before it
-    hidden, lw = _qwen35_hidden(w, tokens[:-1]), _layer(w, Q35_EVERY)
+    # it, none before the first; then the drafts', each with the layer's own state before it.
+    # GLM-4.5's layer embeds its tokens and gives its logits by tensors of its own.
+    glm = arch == "glm4moe"
+    hidden = (_glm4moe_hidden if glm else _qwen35_hidden)(w, tokens[:-1])
+    lw = _layer(w, LAYERS if glm else Q35_EVERY)
+    embed = lw.get("nextn.embed_tokens", w["token_embd.weight"])
+    head = lw.get("nextn.shared_head_head", w["output.weight"])
     tokens, before, drafts = list(tokens), [np.zeros(D), *hidden], []
     for _ in range(count):
-        e = norm(w["token_embd.weight"][tokens].astype(np.float64), lw["nextn.enorm"])
+        e = norm(embed[tokens].astype(np.float64), lw["nextn.enorm"])
         h = norm(np.stack(before), lw["nextn.hnorm"])
         x = np.concatenate([e, h], -1) @ lw["nextn.eh_proj"].T
-        places = _mrope_places(tokens, {})
-        out = norm(_qwen35_layer(lw, x, False, places), lw["nextn.shared_head_norm"])[-1]
-        drafts.append(int((out @ w["output.weight"].T).argmax()))
+        if glm:
+            out = _glm4moe_layer(lw, x)
+        else:
+            out = _qwen35_layer(lw, x, False, _mrope_places(tokens, {}))
+        out = norm(out, lw["nextn.shared_head_norm"])[-1]
+        drafts.append(int((out @ head.T).argmax()))
         tokens.append(drafts[-1])
         before.append(out)
     return drafts
@@ -1718,8 +1728,8 @@ def _reference_deepseek2(w: dict[str, np.ndarray], tokens: list[int]) -> np.ndar
 # MTP layer, as GLM-4.5's, not in its first, as GLM-4.5-Air's; RoPE over the first half of each
 # head's dimensions, i with i + GLM_ROTATED / 2. An MLP in the first layer, then experts chosen by
 # the sigmoid plus a bias, normalized and scaled, beside a shared expert; and a layer past the
-# others, of experts, for predicting further tokens, with embeddings and an output head of its
-# own, as GLM-4.5-Air's GGUFs hold them
+# others, of experts, which drafts for the model, with embeddings and an output head of its own,
+# as GLM-4.5-Air's GGUFs hold them: see draft.Mtp
 GLM_ROTATED, GLM_THETA, GLM_SCALE = HEAD_DIM // 2, 1e6, 2.5
 
 
