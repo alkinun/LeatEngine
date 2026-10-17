@@ -286,7 +286,8 @@ def test_tool_calls(reply, text):
 
 
 def test_glm_tool_call_arguments():
-    # GLM-4.7's values, typed as the tool's schema has them: text, or JSON of other types
+    # GLM-4.5's and GLM-4.7's values, typed as the tool's schema has them: text, or JSON of other
+    # types; GLM-4.5's a line each, as its template writes them
     schema = {"properties": {"city": {"type": "string"}, "days": {"type": "integer"}}}
     tools = [{"type": "function", "function": {"name": "weather", "parameters": schema}}]
     reply = ("<tool_call>weather\n<arg_key>city</arg_key>\n<arg_value>42</arg_value>\n"

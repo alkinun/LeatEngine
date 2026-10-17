@@ -321,9 +321,9 @@ def parse_tool_calls(reply: str, tools: list[dict[str, Any]]) -> tuple[str, list
     Llama 3 calls a tool by replying with nothing but {"name": ..., "parameters": {...}}, Qwen
     with <tool_call>{"name": ..., "arguments": {...}}</tool_call> after any text, Qwen3.5 with
     <tool_call><function=name><parameter=key>value</parameter>...</function></tool_call>, values
-    as text where the tool takes a string and else as JSON, GLM-4.7 with
-    <tool_call>name<arg_key>key</arg_key><arg_value>value</arg_value>...</tool_call>, its values
-    typed alike, Gemma 4 with
+    as text where the tool takes a string and else as JSON, GLM-4.5 and GLM-4.7 with
+    <tool_call>name<arg_key>key</arg_key><arg_value>value</arg_value>...</tool_call>, GLM-4.5 a
+    line each, its values typed alike, Gemma 4 with
     <|tool_call>call:name{key:value,...}<tool_call|>, and LFM2 with a Python list of calls of
     keyword arguments, <|tool_call_start|>[name(key=value, ...), ...]<|tool_call_end|>.
     """
@@ -381,13 +381,13 @@ def _xml_call(text: str, functions: dict[str, Any]) -> dict[str, Any] | None:
     return {"name": match[1], "arguments": _typed_values(arguments, functions.get(match[1]))}
 
 
-# GLM-4.7's calls inside <tool_call>: a function's name, then each key and its value
+# GLM-4.5's and GLM-4.7's calls inside <tool_call>: a function's name, then each key and its value
 _GLM_ARGUMENT = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.S)
 _GLM_CALL = re.compile(rf"\s*([\w.\-]+)\s*((?:{_GLM_ARGUMENT.pattern}\s*)*)", re.S)
 
 
 def _glm_call(text: str, functions: dict[str, Any]) -> dict[str, Any] | None:
-    # a call of GLM-4.7's, its values typed as its tool's schema has them
+    # a call of GLM-4.5's or GLM-4.7's, its values typed as its tool's schema has them
     if not (match := _GLM_CALL.fullmatch(text)):
         return None
     arguments = dict(_GLM_ARGUMENT.findall(match[2]))

@@ -113,6 +113,7 @@ and tensors in the file, not on the model's name.
 | `muse-glimmer` | Muse Glimmer 30B (text only) |
 | `lfm2moe` | LFM2.5 24B A2B |
 | `deepseek2` | GLM-4.7-Flash (multi-head latent attention) |
+| `glm4moe` | GLM-4.5-Air and GLM-4.5 |
 
 The GPU kernels take Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S,
 IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4 weights for prefill and decode, and Q4_1 and Q5_1 for

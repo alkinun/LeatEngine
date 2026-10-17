@@ -74,7 +74,7 @@ tool formats a model understands.
   `chat_template_kwargs` control supported templates; explicit template options take precedence.
 - Tool calls are returned in OpenAI-style `tool_calls`. The engine does not execute them. It
   reads each model's own call format: Llama 3's JSON replies, Qwen's `<tool_call>` blocks of JSON
-  or Qwen3.5's XML, GLM-4.7's argument tags, Gemma 4's calls, LFM2's Python-style call lists,
+  or Qwen3.5's XML, GLM-4.5's and GLM-4.7's argument tags, Gemma 4's calls, LFM2's Python-style call lists,
   gpt-oss's harmony messages, and Muse Glimmer's ATEM messages. Arguments written as text are
   typed by the tool's JSON schema. A reply cut off by `max_tokens` or the context keeps
   `finish_reason: "length"` even when it holds complete calls, as a later call may be missing.

@@ -1714,17 +1714,120 @@ def _reference_deepseek2(w: dict[str, np.ndarray], tokens: list[int]) -> np.ndar
     return norm(x, w["output_norm.weight"]) @ w["output.weight"].T
 
 
+# GLM-4.5's: attention of biases of q, k and v, and of norms of q and k in its second layer and its
+# MTP layer, as GLM-4.5's, not in its first, as GLM-4.5-Air's; RoPE over the first half of each
+# head's dimensions, i with i + GLM_ROTATED / 2. An MLP in the first layer, then experts chosen by
+# the sigmoid plus a bias, normalized and scaled, beside a shared expert; and a layer past the
+# others, of experts, for predicting further tokens, with embeddings and an output head of its
+# own, as GLM-4.5-Air's GGUFs hold them
+GLM_ROTATED, GLM_THETA, GLM_SCALE = HEAD_DIM // 2, 1e6, 2.5
+
+
+def _write_glm4moe(path: Path) -> dict[str, np.ndarray]:
+    w, weights, add = _writer(path, "glm4moe")
+    a = "glm4moe."
+    for key, value in [("block_count", LAYERS + 1), ("nextn_predict_layers", 1),
+                       ("embedding_length", D), ("feed_forward_length", HIDDEN),
+                       ("attention.head_count", HEADS), ("attention.head_count_kv", KV_HEADS),
+                       ("attention.key_length", HEAD_DIM), ("attention.value_length", HEAD_DIM),
+                       ("rope.dimension_count", GLM_ROTATED), ("expert_count", EXPERTS),
+                       ("expert_used_count", USED), ("expert_feed_forward_length", EXPERT_HIDDEN),
+                       ("expert_shared_count", 1), ("expert_group_count", 1),
+                       ("expert_group_used_count", 1), ("expert_gating_func", 2),
+                       ("leading_dense_block_count", 1)]:  # fmt: skip
+        w.add_uint32(a + key, value)
+    w.add_float32(a + "rope.freq_base", GLM_THETA)
+    w.add_float32(a + "expert_weights_scale", GLM_SCALE)
+    w.add_bool(a + "expert_weights_norm", True)
+    add("token_embd.weight", *TENSORS["token_embd.weight"])
+    add("output.weight", *TENSORS["output.weight"])
+    add("output_norm.weight", (D,))
+    for i in range(LAYERS + 1):
+        b = f"blk.{i}."
+        add(b + "attn_norm.weight", (D,))
+        add(b + "post_attention_norm.weight", (D,))
+        for name in ATTENTION:
+            add(b + name + ".weight", *TENSORS[name])
+        for name in ATTENTION[:3]:
+            add(b + name + ".bias", (TENSORS[name][0][0],), GGMLType.F32, 0.5)
+        if i:
+            add(b + "attn_q_norm.weight", (HEAD_DIM,))
+            add(b + "attn_k_norm.weight", (HEAD_DIM,))
+        if i == 0:
+            for name in MLP:
+                add(b + name + ".weight", *TENSORS[name])
+            continue
+        for name in MOE:
+            add(b + name + ".weight", *TENSORS[name])
+        add(b + "exp_probs_b.bias", (EXPERTS,), GGMLType.F32, 0.5)
+        for name in ("gate", "up", "down"):
+            shape = (D, EXPERT_HIDDEN) if name == "down" else (EXPERT_HIDDEN, D)
+            add(b + f"ffn_{name}_shexp.weight", shape, GGMLType.Q8_0, 1e-3)
+    b = f"blk.{LAYERS}.nextn."
+    for name in ("enorm", "hnorm", "shared_head_norm"):
+        add(b + name + ".weight", (D,))
+    add(b + "eh_proj.weight", (D, 2 * D), GGMLType.Q8_0, 1e-3)
+    add(b + "embed_tokens.weight", *TENSORS["token_embd.weight"])
+    add(b + "shared_head_head.weight", *TENSORS["output.weight"])
+    _finish(w)
+    return weights
+
+
+def _reference_glm4moe(w: dict[str, np.ndarray], tokens: list[int]) -> np.ndarray:
+    return _glm4moe_hidden(w, tokens) @ w["output.weight"].T
+
+
+def _glm4moe_hidden(w: dict[str, np.ndarray], tokens: list[int]) -> np.ndarray:
+    # the normed hidden states
+    x = w["token_embd.weight"][tokens].astype(np.float64)
+    for i in range(LAYERS):
+        x = _glm4moe_layer(_layer(w, i), x)
+    return norm(x, w["output_norm.weight"])
+
+
+def _glm4moe_layer(lw: dict[str, np.ndarray], x: np.ndarray) -> np.ndarray:
+    # an attention layer of tokens at positions 0 on, then its MLP, or its experts and shared
+    # expert
+    T = len(x)
+    freqs = GLM_THETA ** (-np.arange(0, GLM_ROTATED, 2) / GLM_ROTATED)
+    angles = np.arange(T)[:, None, None] * freqs
+    cos, sin = np.cos(angles), np.sin(angles)
+
+    def rope(z):  # the first GLM_ROTATED dimensions, i with i + GLM_ROTATED / 2
+        return np.concatenate(
+            [rotate_halves(z[..., :GLM_ROTATED], cos, sin), z[..., GLM_ROTATED:]], -1
+        )
+
+    h = norm(x, lw["attn_norm"])
+    q, k, v = (h @ lw[n].T + lw[f"{n}.bias"] for n in ATTENTION[:3])
+    q, k, v = q.reshape(T, HEADS, HEAD_DIM), *(z.reshape(T, KV_HEADS, HEAD_DIM) for z in (k, v))
+    if "attn_q_norm" in lw:
+        q, k = norm(q, lw["attn_q_norm"]), norm(k, lw["attn_k_norm"])
+    x = x + attention(rope(q), rope(k), v, _mask(T, 0), HEAD_DIM**-0.5) @ lw["attn_output"].T
+    h = norm(x, lw["post_attention_norm"])
+    if "ffn_gate_inp" not in lw:
+        return x + mlp(h, lw["ffn_gate"], lw["ffn_up"], lw["ffn_down"])
+    probs = sigmoid(h @ lw["ffn_gate_inp"].T)
+    out = mlp(h, lw["ffn_gate_shexp"], lw["ffn_up_shexp"], lw["ffn_down_shexp"])
+    for t in range(T):
+        best = np.argsort(-(probs[t] + lw["exp_probs_b.bias"]), kind="stable")[:USED]
+        for e in best:
+            gate, up, down = (lw[f"ffn_{n}_exps"][e] for n in ("gate", "up", "down"))
+            out[t] += probs[t, e] / probs[t, best].sum() * GLM_SCALE * mlp(h[t], gate, up, down)
+    return x + out
+
+
 _WRITERS = {
     "gemma3": _write_gemma3, "gpt-oss": _write_gpt_oss, "phi3": _write_phi3,
     "mellum": _write_mellum, "muse-glimmer": _write_muse_glimmer, "lfm2moe": _write_lfm2moe,
-    "deepseek2": _write_deepseek2,
+    "deepseek2": _write_deepseek2, "glm4moe": _write_glm4moe,
     "qwen35": lambda path: _write_qwen35(path, "qwen35"),
     "qwen35moe": lambda path: _write_qwen35(path, "qwen35moe"),
 }  # fmt: skip
 _REFERENCES = {
     "gpt-oss": _reference_gpt_oss, "phi3": _reference_phi3, "mellum": _reference_mellum,
     "muse-glimmer": _reference_muse_glimmer, "lfm2moe": _reference_lfm2moe,
-    "deepseek2": _reference_deepseek2,
+    "deepseek2": _reference_deepseek2, "glm4moe": _reference_glm4moe,
 }  # fmt: skip
 
 

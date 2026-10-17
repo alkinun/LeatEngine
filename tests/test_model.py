@@ -57,6 +57,7 @@ ARCHS = [
     "muse-glimmer",
     "lfm2moe",
     "deepseek2",
+    "glm4moe",
 ]
 # of plain layers, of rings with sinks, of keys that are values, beside recurrent layers, and of
 # MLA's one head: the ways a q8_0 cache holds keys and values
@@ -329,7 +330,8 @@ def test_lfm2_config():
 
 def test_mla_config():
     # DeepSeek V2's multi-head latent attention: scores scaled by each head's whole query and key;
-    # its YaRN and its groups of experts, as DeepSeek V3's, are refused rather than run wrong
+    # its YaRN and its groups of experts, as DeepSeek V3's, are refused rather than run wrong, but
+    # groups all used, which choose nothing
     mla = {"attention.kv_lora_rank": 512, "attention.q_lora_rank": 768,
            "attention.key_length": 576, "attention.key_length_mla": 256,
            "attention.value_length_mla": 256, "rope.dimension_count": 64,
@@ -337,9 +339,11 @@ def test_mla_config():
     c = config("deepseek2", mla)
     assert c.mla is not None and (c.mla.nope, c.mla.rope, c.mla.v_dim) == (192, 64, 256)
     assert c.scales == (1 / 16,) * 4 and c.head_dims == (576,) * 4 and not c.rope_halves
-    for unsupported in (YARN, {"expert_group_used_count": 4}):
-        with pytest.raises(NotImplementedError, match="multi-head latent attention"):
-            config("deepseek2", mla | unsupported)
+    with pytest.raises(NotImplementedError, match="YaRN of multi-head latent attention"):
+        config("deepseek2", mla | YARN)
+    with pytest.raises(NotImplementedError, match="within groups"):
+        config("deepseek2", mla | {"expert_group_count": 8, "expert_group_used_count": 4})
+    assert config("deepseek2", mla | {"expert_group_count": 8, "expert_group_used_count": 8})
     # its experts weighed as llama.cpp's: GLM-4.7-Flash's of a GGUF that leaves the gating function
     # out by the sigmoid, as llama.cpp tells it by its sizes, unnormalized unless the GGUF says so;
     # an unnormalized softmax, or another function, refused
@@ -350,6 +354,23 @@ def test_mla_config():
     for refused in ({"expert_weights_norm": False}, {"expert_gating_func": 3}):
         with pytest.raises(NotImplementedError, match="gating function"):
             config("deepseek2", mla | {"expert_gating_func": 1} | refused)
+
+
+def test_glm4moe_config():
+    # GLM-4.5's: its MTP layer past the model's own; NeoX RoPE over rope.dimension_count of each
+    # head's dimensions, scores scaled by the whole head's; an MLP in its first layers; experts
+    # weighed by the sigmoid where the GGUF leaves the function out, as llama.cpp's, normalized as
+    # it says
+    glm = {"block_count": 47, "nextn_predict_layers": 1, "attention.key_length": 128,
+           "rope.dimension_count": 64, "expert_count": 128, "expert_used_count": 8,
+           "leading_dense_block_count": 1, "expert_weights_norm": True}  # fmt: skip
+    c = config("glm4moe", glm)
+    assert c.n_layers == 46 and c.rope_halves and c.ropes[0].dims == 64 and c.dense_lead == 1
+    assert c.scales == (1 / math.sqrt(128),) * 46 and c.head_dims == (128,) * 46
+    assert c.sigmoid_gating and c.expert_weights_norm and c.expert_weights_scale == 1.0
+    assert not config("glm4moe", glm | {"expert_weights_norm": False}).expert_weights_norm
+    with pytest.raises(NotImplementedError, match="within groups"):
+        config("glm4moe", glm | {"expert_group_count": 4, "expert_group_used_count": 1})
 
 
 @pytest.mark.usefixtures("reference_ops")
